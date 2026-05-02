@@ -1,0 +1,6 @@
+{
+  "version": "4.2.0",
+  "notes": "Voice Input Local release notes go here.",
+  "installer_asset": "VoiceInputLocalSetup-4.2.0.exe",
+  "portable_asset": "VoiceInputLocal-portable-4.2.0.zip"
+}

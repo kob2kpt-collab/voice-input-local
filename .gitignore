@@ -1,0 +1,23 @@
+.venv/
+build/
+dist/
+release/*.exe
+release/*.zip
+__pycache__/
+*.pyc
+*.pyo
+*.log
+launch_debug.log
+
+# Local runtime data is stored in %LOCALAPPDATA%\VoiceInputLocal, not in the repo
+config.json
+history.json
+*.sqlite
+*.sqlite3
+models/
+logs/
+recordings/
+
+# Secrets
+.env
+*.token

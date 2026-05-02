@@ -1,0 +1,56 @@
+name: Build Windows Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        shell: cmd
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python.exe -m pip install --upgrade pip
+          .venv\Scripts\pip.exe install -r requirements.txt
+
+      - name: Build portable app
+        shell: cmd
+        run: build_exe.bat
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build installer
+        shell: cmd
+        run: build_installer.bat
+
+      - name: Pack portable ZIP
+        shell: powershell
+        run: |
+          $version = "${env:GITHUB_REF_NAME}".TrimStart("v")
+          Compress-Archive -Path "dist\VoiceInputLocal\*" -DestinationPath "VoiceInputLocal-portable-$version.zip" -Force
+
+      - name: Publish GitHub Release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = "${env:GITHUB_REF_NAME}".TrimStart("v")
+          $setup = Get-ChildItem -Path release -Filter "VoiceInputLocalSetup-*.exe" | Select-Object -First 1
+          gh release create "${env:GITHUB_REF_NAME}" $setup.FullName "VoiceInputLocal-portable-$version.zip" --title "Voice Input Local $version" --notes "Voice Input Local $version"
