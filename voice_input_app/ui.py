@@ -758,8 +758,9 @@ class MainWindow(QMainWindow):
 
     def register_hotkey(self, show_errors: bool = True) -> bool:
         try:
-            self.hotkey.start(self.cfg.hotkey)
-            self.status_label.setText(f"Готово. Горячая клавиша: {self.cfg.hotkey}")
+            self.hotkey.start(self.cfg.hotkey, window_handle=int(self.winId()))
+            backend = f" ({self.hotkey.backend})" if self.hotkey.backend else ""
+            self.status_label.setText(f"Готово. Горячая клавиша: {self.cfg.hotkey}{backend}")
             self.overlay.set_hotkey(self.cfg.hotkey)
             self._set_hotkey_attention(False)
             return True
@@ -771,6 +772,15 @@ class MainWindow(QMainWindow):
             if show_errors:
                 QMessageBox.warning(self, "Горячая клавиша", message)
             return False
+
+    def nativeEvent(self, event_type, message):  # noqa: ANN001
+        try:
+            if self.hotkey.handle_native_event(message):
+                self.hotkey_signal.triggered.emit()
+                return True, 0
+        except Exception:  # noqa: BLE001
+            log.exception("Native hotkey event handling failed")
+        return super().nativeEvent(event_type, message)
 
     def register_cancel_hotkey(self) -> None:
         if self.cancel_hotkey_handle is not None:
@@ -1453,6 +1463,7 @@ class MainWindow(QMainWindow):
 
 
     def toggle_recording(self) -> None:
+        log.info("Toggle recording requested. recorder_active=%s transcribe_running=%s", self.recorder.is_recording, bool(self.transcribe_worker and self.transcribe_worker.isRunning()))
         if self._file_job_running():
             self.status_label.setText("Идёт расшифровка файла. Диктовка временно недоступна.")
             if self.cfg.overlay_enabled:

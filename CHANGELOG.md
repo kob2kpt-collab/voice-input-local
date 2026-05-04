@@ -1,5 +1,12 @@
 # Changelog
 
+## v4.2.2
+
+- Replaced the primary Windows global hotkey backend with native `RegisterHotKey` / `WM_HOTKEY` handling, with the previous `keyboard` backend retained as a fallback.
+- Added hotkey registration and hotkey event logging to make OBS/softphone conflicts diagnosable.
+- Restricted regular recording fallback to the selected microphone or system default input instead of probing unrelated microphones.
+- Kept microphone test and microphone autodetect flows intact: the test uses the same safer recording path, while autodetect can still scan available microphones.
+
 ## v4.2.0
 
 - Added GitHub Releases updater infrastructure.

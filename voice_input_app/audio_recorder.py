@@ -55,9 +55,11 @@ def _api_rank(name: str) -> int:
         return 0
     if "directsound" in lowered:
         return 1
-    if "wdm-ks" in lowered or "wdm" in lowered:
-        return 2
     if "mme" in lowered:
+        return 2
+    # WDM-KS is kept as a late fallback only. It can behave less friendly
+    # with OBS, softphones and other apps that already use audio devices.
+    if "wdm-ks" in lowered or "wdm" in lowered:
         return 3
     return 4
 
@@ -241,46 +243,40 @@ class AudioRecorder:
                 )
             )
 
-        # 1. If the user selected a legacy backend for a microphone that also
-        # exists through WASAPI, prefer the WASAPI shared endpoint first.
-        if self.meeting_compatibility and selected is not None and "wasapi" not in selected.hostapi_name.lower():
-            same_name_wasapi = [d for d in devices if d.name == selected.name and "wasapi" in d.hostapi_name.lower()]
-            same_name_wasapi.sort(key=lambda d: _api_rank(d.hostapi_name))
-            for device in same_name_wasapi:
-                add(device, f"{device.name} · Windows WASAPI shared")
-
-        # 2. Explicit user selection.
         if selected is not None:
+            # If the user selected a concrete microphone, do not probe unrelated
+            # devices. OBS/softphones may legitimately own another microphone,
+            # and touching it as a fallback can make dictation fail even though
+            # the selected microphone is available.
+            same_physical_device = [d for d in devices if d.name == selected.name]
+            same_physical_device.sort(key=lambda d: (_api_rank(d.hostapi_name), d.index))
+
+            if self.meeting_compatibility:
+                for device in same_physical_device:
+                    if "wasapi" in device.hostapi_name.lower():
+                        add(device, f"{device.name} · Windows WASAPI shared")
+
             add(selected)
 
-        # 3. For meeting compatibility, prefer the default WASAPI endpoint over
-        # legacy MME. This is the closest sounddevice/PortAudio equivalent to
-        # Windows shared capture.
+            for device in same_physical_device:
+                if device.index == selected.index:
+                    continue
+                hostapi = device.hostapi_name.lower()
+                if self.meeting_compatibility and ("wdm-ks" in hostapi or "wdm" in hostapi):
+                    # WDM-KS is a late/exclusive-prone backend. Do not use it
+                    # automatically in meeting compatibility mode.
+                    continue
+                add(device)
+            log.info("Audio candidates restricted to selected microphone: %s", len(candidates))
+            return candidates
+
+        # No explicit microphone selected: use only the Windows/default input
+        # endpoints. Autodetect remains available when the user wants the app to
+        # search across all microphones.
         if self.meeting_compatibility:
             add(_default_wasapi_input_candidate(devices), "Системный микрофон по умолчанию · Windows WASAPI")
-
-        # 4. System default as reported by PortAudio.
         add(None)
-
-        # 5. Same physical microphone through other host APIs, then all WASAPI
-        # inputs as fallback. This helps when Zoom/Teams picked one backend and
-        # MME refuses to open it.
-        if selected is not None:
-            same_name = [d for d in devices if d.name == selected.name and d.index != selected.index]
-            same_name.sort(key=lambda d: _api_rank(d.hostapi_name))
-            for device in same_name:
-                add(device)
-        if self.meeting_compatibility:
-            for device in devices:
-                if "wasapi" in device.hostapi_name.lower():
-                    add(device)
-            # Some headsets expose a working WDM-KS endpoint when WASAPI/MME
-            # fail on that particular machine. Use it as a late fallback because
-            # it can be less friendly to simultaneous meeting software.
-            for device in devices:
-                hostapi = device.hostapi_name.lower()
-                if "wdm-ks" in hostapi or "wdm" in hostapi:
-                    add(device)
+        log.info("Audio candidates restricted to default microphone: %s", len(candidates))
         return candidates
 
     def _extra_settings_for(self, candidate: AudioOpenCandidate):  # noqa: ANN001
@@ -379,7 +375,8 @@ class AudioRecorder:
             "1. Выберите другой микрофон в настройках Voice Input Local.\n"
             "2. Проверьте доступ к микрофону для классических приложений Windows.\n"
             "3. В свойствах микрофона Windows отключите эксклюзивный режим, если он включён.\n"
-            "4. Если идёт созвон, попробуйте выбрать в Voice Input Local другое устройство ввода.\n\n"
+            "4. Если идёт созвон или открыт OBS, убедитесь, что выбран нужный микрофон и он не открыт в эксклюзивном режиме.\n"
+            "5. Для поиска другого доступного микрофона используйте «Автонастройка микрофона».\n\n"
             f"Выбранное устройство: {requested_label}\n\n"
             "Попытки открытия:\n- " + "\n- ".join(errors[-18:]) + "\n\nСписок аудиоустройств записан в app.log."
         )
