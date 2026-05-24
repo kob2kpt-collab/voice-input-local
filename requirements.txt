@@ -14,3 +14,18 @@ pyinstaller>=6.0
 soundfile>=0.12.1
 
 av>=12.0
+
+# Summarization (SUM-04): local LLM on CPU
+# llama-cpp-python requires CMake + C++ compiler.
+# Install separately: pip install llama-cpp-python
+# On Windows without build tools, use pre-built wheel:
+#   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+# The app works without it — summarization will be unavailable.
+
+# API server (API-01..04)
+fastapi>=0.111
+uvicorn>=0.29
+python-multipart>=0.0.9
+
+# Cloud STT (US-015, US-016, US-032): OpenAI-compatible API + ElevenLabs
+requests>=2.31

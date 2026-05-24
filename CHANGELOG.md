@@ -1,5 +1,94 @@
 # Changelog
 
+## v4.4.0
+
+### Облачные модели для расшифровки файлов (US-017)
+
+- **TASK-051**: file_model_combo на вкладке «Файлы» получил группы «── Локальные ──» / «── Облачные ──». Cloud-модели без API-ключа отображаются серым с пометкой «(не настроено)». Выбор файловой модели сохраняется отдельно в config.file_selected_model.
+- **TASK-052**: FileTranscribeWorker.run() получил ветку cloud — для cloud-ключей вызывается ModelManager.transcribe_with_fallback с автонарезкой через cloud_stt.split_and_transcribe.
+- **TASK-053**: при превышении лимита размера файла провайдером (OpenAI 25 МБ, ElevenLabs 1024 МБ) показывается диалог с 3 кнопками: «Расшифровать через облако с автонарезкой», «Переключусь на локальную модель» (с подсветкой file_model_combo на 1.5 сек), «Отмена».
+- **TASK-054**: pre-flight is_internet_available() перед стартом cloud-расшифровки файла. При недоступности — авто-fallback на cloud_fallback_model_key.
+- **TASK-055**: сигнал fallback_applied(fallback_key, reason) в FileTranscribeWorker, подключённый к общему обработчику on_cloud_fallback_applied. Обновляет combo через refresh_available_models_combo(force_current=True).
+- **TASK-056**: история сохраняет cloud-расшифровки. Pretty-fallback для имён моделей: если cloud-ключ удалён из настроек, отображается «OpenAI · whisper-1» вместо сырого «cloud:openai:whisper-1».
+- **TASK-078**: прогрессивный прогресс при cloud-расшифровке файла. split_and_transcribe принимает on_chunk_done колбэк. FileTranscribeWorker эмитит block_ready по мере готовности каждого чанка — пользователь видит куски текста и прогресс «{percent}% · cloud · чанк {done}/{total}».
+- **TASK-079**: отзывчивая отмена cloud-расшифровки. split_and_transcribe принимает cancel_check. При отмене pool.shutdown(cancel_futures=True), текущие in-flight дорабатываются, raise InterruptedError. Время отмены ≤30 секунд.
+- **TASK-082**: READ_TIMEOUT cloud-чанков уменьшен со 120 до 30 секунд.
+- **TASK-085**: per-chunk local fallback при ошибке cloud-чанка файла. При CloudRateLimit (429) — 1 retry с backoff 3 сек, далее перерасшифровка ТОЛЬКО упавшего чанка локально через cloud_fallback_model_key. Остальные cloud-чанки продолжают идти. Файл устойчив к rate limit, прогресс не теряется, таймкоды сохраняются. Диктовку не трогаем — там действует full fallback.
+
+### Параллельная работа диктовки и расшифровки файла (US-019)
+
+- **TASK-062..065**: матрица блокировок. Снята взаимоисключающая блокировка диктовка ↔ расшифровка файла для cloud-комбинаций (лок+cloud, cloud+лок, cloud+cloud — параллельно разрешено). Жёсткий запрет только при лок+лок. Геттеры is_dictation_busy(), is_file_busy(), dictation_uses_local(), file_uses_local() и предикаты _can_start_dictation(), _can_start_file_transcribe() — единый источник правды для матрицы.
+- **TASK-066..068**: одновременный прогресс через изолированные виджеты (overlay + панель Файлы), изоляция отмены (Esc → только диктовка), защита от перемешивания результатов.
+- **TASK-080**: on_file_transcription_progress не перезаписывает overlay, если идёт диктовка или активен result_preview. Это позволяет overlay показывать развёрнутый блок с текстом расшифровки диктовки и кнопкой «Скопировать» поверх параллельной cloud-расшифровки файла.
+- **TASK-081, 084**: defensive hotkey re-register в 3 точках — в on_file_transcription_cancelled, on_file_transcription_done и сразу при клике cancel_file_transcription. Помогает если keyboard listener потерял Win32-хук во время длительной cloud-операции.
+- **TASK-083**: расширенное логирование в toggle_recording / start_recording для диагностики блокировок hotkey.
+
+### Известные ограничения v4.4.0
+
+- Не реализовано в этой итерации (следующий релиз): timestamps + diarization для cloud-моделей (TASK-057..061 US-017), overlay model picker при попытке диктовки во время локальной расшифровки файла (TASK-069..074 US-019).
+- Cloud-чанки не прерываются мгновенно (Python ThreadPoolExecutor не умеет прерывать запущенные потоки). Максимальное время «висения» отмены = READ_TIMEOUT = 30с.
+
+## Lessons learned
+
+### 2026-05-24 — повреждение файлов при последовательных Edit-операциях
+
+При работе над US-017/US-019 обрезались `config.py`, `ui.py`,
+`project-data.json` и `CLAUDE.md` — последовательные вызовы `Edit` на
+больших файлах с кириллицей вели к произвольному обрыву содержимого
+(середина UTF-8 символа, неожиданный EOF) без явной ошибки от
+инструмента.
+
+Файлы восстановлены: `config.py`, `ui.py` — из локального бекапа
+пользователя; `project-data.json` и `CLAUDE.md` — через Python-запись
+(`json.load → mutate → json.dump`, текстовый heredoc) из контекста
+сессии.
+
+Зафиксированные правила работы с большими файлами — в `CLAUDE.md`,
+раздел «Безопасное редактирование файлов (для AI-агентов)»:
+выбор инструмента по размеру файла, обязательный бекап `.bak` перед
+серией правок, валидация после каждой нетривиальной правки
+(`ast.parse` / `json.load`), стоп-сигнал при первом признаке обрезания.
+
+## v4.3.0
+
+### Багфиксы и доработки итерации (TASK-038..050, BUG-CL-01..03, BUG-04)
+
+- **TASK-040, TASK-044**: Single-instance lock через `QLockFile` с `staleLockTime=30с`. Второй запуск выходит с MessageBox «Уже запущено», убирая баг с двумя overlay в трее.
+- **TASK-039, TASK-049**: `refresh_cloud_models` теперь не делает HTTP при старте — реестр восстанавливается из `cfg.openai_stt_model_id`/`elevenlabs_stt_model_id`. После успешного discover модели регистрируются напрямую через `set_cloud_models` (без повторного HTTP). Combo моделей в настройках обновляется и при стартовом, и при ручном discover через общий метод.
+- **TASK-041, TASK-043**: Убран захардкоженный fallback `whisper-1` в `discover_models` (мешал нестандартным провайдерам типа routerai/Groq). Combo больше не сохраняет остаточные модели от прошлого провайдера. Расширены STT-keywords. Лог первых 30 model id если фильтр не нашёл — для диагностики.
+- **TASK-042**: Защита от `UnicodeEncodeError` при попадании кириллицы в API-ключ — `_validate_api_key_charset` возвращает понятное сообщение вместо traceback.
+- **TASK-045**: Автозагрузка cloud-моделей через `start_initial_cloud_discover` при старте программы (`QTimer.singleShot(1500)`). Не блокирует UI. При ошибке — статус-бар + трей-уведомление; если выбранная cloud-модель недоступна — автопереключение на `cloud_fallback_model_key`.
+- **TASK-046**: Combo «Fallback при сбое облака» в настройках показывает только установленные локальные модели (как dropdown «Диктовки»), не весь `TRANSCRIPTION_MODELS`.
+- **TASK-047**: `setFocusPolicy(Qt.NoFocus)` + `setAutoDefault(False)` на кнопки записи/копирования/расшифровки — Space-без-Ctrl больше не активирует диктовку внутри окна программы. Глобальный хоткей `Ctrl+Space` работает по-прежнему.
+- **TASK-048**: Новый класс `EditableClickToOpenComboBox` — клик в любую часть редактируемого combo «OpenAI Model»/«ElevenLabs Model» открывает popup (раньше работала только стрелка справа).
+- **BUG-CL-01**: При cloud→локальная fallback combo на «Диктовке» теперь сразу переключается на локальную (`refresh_available_models_combo(force_current=True)`). Раньше cloud-модель оставалась выбранной, потому что `is_available=True`.
+- **BUG-CL-02**: Длинные сообщения об ошибках cloud-подключения больше не растягивают окно — `status_label` с `setWordWrap(True)` и `SizePolicy(Ignored, Preferred)`.
+- **BUG-CL-03**: Во время cloud-расшифровки статус-бар пишет «Отправляю в облако: …», а не «Финальная расшифровка локально…».
+- **BUG-04**: Новый `NoScrollSpinBox` (по аналогии с `NoScrollComboBox` из US-001). Поле «Длина чанка для облака» больше не меняет значение при скролле страницы настроек.
+
+### Основной функционал (US-015, US-016, US-021, US-032)
+
+- **US-015**: Подключение облачных STT через OpenAI-совместимый API (OpenAI Whisper API, Groq и любой совместимый прокси). В настройках раздел «Облачные модели» с полями API Key, Base URL, выбор модели + кнопка «Проверить соединение и обновить список моделей». Динамический discover моделей через `GET /v1/models` с фильтрацией по STT (whisper / transcribe / scribe / stt / speech-to-text).
+- **US-016**: Подключение ElevenLabs Speech-to-Text. Поле API Key, выбор модели (`scribe_v1`, `scribe_v1_experimental`), проверка соединения через `GET /v1/user`.
+- **US-021** (минимально): Выпадающий список моделей на вкладке «Диктовка» разделён на группы «── Локальные ──» и «── Облачные ──». Облачные модели без настроенного ключа отображаются серым с пометкой «(не настроено)».
+- **US-032** (новая): Длинные надиктовки (> 60 сек по умолчанию) автоматически нарезаются на чанки и отправляются в облако параллельно (до 3 потоков, overlap 0.3 с). Порог настраивается в настройках.
+- Проактивная проверка интернета через TCP-connect к хосту провайдера перед каждым cloud-запросом.
+- При сбое cloud (нет интернета, 401, 5xx, лимит) — автоматическое переключение `selected_model` на `cloud_fallback_model_key` (по умолчанию `whisper:small`) с уведомлением в статус-баре и трее.
+- Новый модуль `voice_input_app/cloud_stt.py`: `transcribe_openai_compatible`, `transcribe_elevenlabs`, `verify_*_connection`, `discover_models`, `split_and_transcribe`, `is_internet_available`, типизированные исключения `CloudSttError`/`CloudAuthError`/`CloudPayloadTooLarge`/`CloudRateLimit`/`CloudServerError`/`CloudNetworkError`.
+- Новая зависимость: `requests>=2.31`.
+
+## v4.2.1
+
+- BUG-01: Выпадающие списки в настройках больше не прокручиваются колёсиком мыши — скролл всегда идёт по странице, кроме момента, когда dropdown открыт.
+- BUG-02: Объединение коротких 1–3 секундных сегментов Whisper при диаризации в более естественные реплики.
+- QUA-01: Улучшено качество диаризации — MFCC-фичи, k-means++ с рестартами, 3 прохода сглаживания.
+- SUM-01..04: Локальная суммаризация расшифровок через llama-cpp-python (Phi-3.5 Mini Q4, CPU). UI для суммаризации на вкладках Файлы и История, настраиваемый системный промпт.
+- API-01..04: REST API с очередью и async-режимом (FastAPI/uvicorn, опционально).
+- UX-01: Кнопка «Открыть папку моделей» в настройках.
+- Исправлен белый фон вкладки настроек на Windows (QScrollArea viewport palette). Решение и рекомендации — в README и комментариях `_settings_tab()`.
+- Убраны кнопки «Проверить микрофон», «Настройки микрофона Windows», «Настройки звука Windows» из настроек. Оставлены: Автонастройка, Логи, Модели, Обновления.
+- Горизонтальная прокрутка убрана из настроек.
+
 ## v4.2.0
 
 - Added GitHub Releases updater infrastructure.

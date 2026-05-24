@@ -16,7 +16,7 @@ from typing import Callable, Optional
 # progress shown in the app is driven by our own directory-size monitor.
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("DISABLE_TQDM", "1")
-from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 try:
     from huggingface_hub.utils import disable_progress_bars
 
@@ -121,6 +121,21 @@ def _repo_size_bytes(repo_id: str, token: str | None = None) -> int | None:
         return None
 
 
+def _single_file_size_bytes(repo_id: str, filename: str, token: str | None = None) -> int | None:
+    """Get size of a single file in a HuggingFace repo (for GGUF downloads)."""
+    try:
+        info = HfApi(token=token).model_info(repo_id, files_metadata=True)
+        for sibling in getattr(info, "siblings", []) or []:
+            if getattr(sibling, "rfilename", None) == filename:
+                size = getattr(sibling, "size", None)
+                if isinstance(size, int) and size > 0:
+                    return size
+        return None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not get file size for %s/%s: %s", repo_id, filename, exc)
+        return None
+
+
 def _emit_download_progress(
     progress: Optional[Progress],
     message: str,
@@ -193,6 +208,42 @@ def merge_whisper_blocks_into_utterances(
         merged.append(current)
     return merged
 
+def merge_speaker_segments(
+    blocks: list[TranscriptSegment],
+    *,
+    max_gap_seconds: float = 2.0,
+    max_duration_seconds: float = 60.0,
+) -> list[TranscriptSegment]:
+    """Merge consecutive segments that belong to the same speaker.
+
+    Whisper with diarization often produces many 2-10 second fragments for a
+    single speaker talking continuously.  This post-processing step combines
+    adjacent same-speaker segments so the output is comparable to Parakeet's
+    natural block sizes (BUG-02).
+    """
+    if not blocks:
+        return blocks
+    merged: list[TranscriptSegment] = []
+    current = blocks[0]
+    for block in blocks[1:]:
+        same_speaker = (current.speaker and block.speaker and current.speaker == block.speaker)
+        gap = max(0.0, block.start_seconds - current.end_seconds)
+        combined_duration = block.end_seconds - current.start_seconds
+        if same_speaker and gap <= max_gap_seconds and combined_duration <= max_duration_seconds:
+            combined_text = current.text.rstrip() + " " + block.text.lstrip()
+            current = TranscriptSegment(
+                current.start_seconds,
+                max(current.end_seconds, block.end_seconds),
+                combined_text.strip(),
+                current.speaker,
+            )
+        else:
+            merged.append(current)
+            current = block
+    merged.append(current)
+    return merged
+
+
 @dataclass(frozen=True)
 class ModelSpec:
     key: str
@@ -224,8 +275,72 @@ ADDITIONAL_MODELS: dict[str, ModelSpec] = {
     "addon:sortformer": ModelSpec("addon:sortformer", "Дополнительно", "Sortformer Diarization v2.1", "cgus/diar_streaming_sortformer_4spk-v2.1-onnx", "diar_streaming_sortformer_4spk-v2.1.onnx", "до 4 спикеров", "~492 МБ", "ONNX-модель для определения говорящих в файлах; функция выключена по умолчанию"),
 }
 
+SUMMARY_MODELS: dict[str, ModelSpec] = {
+    "summary:qwen3-1.7b": ModelSpec(
+        "summary:qwen3-1.7b", "Суммаризация", "Qwen3 1.7B Q4_K_M",
+        "bartowski/Qwen_Qwen3-1.7B-GGUF",
+        "Qwen_Qwen3-1.7B-Q4_K_M.gguf",
+        "мультиязычная / русский",
+        "~1.2 ГБ",
+        "GGUF-модель для локальной суммаризации расшифровок; CPU-friendly Q4"
+    ),
+}
+DEFAULT_SUMMARY_MODEL_KEY = "summary:qwen3-1.7b"
+
 TRANSCRIPTION_MODELS: dict[str, ModelSpec] = {**WHISPER_MODELS, **PARAKEET_MODELS}
-ALL_MODELS: dict[str, ModelSpec] = {**TRANSCRIPTION_MODELS, **ADDITIONAL_MODELS}
+ALL_MODELS: dict[str, ModelSpec] = {**TRANSCRIPTION_MODELS, **ADDITIONAL_MODELS, **SUMMARY_MODELS}
+
+# US-015, US-016: Cloud STT models registry.
+# Заполняется динамически через ModelManager.refresh_cloud_models(cfg)
+# на основе настроек API-ключей и discover_models() от провайдера.
+# Ключ формата "cloud:<provider>:<model_id>", например "cloud:openai:whisper-1".
+_CLOUD_MODELS_REGISTRY: dict[str, ModelSpec] = {}
+CLOUD_OPENAI_ENGINE = "Cloud-OpenAI"
+CLOUD_ELEVENLABS_ENGINE = "Cloud-ElevenLabs"
+
+
+def is_cloud_model_key(key: str) -> bool:
+    return key.startswith("cloud:")
+
+
+def cloud_provider_of(key: str) -> str:
+    """Извлечь имя провайдера из cloud-ключа: cloud:openai:xxx → "openai"."""
+    parts = key.split(":", 2)
+    if len(parts) >= 2 and parts[0] == "cloud":
+        return parts[1]
+    return ""
+
+
+def cloud_model_id_of(key: str) -> str:
+    """Извлечь model_id из cloud-ключа: cloud:openai:whisper-1 → "whisper-1"."""
+    parts = key.split(":", 2)
+    if len(parts) >= 3 and parts[0] == "cloud":
+        return parts[2]
+    return ""
+
+
+def _make_cloud_spec(engine: str, display_provider: str, model_id: str) -> ModelSpec:
+    key = f"cloud:{display_provider.lower()}:{model_id}" if False else None  # placeholder unused
+    # На самом деле ключ строится в refresh_cloud_models — здесь только spec поля
+    if engine == CLOUD_OPENAI_ENGINE:
+        name = f"OpenAI — {model_id}"
+        note = "OpenAI-совместимый STT API"
+    elif engine == CLOUD_ELEVENLABS_ENGINE:
+        name = f"ElevenLabs — {model_id}"
+        note = "ElevenLabs Speech-to-Text"
+    else:
+        name = model_id
+        note = "Cloud STT"
+    return ModelSpec(
+        key="",  # будет задано вызывающим
+        engine=engine,
+        name=name,
+        repo_id="",
+        loader_name=model_id,
+        language_hint="мультиязычная",
+        size_hint="облако",
+        note=note,
+    )
 WHISPER_REQUIRED_FILES_BY_KEY: dict[str, tuple[str, ...]] = {
     "whisper:tiny": ("model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.json"),
     "whisper:base": ("model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.json"),
@@ -246,7 +361,21 @@ ADDITIONAL_REQUIRED_FILES_BY_KEY: dict[str, tuple[str, ...]] = {
 def model_display_name(key: str) -> str:
     spec = ALL_MODELS.get(key)
     if spec is None:
+        spec = _CLOUD_MODELS_REGISTRY.get(key)
+    if spec is None:
+        # TASK-056 (US-017): для cloud-ключей, которых нет ни в ALL_MODELS,
+        # ни в _CLOUD_MODELS_REGISTRY (ключ удалён из настроек, история
+        # помнит расшифровку), собираем читабельное имя из самого ключа.
+        if is_cloud_model_key(key):
+            provider = cloud_provider_of(key)
+            model_id = cloud_model_id_of(key)
+            provider_label = {"openai": "OpenAI", "elevenlabs": "ElevenLabs"}.get(provider, provider or "Cloud")
+            return f"{provider_label} · {model_id}"
         return key
+    # Для cloud-моделей spec.name уже содержит провайдера ("OpenAI — whisper-1"),
+    # дублировать engine не нужно
+    if is_cloud_model_key(key):
+        return spec.name
     return f"{spec.engine} — {spec.name}"
 
 
@@ -256,8 +385,19 @@ def _has_incomplete_downloads(path: Path) -> bool:
     return any(p.name.endswith(".incomplete") for p in path.rglob("*"))
 
 
+def _is_summary_model(spec: ModelSpec) -> bool:
+    """Summary models are single GGUF files, not directories."""
+    return spec.key in SUMMARY_MODELS
+
+
 def _missing_required_files(spec: ModelSpec, path: Path) -> list[str]:
     missing: list[str] = []
+    # Summary GGUF models are single files, not directories
+    if _is_summary_model(spec):
+        gguf_path = path / spec.loader_name
+        if not gguf_path.is_file() or gguf_path.stat().st_size < 1_000_000:
+            missing.append(spec.loader_name)
+        return missing
     if not path.exists() or not path.is_dir():
         return ["<model directory>"]
     if _has_incomplete_downloads(path):
@@ -313,6 +453,9 @@ class ModelManager:
     def __init__(self) -> None:
         self._loaded: dict[str, object] = {}
         self._locks: dict[str, threading.RLock] = {}
+        # Последний применённый AppConfig — нужен для проверки доступности
+        # cloud-моделей (наличие API-ключа в cfg). Заполняется refresh_cloud_models().
+        self._last_cfg: AppConfig | None = None
 
     def _lock_for(self, key: str) -> threading.RLock:
         if key not in self._locks:
@@ -320,27 +463,112 @@ class ModelManager:
         return self._locks[key]
 
     def spec(self, key: str) -> ModelSpec:
-        if key not in ALL_MODELS:
-            raise KeyError(f"Неизвестная модель: {key}")
-        return ALL_MODELS[key]
+        if key in ALL_MODELS:
+            return ALL_MODELS[key]
+        if key in _CLOUD_MODELS_REGISTRY:
+            return _CLOUD_MODELS_REGISTRY[key]
+        raise KeyError(f"Неизвестная модель: {key}")
+
+    # Cyrillic engine names → ASCII-safe folder names for filesystem
+    _ENGINE_DIRS = {"Суммаризация": "summarization"}
 
     def model_path(self, key: str) -> Path:
+        if is_cloud_model_key(key):
+            raise ValueError(f"Cloud-модель не имеет локального пути: {key}")
         spec = self.spec(key)
         safe = key.replace(":", "_")
-        return models_dir() / spec.engine.lower() / safe
+        engine_dir = self._ENGINE_DIRS.get(spec.engine, spec.engine.lower())
+        return models_dir() / engine_dir / safe
+
+    def is_cloud_model(self, key: str) -> bool:
+        return is_cloud_model_key(key)
+
+    def cloud_model_keys(self) -> list[str]:
+        """Все зарегистрированные cloud-модели (для UI dropdown, включая «не настроено»)."""
+        return list(_CLOUD_MODELS_REGISTRY.keys())
+
+    def refresh_cloud_models(self, cfg: AppConfig) -> None:
+        """Перестроить реестр cloud-моделей на основе сохранённого AppConfig.
+
+        ВАЖНО: метод НЕ делает HTTP-запросов. Регистрирует ТОЛЬКО те модели,
+        которые пользователь уже один раз успешно обнаружил через кнопку
+        «Проверить соединение» (они сохранены в cfg.openai_stt_model_id /
+        cfg.elevenlabs_stt_model_id). До этого момента cloud-моделей в списке
+        нет (US-021: не показываем заглушки до подтверждения провайдером).
+
+        После успешного verify в UI вызывается set_cloud_models() — он
+        регистрирует все обнаруженные модели напрямую из ответа воркера.
+        """
+        self._last_cfg = cfg
+        _CLOUD_MODELS_REGISTRY.clear()
+
+        if cfg.openai_stt_api_key and cfg.openai_stt_model_id:
+            self._register_cloud_model("openai", cfg.openai_stt_model_id)
+        if cfg.elevenlabs_stt_api_key and cfg.elevenlabs_stt_model_id:
+            self._register_cloud_model("elevenlabs", cfg.elevenlabs_stt_model_id)
+
+    def set_cloud_models(self, provider: str, model_ids: list[str]) -> None:
+        """Зарегистрировать обнаруженные cloud-модели одного провайдера.
+        Вызывается из UI после успешного CloudConnectionCheckWorker.
+        Не делает HTTP — model_ids получены воркером.
+        """
+        # Очищаем модели этого провайдера, но не трогаем другого
+        for key in list(_CLOUD_MODELS_REGISTRY.keys()):
+            if cloud_provider_of(key) == provider:
+                _CLOUD_MODELS_REGISTRY.pop(key, None)
+        for mid in model_ids:
+            self._register_cloud_model(provider, mid)
+
+    def _register_cloud_model(self, provider: str, model_id: str) -> None:
+        """Добавить одну cloud-модель в _CLOUD_MODELS_REGISTRY."""
+        if not model_id:
+            return
+        if provider == "openai":
+            engine = CLOUD_OPENAI_ENGINE
+            display = "OpenAI"
+        elif provider == "elevenlabs":
+            engine = CLOUD_ELEVENLABS_ENGINE
+            display = "ElevenLabs"
+        else:
+            return
+        key = f"cloud:{provider}:{model_id}"
+        spec_obj = _make_cloud_spec(engine, display, model_id)
+        _CLOUD_MODELS_REGISTRY[key] = ModelSpec(
+            key=key,
+            engine=spec_obj.engine,
+            name=spec_obj.name,
+            repo_id="",
+            loader_name=model_id,
+            language_hint=spec_obj.language_hint,
+            size_hint=spec_obj.size_hint,
+            note=spec_obj.note,
+        )
 
     def is_installed(self, key: str) -> bool:
-        """Return True only for fully downloaded, loadable app-managed models."""
+        """Return True only for fully downloaded, loadable app-managed models.
+
+        Для cloud-моделей возвращает True, если задан соответствующий API-ключ
+        (нет смысла говорить о «загрузке» для облака).
+        """
+        if is_cloud_model_key(key):
+            return self.is_available(key)
         if key not in ALL_MODELS:
             return False
         spec = self.spec(key)
         return _is_complete_model_dir(spec, self.model_path(key))
 
     def is_incomplete(self, key: str) -> bool:
+        if is_cloud_model_key(key):
+            return False
         if key not in ALL_MODELS:
             return False
         path = self.model_path(key)
-        return path.exists() and any(path.iterdir()) and not self.is_installed(key)
+        if not path.exists():
+            return False
+        if _is_summary_model(self.spec(key)):
+            # Summary model dir exists but GGUF file missing or too small
+            return not self.is_installed(key)
+        return any(path.iterdir()) and not self.is_installed(key)
 
     def is_available(self, key: str) -> bool:
         """Return whether the model can be selected by the user.
@@ -348,15 +576,31 @@ class ModelManager:
         Whisper Small is available by default through faster-whisper's named model
         loader/cache even when there is no app-managed local directory yet.
         All other transcription models must be explicitly downloaded through the Models tab.
-        Unknown, legacy, and additional service models are never selectable for dictation.
+        Summary models are available once downloaded.
+        Cloud models — доступны если задан соответствующий API-ключ.
         """
+        if is_cloud_model_key(key):
+            if key not in _CLOUD_MODELS_REGISTRY:
+                return False
+            if self._last_cfg is None:
+                return False
+            provider = cloud_provider_of(key)
+            if provider == "openai":
+                return bool(self._last_cfg.openai_stt_api_key)
+            if provider == "elevenlabs":
+                return bool(self._last_cfg.elevenlabs_stt_api_key)
+            return False
         if key == DEFAULT_MODEL_KEY:
             return True
+        if key in SUMMARY_MODELS:
+            return self.is_installed(key)
         if key not in TRANSCRIPTION_MODELS:
             return False
         return self.is_installed(key)
 
     def installed_status(self, key: str) -> str:
+        if is_cloud_model_key(key):
+            return "Облачная" if self.is_available(key) else "Не настроена"
         if self.is_installed(key):
             return "Загружена"
         if self.is_incomplete(key):
@@ -366,18 +610,38 @@ class ModelManager:
         return "Не загружена"
 
     def is_transcription_model(self, key: str) -> bool:
-        return key in TRANSCRIPTION_MODELS
+        if key in TRANSCRIPTION_MODELS:
+            return True
+        return is_cloud_model_key(key) and key in _CLOUD_MODELS_REGISTRY
 
     def is_additional_model(self, key: str) -> bool:
         return key in ADDITIONAL_MODELS
+
+    def is_summary_model(self, key: str) -> bool:
+        return key in SUMMARY_MODELS
+
+    def summary_model_gguf_path(self, key: str) -> Path:
+        """Return the full path to the GGUF file for a summary model."""
+        spec = self.spec(key)
+        return self.model_path(key) / spec.loader_name
+
+    def available_summary_model_keys(self) -> list[str]:
+        """Return keys of summary models that are downloaded and ready."""
+        return [key for key in SUMMARY_MODELS if self.is_installed(key)]
 
     def available_model_keys(self) -> list[str]:
         keys = [key for key in TRANSCRIPTION_MODELS if self.is_available(key)]
         if DEFAULT_MODEL_KEY not in keys:
             keys.insert(0, DEFAULT_MODEL_KEY)
+        # Добавляем cloud-модели, для которых задан API-ключ (US-015, US-016)
+        for ckey in _CLOUD_MODELS_REGISTRY:
+            if self.is_available(ckey):
+                keys.append(ckey)
         return keys
 
     def download(self, key: str, progress: Optional[Progress] = None, *, hf_token: str | None = None) -> Path:
+        if is_cloud_model_key(key):
+            raise ValueError("Cloud-модели не нужно скачивать — они используются через API")
         spec = self.spec(key)
         final_path = self.model_path(key)
         staging_path = final_path.with_name(final_path.name + ".downloading")
@@ -392,7 +656,10 @@ class ModelManager:
             staging_path.mkdir(parents=True, exist_ok=True)
 
             token = _resolve_hf_token(hf_token)
-            total_bytes = _repo_size_bytes(spec.repo_id, token=token) or 0
+            if _is_summary_model(spec):
+                total_bytes = _single_file_size_bytes(spec.repo_id, spec.loader_name, token=token) or 0
+            else:
+                total_bytes = _repo_size_bytes(spec.repo_id, token=token) or 0
             stop_monitor = threading.Event()
 
             def monitor_download() -> None:
@@ -422,13 +689,24 @@ class ModelManager:
             monitor_thread = threading.Thread(target=monitor_download, name=f"download-progress-{key}", daemon=True)
             monitor_thread.start()
             try:
-                snapshot_download(
-                    repo_id=spec.repo_id,
-                    local_dir=str(staging_path),
-                    local_dir_use_symlinks=False,
-                    resume_download=False,
-                    token=token,
-                )
+                if _is_summary_model(spec):
+                    # Summary GGUF: download single file directly into staging_path.
+                    # hf_hub_download with local_dir places the file under staging_path
+                    # so our directory-size monitor can track real progress.
+                    hf_hub_download(
+                        repo_id=spec.repo_id,
+                        filename=spec.loader_name,
+                        local_dir=str(staging_path),
+                        token=token,
+                    )
+                else:
+                    snapshot_download(
+                        repo_id=spec.repo_id,
+                        local_dir=str(staging_path),
+                        local_dir_use_symlinks=False,
+                        resume_download=False,
+                        token=token,
+                    )
             finally:
                 stop_monitor.set()
                 monitor_thread.join(timeout=2.0)
@@ -458,6 +736,8 @@ class ModelManager:
             return final_path
 
     def delete(self, key: str) -> None:
+        if is_cloud_model_key(key):
+            raise ValueError("Cloud-модели нельзя удалить — отключите API-ключ в настройках")
         path = self.model_path(key)
         staging_path = path.with_name(path.name + ".downloading")
         log.info("Delete model: %s from %s", key, path)
@@ -468,6 +748,10 @@ class ModelManager:
             _safe_rmtree(staging_path, retries=2)
 
     def preload(self, key: str, cfg: AppConfig) -> None:
+        if is_cloud_model_key(key):
+            # Cloud-модели не требуют preload — API всегда «горячий»
+            log.info("Skip preload for cloud model: %s", key)
+            return
         spec = self.spec(key)
         if not self.is_available(key) or not self.is_transcription_model(key):
             log.info("Skip preload for unavailable/non-transcription model: %s", key)
@@ -482,6 +766,10 @@ class ModelManager:
         spec = self.spec(key)
         if not self.is_available(key):
             raise RuntimeError(f"Модель {model_display_name(key)} не загружена. Сначала загрузите её во вкладке «Модели».")
+        # Cloud-модели (US-015, US-016, US-032) — отдельная ветка, без блокировки
+        # (несколько cloud-запросов могут идти параллельно — это нормально).
+        if is_cloud_model_key(key):
+            return self._transcribe_cloud(key, wav_path, cfg)
         with self._lock_for(key):
             transcription_log.info("Transcription start: key=%s engine=%s live=%s language=%s path=%s", key, spec.engine, is_live, _normalize_language(cfg.language), wav_path)
             if spec.engine == "Whisper":
@@ -492,6 +780,147 @@ class ModelManager:
                 raise RuntimeError(f"Неподдерживаемый движок: {spec.engine}")
             transcription_log.info("Transcription done: key=%s live=%s chars=%s", key, is_live, len(text))
             return text
+
+    def _transcribe_cloud(
+        self,
+        key: str,
+        wav_path: Path,
+        cfg: AppConfig,
+        *,
+        on_chunk_done=None,
+        cancel_check=None,
+        chunk_local_fallback=None,
+    ) -> str:
+        """Расшифровка через облачный STT (US-015, US-016) с автонарезкой (US-032).
+
+        Проактивно проверяем интернет (US-015 решение F), затем шлём один
+        запрос или несколько чанков. Исключения cloud_stt.* пробрасываются
+        наверх — их перехватывает transcribe_with_fallback() для переключения
+        на локальную модель.
+
+        TASK-078/TASK-079 (US-017): on_chunk_done и cancel_check пробрасываются
+        в split_and_transcribe для прогрессивных block_ready и отзывчивой отмены.
+        """
+        from . import cloud_stt
+
+        provider = cloud_provider_of(key)
+        model_id = cloud_model_id_of(key)
+        language = _normalize_language(cfg.language)
+        max_chunk = max(10, int(getattr(cfg, "cloud_max_chunk_seconds", 60) or 60))
+        transcription_log.info(
+            "Cloud STT start: key=%s provider=%s model=%s language=%s path=%s max_chunk=%ds",
+            key, provider, model_id, language or "auto", wav_path, max_chunk,
+        )
+
+        if provider == "openai":
+            host = cloud_stt._host_from_url(cfg.openai_stt_base_url)
+
+            def _one(chunk_path: Path) -> str:
+                return cloud_stt.transcribe_openai_compatible(
+                    chunk_path,
+                    api_key=cfg.openai_stt_api_key,
+                    base_url=cfg.openai_stt_base_url,
+                    model_id=model_id or "whisper-1",
+                    language=language,
+                )
+
+            text = cloud_stt.split_and_transcribe(
+                wav_path,
+                _one,
+                max_chunk_seconds=max_chunk,
+                require_internet_host=host,
+                on_chunk_done=on_chunk_done,
+                cancel_check=cancel_check,
+                chunk_local_fallback=chunk_local_fallback,
+            )
+        elif provider == "elevenlabs":
+            def _one(chunk_path: Path) -> str:
+                return cloud_stt.transcribe_elevenlabs(
+                    chunk_path,
+                    api_key=cfg.elevenlabs_stt_api_key,
+                    model_id=model_id or "scribe_v1",
+                    language=language,
+                )
+
+            text = cloud_stt.split_and_transcribe(
+                wav_path,
+                _one,
+                max_chunk_seconds=max_chunk,
+                require_internet_host=cloud_stt.ELEVENLABS_HOST,
+                on_chunk_done=on_chunk_done,
+                cancel_check=cancel_check,
+                chunk_local_fallback=chunk_local_fallback,
+            )
+        else:
+            raise RuntimeError(f"Неподдерживаемый cloud-провайдер: {provider}")
+        transcription_log.info("Cloud STT done: key=%s chars=%s", key, len(text))
+        return text
+
+    def transcribe_with_fallback(
+        self,
+        key: str,
+        wav_path: Path,
+        cfg: AppConfig,
+        *,
+        is_live: bool = False,
+        on_cloud_chunk=None,
+        cancel_check=None,
+        chunk_local_fallback=None,
+    ) -> tuple[str, bool, str, str]:
+        """Обёртка над transcribe() с автоматическим fallback на локальную модель.
+
+        Возвращает кортеж (text, used_fallback, fallback_key, reason).
+        Если used_fallback=True, cfg.selected_model уже переключён на
+        cfg.cloud_fallback_model_key и сохранён в config.json
+        (US-015/US-016 решение G).
+        """
+        # Не cloud → как обычно (колбэки игнорируются — локальные модели
+        # обрабатываются через transcribe_file_progressive со своим прогрессом)
+        if not is_cloud_model_key(key):
+            text = self.transcribe(key, wav_path, cfg, is_live=is_live)
+            return text, False, key, ""
+
+        # Cloud → пробуем напрямую через _transcribe_cloud с колбэками,
+        # при сбое — fallback на локальную модель.
+        from . import cloud_stt as _cs
+
+        try:
+            text = self._transcribe_cloud(
+                key, wav_path, cfg,
+                on_chunk_done=on_cloud_chunk,
+                cancel_check=cancel_check,
+                chunk_local_fallback=chunk_local_fallback,
+            )
+            return text, False, key, ""
+        except _cs.CloudSttError as exc:
+            fallback_key = cfg.cloud_fallback_model_key or DEFAULT_MODEL_KEY
+            reason = self._format_cloud_error_reason(exc)
+            log.warning("Cloud STT failed (%s), falling back to %s: %s", key, fallback_key, exc)
+            # Переключаем selected_model и сохраняем (решение G)
+            try:
+                cfg.selected_model = fallback_key
+                cfg.save()
+            except Exception as save_exc:  # noqa: BLE001
+                log.warning("Failed to save cfg after fallback: %s", save_exc)
+            # Делаем fallback-расшифровку локальной моделью
+            text = self.transcribe(fallback_key, wav_path, cfg, is_live=is_live)
+            return text, True, fallback_key, reason
+
+    @staticmethod
+    def _format_cloud_error_reason(exc: Exception) -> str:
+        # Поздний импорт чтобы не создавать жёсткую связь
+        from . import cloud_stt as _cs
+        if isinstance(exc, _cs.CloudNetworkError):
+            return "нет соединения с интернетом"
+        if isinstance(exc, _cs.CloudAuthError):
+            return "неверный API-ключ"
+        if isinstance(exc, _cs.CloudPayloadTooLarge):
+            return "файл превышает лимит провайдера"
+        if isinstance(exc, _cs.CloudRateLimit):
+            return "превышен лимит запросов"
+        if isinstance(exc, _cs.CloudServerError):
+            return "ошибка на стороне провайдера"
+        return f"ошибка облачного API: {exc}"
 
     def transcribe_file_progressive(
         self,
@@ -680,6 +1109,18 @@ class ModelManager:
             emit_block(pending)
         merged_preview = merge_whisper_blocks_into_utterances(raw_segments)
         transcription_log.info("Whisper merge: raw_segments=%s emitted_blocks=%s merged_preview=%s", len(raw_segments), len(emitted_blocks), len(merged_preview))
+        if diarize and len(emitted_blocks) > 1:
+            before_count = len(emitted_blocks)
+            emitted_blocks = merge_speaker_segments(emitted_blocks)
+            transcription_log.info(
+                "Speaker segment merge: before=%s after=%s key=%s",
+                before_count, len(emitted_blocks), spec.key,
+            )
+            # Re-emit merged blocks so the UI displays consolidated speaker segments
+            if block_callback is not None:
+                block_callback(0.0, 0.0, "", "", True)  # replace_existing=True clears old blocks
+                for b in emitted_blocks:
+                    block_callback(b.start_seconds, b.end_seconds, b.text, b.speaker, False)
         if diarize:
             transcription_log.info("Speaker labels applied progressively: key=%s blocks=%s", spec.key, sum(1 for b in emitted_blocks if b.speaker))
         parts: list[str] = []
@@ -780,6 +1221,17 @@ class ModelManager:
                     percent = int(max(0.0, min(100.0, (done / duration_seconds) * 100.0)))
                     if progress_callback is not None:
                         progress_callback(done, f"{percent}% · фрагмент {index} из {len(chunks)} · {format_duration(done)} из {format_duration(duration_seconds)}")
+            if diarize and len(blocks) > 1:
+                before_count = len(blocks)
+                blocks = merge_speaker_segments(blocks)
+                transcription_log.info(
+                    "Speaker segment merge: before=%s after=%s key=%s",
+                    before_count, len(blocks), spec.key,
+                )
+                if block_callback is not None:
+                    block_callback(0.0, 0.0, "", "", True)  # replace_existing=True
+                    for b in blocks:
+                        block_callback(b.start_seconds, b.end_seconds, b.text, b.speaker, False)
             if diarize:
                 transcription_log.info("Speaker labels applied progressively: key=%s blocks=%s", spec.key, sum(1 for b in blocks if b.speaker))
             parts: list[str] = []

@@ -10,7 +10,7 @@ from .audio_files import cleanup_prepared_file, convert_media_to_wav_16k_mono, f
 from .audio_recorder import auto_detect_input_device
 from .config import AppConfig
 from .logger import get_logger
-from .models import ModelManager
+from .models import ModelManager, is_cloud_model_key, model_display_name
 
 log = get_logger("workers")
 
@@ -81,6 +81,9 @@ class PreloadWorker(QThread):
 
 class TranscribeWorker(QThread):
     finished_text = Signal(str, float)
+    # US-015/US-016: уведомление о применённом fallback (cloud → локальная).
+    # Эмитится ДО finished_text, если cloud упал. Передаёт (fallback_key, reason).
+    fallback_applied = Signal(str, str)
     failed = Signal(str)
 
     def __init__(self, manager: ModelManager, model_key: str, wav_path: Path, duration: float, cfg: AppConfig, *, is_live: bool = False) -> None:
@@ -94,7 +97,11 @@ class TranscribeWorker(QThread):
 
     def run(self) -> None:
         try:
-            text = self.manager.transcribe(self.model_key, self.wav_path, self.cfg, is_live=self.is_live)
+            text, used_fallback, fallback_key, reason = self.manager.transcribe_with_fallback(
+                self.model_key, self.wav_path, self.cfg, is_live=self.is_live
+            )
+            if used_fallback:
+                self.fallback_applied.emit(fallback_key, reason)
             self.finished_text.emit(text, self.duration)
         except Exception as exc:  # noqa: BLE001
             log.exception("Transcription failed: model=%s live=%s path=%s", self.model_key, self.is_live, self.wav_path)
@@ -108,6 +115,9 @@ class FileTranscribeWorker(QThread):
     finished_text = Signal(str, float, str, str)
     failed = Signal(str)
     cancelled = Signal()
+    # TASK-055 (US-017): уведомление UI о том, что cloud упал и применён fallback.
+    # Параметры: fallback_key, reason. UI обновляет combo и показывает уведомление.
+    fallback_applied = Signal(str, str)
 
     def __init__(self, manager: ModelManager, model_key: str, input_path: Path, cfg: AppConfig) -> None:
         super().__init__()
@@ -151,6 +161,89 @@ class FileTranscribeWorker(QThread):
             def on_block(start: float, end: float, text: str, speaker: str = "", replace_existing: bool = False) -> None:
                 self.block_ready.emit(FileTranscriptBlock(start_seconds=start, end_seconds=end, text=text, speaker=speaker or "", replace_existing=replace_existing))
 
+            # TASK-052 (US-017): ветка cloud для расшифровки файлов.
+            # TASK-078: прогрессивный прогресс — block_ready по мере готовности
+            # каждого чанка, percent = chunks_done / total_chunks × 100.
+            # TASK-079: отзывчивая отмена — cancel_check пробрасывается в
+            # split_and_transcribe, при отмене текущий in-flight чанк
+            # дорабатывается (Python не умеет прерывать запущенные потоки),
+            # новые не запускаются — ожидание ≤120с (READ_TIMEOUT).
+            if is_cloud_model_key(self.model_key):
+                self._emit_progress(0.0, duration, f"Отправляю файл в облако: {model_display_name(self.model_key)}…")
+                if self._cancel_requested:
+                    self.cancelled.emit()
+                    return
+
+                # Счётчик готовых чанков для расчёта прогресса
+                chunks_done = [0]
+
+                def _on_cloud_chunk(index: int, total: int, start_sec: float, end_sec: float, text: str) -> None:
+                    if self._cancel_requested:
+                        return
+                    chunks_done[0] += 1
+                    done = chunks_done[0]
+                    # Текст готового куска — в UI прогрессивно (TASK-078)
+                    if text:
+                        self.block_ready.emit(FileTranscriptBlock(
+                            start_seconds=start_sec,
+                            end_seconds=end_sec,
+                            text=text,
+                            speaker="",
+                            replace_existing=False,
+                        ))
+                    # Прогресс по доле готовых чанков
+                    if total > 0:
+                        processed_seconds = duration * done / total
+                        percent = int(min(100.0, done * 100.0 / total))
+                        self._emit_progress(
+                            processed_seconds,
+                            duration,
+                            f"{percent}% · cloud · чанк {done}/{total}",
+                        )
+
+                # TASK-085: per-chunk local fallback. При rate limit или ошибке cloud
+                # отдельного чанка — перерасшифровываем этот чанк локально (через
+                # cloud_fallback_model_key), не пробрасывая ошибку всему файлу.
+                # Это сохраняет частичный прогресс и таймкоды.
+                fb_local_key = self.cfg.cloud_fallback_model_key or "whisper:small"
+
+                def _chunk_local_fallback(chunk_wav_path: Path) -> str:
+                    """TASK-085: расшифровать ОДИН чанк локально, чтобы спасти прогресс
+                    cloud-файла при ошибке отдельного чанка."""
+                    log.info("Per-chunk local fallback: %s with %s", chunk_wav_path.name, fb_local_key)
+                    return self.manager.transcribe(fb_local_key, chunk_wav_path, self.cfg, is_live=False)
+
+                try:
+                    text, used_fallback, fallback_key, reason = self.manager.transcribe_with_fallback(
+                        self.model_key,
+                        prepared_path,
+                        self.cfg,
+                        is_live=False,
+                        on_cloud_chunk=_on_cloud_chunk,
+                        cancel_check=lambda: self._cancel_requested,
+                        chunk_local_fallback=_chunk_local_fallback,
+                    )
+                except InterruptedError:
+                    # TASK-079: split_and_transcribe бросает при отмене
+                    self.cancelled.emit()
+                    return
+                if self._cancel_requested:
+                    self.cancelled.emit()
+                    return
+                final_key = fallback_key if used_fallback else self.model_key
+                if used_fallback:
+                    log.info("File transcribe cloud→fallback: %s → %s (%s)", self.model_key, fallback_key, reason)
+                    self.fallback_applied.emit(fallback_key, reason)
+                    # Fallback пошёл через локальную модель — текст уже готов целиком,
+                    # эмитим один блок (как раньше для cloud без чанк-прогресса)
+                    self.block_ready.emit(FileTranscriptBlock(
+                        start_seconds=0.0, end_seconds=duration, text=text,
+                        speaker="", replace_existing=False,
+                    ))
+                self._emit_progress(duration, duration, "100% · готово")
+                self.finished_text.emit(text, duration, str(self.input_path), final_key)
+                return
+
             text = self.manager.transcribe_file_progressive(
                 self.model_key,
                 prepared_path,
@@ -192,6 +285,29 @@ class MicrophoneAutodetectWorker(QThread):
             log.exception("Microphone autodetect failed")
             self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
 
+
+class SummarizeWorker(QThread):
+    """Run summarization in background thread."""
+    finished_text = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, text: str, model_path: str, system_prompt: str = "") -> None:
+        super().__init__()
+        self.text = text
+        self.model_path = model_path
+        self.system_prompt = system_prompt
+
+    def run(self) -> None:
+        try:
+            from pathlib import Path
+            from .summarizer import summarize
+            result = summarize(self.text, model_path=Path(self.model_path), system_prompt=self.system_prompt)
+            self.finished_text.emit(result)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Summarization failed")
+            self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
+
+
 class UpdateCheckWorker(QThread):
     finished_result = Signal(object)
     failed = Signal(str)
@@ -230,3 +346,47 @@ class UpdateDownloadWorker(QThread):
         except Exception as exc:  # noqa: BLE001
             log.exception("Update download failed")
             self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
+
+
+class CloudConnectionCheckWorker(QThread):
+    """Проверяет соединение с облачным STT-провайдером и обновляет список моделей.
+
+    US-015, US-016. Эмитит result(ok: bool, message: str, models: list[str]).
+    Используется кнопкой «Проверить соединение» в настройках.
+    """
+
+    result = Signal(bool, str, list)
+
+    def __init__(self, provider: str, api_key: str, base_url: str = "") -> None:
+        super().__init__()
+        self.provider = provider
+        self.api_key = api_key
+        self.base_url = base_url
+
+    def run(self) -> None:
+        try:
+            from . import cloud_stt
+        except Exception as exc:  # noqa: BLE001
+            log.exception("cloud_stt import failed")
+            self.result.emit(False, f"Не удалось загрузить модуль cloud_stt: {exc}", [])
+            return
+        try:
+            if self.provider == "openai":
+                ok, message = cloud_stt.verify_openai_compatible_connection(self.api_key, self.base_url)
+            elif self.provider == "elevenlabs":
+                ok, message = cloud_stt.verify_elevenlabs_connection(self.api_key)
+            else:
+                self.result.emit(False, f"Неизвестный провайдер: {self.provider}", [])
+                return
+            models: list[str] = []
+            if ok:
+                cloud_stt.invalidate_discover_cache()
+                try:
+                    models = cloud_stt.discover_models(self.provider, self.api_key, self.base_url or None)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("discover_models failed after successful verify: %s", exc)
+                    models = []
+            self.result.emit(ok, message, models)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("CloudConnectionCheckWorker failed")
+            self.result.emit(False, f"Сбой проверки: {exc}", [])

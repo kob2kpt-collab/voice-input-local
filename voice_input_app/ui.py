@@ -10,13 +10,14 @@ from string import punctuation
 
 import pyperclip
 from PySide6.QtCore import QObject, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QIcon, QKeySequence, QTextCursor
+from PySide6.QtGui import QAction, QCloseEvent, QIcon, QKeySequence, QStandardItem, QStandardItemModel, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -27,6 +28,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QProgressBar,
     QKeySequenceEdit,
+    QScrollArea,
+    QSpinBox,
     QSystemTrayIcon,
     QStyle,
     QTabWidget,
@@ -46,17 +49,21 @@ from .history import HistoryItem, HistoryStore
 from .hotkeys import HotkeyService, normalize_hotkey
 from .insert import copy_and_maybe_paste, focused_control_accepts_text, foreground_belongs_to_current_process, foreground_matches_window_handle
 from .logger import get_logger, setup_logging
-from .models import ALL_MODELS, DEFAULT_MODEL_KEY, DownloadProgress, ModelManager, merge_transcript_parts, model_display_name
+from .models import ALL_MODELS, DEFAULT_MODEL_KEY, DEFAULT_SUMMARY_MODEL_KEY, SUMMARY_MODELS, DownloadProgress, ModelManager, TRANSCRIPTION_MODELS, cloud_provider_of, is_cloud_model_key, merge_transcript_parts, model_display_name
 from .overlay import RecordingOverlay
-from .paths import app_icon_path, logs_dir
+from .paths import app_icon_path, logs_dir, models_dir
 from .updater import UpdateInfo, launch_update_file, normalize_repo
-from .workers import DownloadWorker, FileProgress, FileTranscribeWorker, FileTranscriptBlock, MicrophoneAutodetectWorker, MicrophoneAutodetectResult, PreloadWorker, TranscribeWorker, UpdateCheckWorker, UpdateDownloadWorker
+from .workers import CloudConnectionCheckWorker, DownloadWorker, FileProgress, FileTranscribeWorker, FileTranscriptBlock, MicrophoneAutodetectWorker, MicrophoneAutodetectResult, PreloadWorker, SummarizeWorker, TranscribeWorker, UpdateCheckWorker, UpdateDownloadWorker
+try:
+    from .summarizer import DEFAULT_SUMMARY_PROMPT
+except ImportError:
+    DEFAULT_SUMMARY_PROMPT = ""
 
 log = get_logger("ui")
 
 APP_STYLE = """
 QMainWindow { background: #101114; color: #f4f4f5; }
-QWidget { font-size: 13px; color: #f4f4f5; }
+QWidget { font-size: 13px; color: #f4f4f5; background: #101114; }
 QLabel#Title { font-size: 24px; font-weight: 700; }
 QLabel#Subtitle { color: #a1a1aa; }
 QLabel#RecordBadge { border-radius: 14px; padding: 8px 12px; background: #27272a; }
@@ -89,6 +96,96 @@ QTabWidget::pane { border: 1px solid #27272a; border-radius: 14px; }
 QTabBar::tab { background: #18181b; color: #d4d4d8; padding: 8px 12px; border-radius: 9px; margin: 4px; }
 QTabBar::tab:selected { background: #f4f4f5; color: #111113; }
 """
+
+
+class NoScrollComboBox(QComboBox):
+    """QComboBox that allows wheel-scroll ONLY while the dropdown popup is open.
+
+    Prevents accidental value changes when scrolling the settings page (BUG-01).
+    Wheel events are always forwarded to the nearest QScrollArea unless the
+    dropdown list is currently visible. This means:
+      - Scrolling over a closed combo → settings page scrolls (good)
+      - Scrolling over a focused-but-closed combo → settings page scrolls (good)
+      - Scrolling while the dropdown is open → combo value changes (expected)
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._popup_visible = False
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def showPopup(self) -> None:
+        self._popup_visible = True
+        super().showPopup()
+
+    def hidePopup(self) -> None:
+        self._popup_visible = False
+        super().hidePopup()
+
+    def wheelEvent(self, event) -> None:  # noqa: ANN001
+        if self._popup_visible:
+            super().wheelEvent(event)
+        else:
+            # Forward wheel to nearest QScrollArea so settings page scrolls
+            ancestor = self.parent()
+            while ancestor is not None:
+                if isinstance(ancestor, QScrollArea):
+                    ancestor.wheelEvent(event)
+                    return
+                ancestor = ancestor.parent()
+            event.ignore()
+
+
+class EditableClickToOpenComboBox(NoScrollComboBox):
+    """Editable QComboBox, который открывает popup по клику в любое место поля
+    (а не только по стрелке справа). Полезно для cloud-моделей в настройках,
+    где пользователь обычно хочет выбрать из списка, но иногда — вписать
+    кастомный id для нестандартных провайдеров.
+
+    Редактирование текста остаётся доступным через клавиатуру / двойной клик.
+    TASK-048.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setEditable(True)
+        # Установим eventFilter на lineEdit, чтобы перехватывать клики по полю
+        if self.lineEdit() is not None:
+            self.lineEdit().installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: ANN001
+        from PySide6.QtCore import QEvent
+        if obj is self.lineEdit() and event.type() == QEvent.MouseButtonPress:
+            # Открываем popup и съедаем событие — фокус всё равно перейдёт
+            # в lineEdit, и пользователь сможет редактировать клавиатурой
+            self.showPopup()
+            return True
+        return super().eventFilter(obj, event)
+
+
+class NoScrollSpinBox(QSpinBox):
+    """QSpinBox, который не меняет значение при скролле страницы (BUG-04).
+
+    Колесо мыши работает только когда поле в фокусе (пользователь явно
+    кликнул). Иначе wheel-событие пересылается в ближайший QScrollArea,
+    чтобы прокручивалась вкладка настроек, а не значение SpinBox'a.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def wheelEvent(self, event) -> None:  # noqa: ANN001
+        if self.hasFocus():
+            super().wheelEvent(event)
+            return
+        ancestor = self.parent()
+        while ancestor is not None:
+            if isinstance(ancestor, QScrollArea):
+                ancestor.wheelEvent(event)
+                return
+            ancestor = ancestor.parent()
+        event.ignore()
 
 
 class HotkeySignal(QObject):
@@ -136,6 +233,13 @@ class MainWindow(QMainWindow):
         self.cfg = AppConfig.load()
         self.history = HistoryStore()
         self.models = ModelManager()
+        # US-015, US-016: построить реестр cloud-моделей из сохранённых ключей.
+        # Для UI-показа placeholder'ов работает и без ключей.
+        try:
+            self.models.refresh_cloud_models(self.cfg)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Initial refresh_cloud_models failed: %s", exc)
+        self._cloud_check_worker = None  # ссылка на CloudConnectionCheckWorker (anti-GC)
         self.recorder = AudioRecorder(sample_rate=self.cfg.sample_rate, input_device_id=self.cfg.audio_input_device_id, meeting_compatibility=self.cfg.audio_meeting_compatibility)
         self.transcribe_worker: TranscribeWorker | None = None
         self.file_transcribe_worker: FileTranscribeWorker | None = None
@@ -143,6 +247,7 @@ class MainWindow(QMainWindow):
         self.update_check_worker: UpdateCheckWorker | None = None
         self.update_download_worker: UpdateDownloadWorker | None = None
         self.pending_update_info: UpdateInfo | None = None
+        self.summarize_worker: SummarizeWorker | None = None
         self.file_cancel_requested = False
         self.selected_file_path: Path | None = None
         self._file_transcript_blocks: list[dict[str, object]] = []
@@ -168,7 +273,7 @@ class MainWindow(QMainWindow):
         self.download_progress_tick = 0
         self.result_preview_active = False
         self.result_preview_text = ""
-        self.microphone_test_recorder: AudioRecorder | None = None
+
         self.recording_started_in_own_window = False
         self._settings_loading = True
         self._settings_save_timer = QTimer(self)
@@ -196,7 +301,10 @@ class MainWindow(QMainWindow):
         self._sync_overlay_visibility()
         self.start_preload_selected_model()
         QTimer.singleShot(900, self.maybe_start_first_microphone_autodetect)
+        QTimer.singleShot(1500, self.start_initial_cloud_discover)  # TASK-045
         QTimer.singleShot(1800, lambda: self.check_for_updates(manual=False))
+        if self.cfg.api_enabled:
+            QTimer.singleShot(2500, self._start_api_server)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.on_timer_tick)
@@ -220,6 +328,13 @@ class MainWindow(QMainWindow):
         self.record_badge.setObjectName("RecordBadge")
         self.status_label = QLabel("Готово")
         self.status_label.setObjectName("Subtitle")
+        # BUG-CL-02: длинные сообщения об ошибках облака (URL + причина) раздвигали
+        # окно по ширине. WordWrap + SizePolicy(Ignored, Preferred) разрешают QLabel
+        # ужиматься в ширину доступной строки вместо раздвигания layout.
+        self.status_label.setWordWrap(True)
+        from PySide6.QtWidgets import QSizePolicy
+        self.status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.status_label.setMinimumWidth(0)
         status_row.addWidget(self.record_badge)
         status_row.addWidget(self.status_label, 1)
         root.addLayout(status_row)
@@ -249,6 +364,13 @@ class MainWindow(QMainWindow):
 
         self.toggle_btn = QPushButton("Начать запись")
         self.toggle_btn.setObjectName("Primary")
+        # TASK-047: иначе после клика по кнопке она остаётся в keyboard focus,
+        # и нажатие Space (часть hotkey Ctrl+Space) активирует её через Qt
+        # default-button behavior — диктовка стартует/стопится без Ctrl.
+        # Глобальный hotkey через keyboard library продолжает работать.
+        self.toggle_btn.setFocusPolicy(Qt.NoFocus)
+        self.toggle_btn.setAutoDefault(False)
+        self.toggle_btn.setDefault(False)
         self.toggle_btn.clicked.connect(self.toggle_recording)
         layout.addWidget(self.toggle_btn)
 
@@ -258,8 +380,12 @@ class MainWindow(QMainWindow):
 
         actions = QHBoxLayout()
         copy_btn = QPushButton("Скопировать текст")
+        copy_btn.setFocusPolicy(Qt.NoFocus)
+        copy_btn.setAutoDefault(False)
         copy_btn.clicked.connect(lambda: pyperclip.copy(self.last_text.toPlainText()))
         insert_btn = QPushButton("Вставить текст сейчас")
+        insert_btn.setFocusPolicy(Qt.NoFocus)
+        insert_btn.setAutoDefault(False)
         insert_btn.clicked.connect(lambda: copy_and_maybe_paste(self.last_text.toPlainText(), True, self.cfg.paste_only_when_text_field_detected))
         actions.addWidget(copy_btn)
         actions.addWidget(insert_btn)
@@ -304,7 +430,7 @@ class MainWindow(QMainWindow):
         self.file_diarization_check = QCheckBox("Определять говорящих (диаризация, до 4 спикеров)")
         self.file_diarization_check.setToolTip("Выключено по умолчанию. Требует дополнительную Sortformer ONNX-модель. Доступно только для обработки файлов.")
         speaker_row = QHBoxLayout()
-        self.file_speaker_count_combo = QComboBox()
+        self.file_speaker_count_combo = NoScrollComboBox()
         self.file_speaker_count_combo.addItem("Авто", "auto")
         self.file_speaker_count_combo.addItem("2", "2")
         self.file_speaker_count_combo.addItem("3", "3")
@@ -312,20 +438,30 @@ class MainWindow(QMainWindow):
         speaker_row.addWidget(QLabel("Количество говорящих:"))
         speaker_row.addWidget(self.file_speaker_count_combo)
         speaker_row.addStretch(1)
+        self.file_summary_check = QCheckBox("Суммаризация (краткие итоги диалога после расшифровки)")
+        self.file_summary_check.setToolTip("После расшифровки локальная LLM-модель создаст краткое резюме. Модель скачается автоматически при первом использовании (~2.5 ГБ).")
         options_box.addWidget(self.file_stable_timestamps_check)
         options_box.addWidget(self.file_diarization_check)
         options_box.addLayout(speaker_row)
+        options_box.addWidget(self.file_summary_check)
         layout.addLayout(options_box)
 
         action_row = QHBoxLayout()
         self.file_transcribe_btn = QPushButton("Расшифровать файл")
         self.file_transcribe_btn.setObjectName("Primary")
+        # TASK-047: убираем focus, чтобы Space не активировал кнопку
+        self.file_transcribe_btn.setFocusPolicy(Qt.NoFocus)
+        self.file_transcribe_btn.setAutoDefault(False)
         self.file_transcribe_btn.clicked.connect(self.start_file_transcription)
         self.file_cancel_btn = QPushButton("Отменить")
         self.file_cancel_btn.setObjectName("Danger")
+        self.file_cancel_btn.setFocusPolicy(Qt.NoFocus)
+        self.file_cancel_btn.setAutoDefault(False)
         self.file_cancel_btn.setEnabled(False)
         self.file_cancel_btn.clicked.connect(self.cancel_file_transcription)
         self.file_copy_btn = QPushButton("Скопировать результат")
+        self.file_copy_btn.setFocusPolicy(Qt.NoFocus)
+        self.file_copy_btn.setAutoDefault(False)
         self.file_copy_btn.clicked.connect(lambda: pyperclip.copy(self.file_result_text.toPlainText()))
         self.file_copy_btn.setEnabled(False)
         action_row.addWidget(self.file_transcribe_btn)
@@ -348,6 +484,17 @@ class MainWindow(QMainWindow):
         self.file_result_text.setReadOnly(True)
         self.file_result_text.setPlaceholderText("Здесь появится результат расшифровки файла.")
         layout.addWidget(self.file_result_text, 1)
+
+        self.file_summary_label = QLabel("Суммаризация:")
+        self.file_summary_label.setObjectName("Subtitle")
+        self.file_summary_label.setVisible(False)
+        layout.addWidget(self.file_summary_label)
+        self.file_summary_text = QTextEdit()
+        self.file_summary_text.setReadOnly(True)
+        self.file_summary_text.setPlaceholderText("Здесь появится краткое резюме расшифровки.")
+        self.file_summary_text.setMaximumHeight(180)
+        self.file_summary_text.setVisible(False)
+        layout.addWidget(self.file_summary_text)
         return tab
 
     def _models_tab(self) -> QWidget:
@@ -379,6 +526,32 @@ class MainWindow(QMainWindow):
         return tab
 
     def _settings_tab(self) -> QWidget:
+        # ── QScrollArea & dark theme ────────────────────────────────────
+        # The dark background for this tab comes from the global rule:
+        #   QWidget { background: #101114; }
+        # in APP_STYLE.  This is the ONLY reliable way to ensure all
+        # QScrollArea viewports, QTabWidget panes, and QFormLayout rows
+        # get the dark background on Windows.
+        #
+        # Previous (broken) approaches — DO NOT use:
+        #   - tab.setStyleSheet("background: transparent;")
+        #     → cascades into ALL children, wiping QLineEdit/QComboBox
+        #       dark backgrounds (#18181b) to transparent
+        #   - scroll.setStyleSheet("QScrollArea > QWidget {…}")
+        #     → Qt CSS does not support the ">" child combinator
+        #   - scroll.viewport().setAutoFillBackground(False)
+        #     → unreliable, viewport palette overrides this
+        #   - QWidget#SettingsInner { background: transparent; }
+        #     → doesn't help when QScrollArea viewport has its own palette
+        #
+        # The fix is at the source: APP_STYLE line
+        #   QWidget { background: #101114; }
+        # If you remove or break that rule, white background WILL return.
+        # ────────────────────────────────────────────────────────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(18, 18, 18, 18)
@@ -401,21 +574,21 @@ class MainWindow(QMainWindow):
         self.update_repo_edit = QLineEdit()
         self.update_repo_edit.setPlaceholderText("owner/repo, например your-org/voice-input-local")
         self.update_repo_edit.setToolTip("Публичный GitHub-репозиторий с релизами приложения. Используется для централизованных обновлений.")
-        self.microphone_combo = QComboBox()
+        self.microphone_combo = NoScrollComboBox()
         self.refresh_microphones_btn = QPushButton("Обновить список")
         self.refresh_microphones_btn.clicked.connect(lambda: self.refresh_microphone_combo())
         if not autostart.is_supported():
             self.autostart_check.setEnabled(False)
             self.autostart_check.setToolTip("Автозагрузка доступна только в Windows.")
 
-        self.language_combo = QComboBox()
+        self.language_combo = NoScrollComboBox()
         self.language_combo.addItem("Авто", "")
         for code in ["ru", "en", "kk", "de", "fr", "es", "it", "nl", "pt", "uk", "pl"]:
             self.language_combo.addItem(code, code)
-        self.device_combo = QComboBox()
+        self.device_combo = NoScrollComboBox()
         for v in ["cpu", "cuda", "auto"]:
             self.device_combo.addItem(v, v)
-        self.compute_combo = QComboBox()
+        self.compute_combo = NoScrollComboBox()
         for v in ["int8", "int8_float16", "float16", "float32"]:
             self.compute_combo.addItem(v, v)
 
@@ -441,6 +614,107 @@ class MainWindow(QMainWindow):
         form.addRow("Язык Whisper", self.language_combo)
         form.addRow("Ускорение Whisper", self.device_combo)
         form.addRow("Compute Whisper", self.compute_combo)
+
+        summary_separator = QLabel("Суммаризация")
+        summary_separator.setObjectName("Title")
+        summary_separator.setStyleSheet("font-size: 16px; margin-top: 12px;")
+        form.addRow(summary_separator)
+        self.summary_prompt_edit = QTextEdit()
+        self.summary_prompt_edit.setPlaceholderText("Системный промпт для суммаризации. Оставьте пустым для промпта по умолчанию.")
+        self.summary_prompt_edit.setMaximumHeight(120)
+        self.summary_prompt_edit.setToolTip("Настройте промпт под свой тип звонков: продажи, поддержка, переговоры.")
+        form.addRow("Промпт суммаризации", self.summary_prompt_edit)
+        self.summary_prompt_reset_btn = QPushButton("По умолчанию")
+        self.summary_prompt_reset_btn.setToolTip("Сбросить промпт суммаризации к встроенному значению.")
+        self.summary_prompt_reset_btn.clicked.connect(self.reset_summary_prompt)
+        form.addRow("", self.summary_prompt_reset_btn)
+
+        # ── Cloud STT (US-015, US-016, US-032) ────────────────────────────
+        cloud_separator = QLabel("Облачные модели")
+        cloud_separator.setObjectName("Title")
+        cloud_separator.setStyleSheet("font-size: 16px; margin-top: 12px;")
+        form.addRow(cloud_separator)
+
+        cloud_hint = QLabel(
+            "Облачные модели обеспечивают более высокое качество распознавания, но требуют интернета "
+            "и передают аудио на серверы провайдера. Если связь пропадёт — программа автоматически переключится "
+            "на локальную модель из списка ниже."
+        )
+        cloud_hint.setWordWrap(True)
+        cloud_hint.setObjectName("Subtitle")
+        form.addRow("", cloud_hint)
+
+        # OpenAI-compatible
+        self.openai_stt_key_edit = QLineEdit()
+        self.openai_stt_key_edit.setEchoMode(QLineEdit.Password)
+        self.openai_stt_key_edit.setPlaceholderText("sk-…")
+        self.openai_stt_key_edit.setToolTip("API-ключ OpenAI (или любого OpenAI-совместимого STT-провайдера).")
+        form.addRow("OpenAI API Key", self.openai_stt_key_edit)
+
+        self.openai_stt_base_url_edit = QLineEdit()
+        self.openai_stt_base_url_edit.setPlaceholderText("https://api.openai.com/v1")
+        self.openai_stt_base_url_edit.setToolTip("Base URL OpenAI-совместимого API. Для Groq: https://api.groq.com/openai/v1")
+        form.addRow("OpenAI Base URL", self.openai_stt_base_url_edit)
+
+        # TASK-048: editable + click-to-open поведение
+        self.openai_stt_model_combo = EditableClickToOpenComboBox()
+        self.openai_stt_model_combo.setToolTip(
+            "Модель STT провайдера. Нажмите «Проверить соединение», чтобы обновить список из API."
+        )
+        form.addRow("OpenAI Model", self.openai_stt_model_combo)
+
+        self.openai_check_btn = QPushButton("Проверить соединение и обновить список моделей")
+        self.openai_check_btn.clicked.connect(lambda: self.check_cloud_connection("openai"))
+        form.addRow("", self.openai_check_btn)
+
+        # ElevenLabs
+        self.elevenlabs_stt_key_edit = QLineEdit()
+        self.elevenlabs_stt_key_edit.setEchoMode(QLineEdit.Password)
+        self.elevenlabs_stt_key_edit.setPlaceholderText("…")
+        self.elevenlabs_stt_key_edit.setToolTip("API-ключ ElevenLabs.")
+        form.addRow("ElevenLabs API Key", self.elevenlabs_stt_key_edit)
+
+        # TASK-048: editable + click-to-open поведение
+        self.elevenlabs_stt_model_combo = EditableClickToOpenComboBox()
+        self.elevenlabs_stt_model_combo.setToolTip("Модель ElevenLabs STT (по умолчанию scribe_v1).")
+        form.addRow("ElevenLabs Model", self.elevenlabs_stt_model_combo)
+
+        self.elevenlabs_check_btn = QPushButton("Проверить соединение и обновить список моделей")
+        self.elevenlabs_check_btn.clicked.connect(lambda: self.check_cloud_connection("elevenlabs"))
+        form.addRow("", self.elevenlabs_check_btn)
+
+        # Параметры fallback и нарезки
+        self.cloud_max_chunk_spin = NoScrollSpinBox()
+        self.cloud_max_chunk_spin.setRange(30, 300)
+        self.cloud_max_chunk_spin.setSuffix(" сек")
+        self.cloud_max_chunk_spin.setToolTip(
+            "Длинная диктовка нарезается на чанки этой длины и отправляется в облако параллельно (US-032)."
+        )
+        form.addRow("Длина чанка для облака", self.cloud_max_chunk_spin)
+
+        self.cloud_fallback_combo = NoScrollComboBox()
+        # Заполняется в _load_settings_into_ui — все локальные транскрипционные модели
+        self.cloud_fallback_combo.setToolTip(
+            "Локальная модель, которая используется при недоступности облака."
+        )
+        form.addRow("Fallback при сбое облака", self.cloud_fallback_combo)
+
+        api_separator = QLabel("API-сервер")
+        api_separator.setObjectName("Title")
+        api_separator.setStyleSheet("font-size: 16px; margin-top: 12px;")
+        form.addRow(api_separator)
+        self.api_enabled_check = QCheckBox("Включить REST API (перезапуск требуется)")
+        self.api_enabled_check.setToolTip("Запускает HTTP-сервер на localhost для приёма запросов на расшифровку от внешних приложений.")
+        form.addRow("API", self.api_enabled_check)
+        self.api_port_edit = QLineEdit()
+        self.api_port_edit.setPlaceholderText("8672")
+        self.api_port_edit.setToolTip("Порт для API-сервера. По умолчанию 8672.")
+        form.addRow("Порт API", self.api_port_edit)
+        self.api_key_edit = QLineEdit()
+        self.api_key_edit.setEchoMode(QLineEdit.Password)
+        self.api_key_edit.setPlaceholderText("Оставьте пустым для открытого доступа")
+        self.api_key_edit.setToolTip("Bearer-токен для авторизации. Если пусто, API доступен без авторизации.")
+        form.addRow("API-ключ", self.api_key_edit)
         layout.addLayout(form)
 
         hint = QLabel("Настройки сохраняются автоматически. Кнопку сохранения нажимать больше не нужно.")
@@ -458,31 +732,25 @@ class MainWindow(QMainWindow):
         layout.addWidget(mic_hint)
 
         buttons = QHBoxLayout()
-        self.test_mic_btn = QPushButton("Проверить микрофон")
-        self.test_mic_btn.setProperty("originalText", "Проверить микрофон")
-        self.test_mic_btn.clicked.connect(self.test_microphone_access)
         self.autodetect_mic_btn = QPushButton("Автонастройка микрофона")
         self.autodetect_mic_btn.setProperty("originalText", "Автонастройка микрофона")
         self.autodetect_mic_btn.clicked.connect(lambda: self.start_microphone_autodetect(manual=True))
-        privacy_btn = QPushButton("Настройки микрофона Windows")
-        privacy_btn.clicked.connect(self.open_microphone_privacy_settings)
-        sound_btn = QPushButton("Настройки звука Windows")
-        sound_btn.clicked.connect(self.open_sound_settings)
         logs_btn = QPushButton("Открыть папку логов")
         logs_btn.clicked.connect(self.open_logs_folder)
+        models_dir_btn = QPushButton("Открыть папку моделей")
+        models_dir_btn.clicked.connect(self.open_models_folder)
         self.check_updates_btn = QPushButton("Проверить обновления")
         self.check_updates_btn.setProperty("originalText", "Проверить обновления")
         self.check_updates_btn.clicked.connect(lambda: self.check_for_updates(manual=True))
-        buttons.addWidget(self.test_mic_btn)
         buttons.addWidget(self.autodetect_mic_btn)
-        buttons.addWidget(privacy_btn)
-        buttons.addWidget(sound_btn)
         buttons.addWidget(logs_btn)
+        buttons.addWidget(models_dir_btn)
         buttons.addWidget(self.check_updates_btn)
         buttons.addStretch(1)
         layout.addLayout(buttons)
         layout.addStretch(1)
-        return tab
+        scroll.setWidget(tab)
+        return scroll
 
     def _history_tab(self) -> QWidget:
         tab = QWidget()
@@ -499,6 +767,9 @@ class MainWindow(QMainWindow):
         right.addWidget(self.history_text, 1)
         copy_btn = QPushButton("Скопировать выбранную")
         copy_btn.clicked.connect(lambda: pyperclip.copy(self.history_text.toPlainText()))
+        self.summarize_history_btn = QPushButton("Суммаризировать")
+        self.summarize_history_btn.setToolTip("Сформировать краткое резюме из текста выбранной расшифровки.")
+        self.summarize_history_btn.clicked.connect(self.summarize_history_item)
         delete_btn = QPushButton("Удалить выбранную")
         delete_btn.setObjectName("Danger")
         delete_btn.clicked.connect(self.delete_history_item)
@@ -506,8 +777,20 @@ class MainWindow(QMainWindow):
         clear_btn.setObjectName("Danger")
         clear_btn.clicked.connect(self.clear_history)
         right.addWidget(copy_btn)
+        right.addWidget(self.summarize_history_btn)
         right.addWidget(delete_btn)
         right.addWidget(clear_btn)
+
+        self.history_summary_label = QLabel("Суммаризация:")
+        self.history_summary_label.setObjectName("Subtitle")
+        self.history_summary_label.setVisible(False)
+        right.addWidget(self.history_summary_label)
+        self.history_summary_text = QTextEdit()
+        self.history_summary_text.setReadOnly(True)
+        self.history_summary_text.setPlaceholderText("Здесь появится резюме.")
+        self.history_summary_text.setMaximumHeight(160)
+        self.history_summary_text.setVisible(False)
+        right.addWidget(self.history_summary_text)
         layout.addLayout(right, 2)
         return tab
 
@@ -594,6 +877,65 @@ class MainWindow(QMainWindow):
             self.file_diarization_check.setChecked(self.cfg.file_diarization_enabled)
         if hasattr(self, "file_speaker_count_combo"):
             self._set_combo_value(self.file_speaker_count_combo, self.cfg.file_speaker_count)
+        if hasattr(self, "file_summary_check"):
+            self.file_summary_check.setChecked(self.cfg.summary_enabled)
+        if hasattr(self, "summary_prompt_edit"):
+            self.summary_prompt_edit.setPlainText(self.cfg.summary_system_prompt)
+        if hasattr(self, "api_enabled_check"):
+            self.api_enabled_check.setChecked(self.cfg.api_enabled)
+        if hasattr(self, "api_port_edit"):
+            self.api_port_edit.setText(str(self.cfg.api_port) if self.cfg.api_port != 8672 else "")
+        if hasattr(self, "api_key_edit"):
+            self.api_key_edit.setText(self.cfg.api_key)
+        # Cloud STT (US-015, US-016, US-032)
+        if hasattr(self, "openai_stt_key_edit"):
+            self.openai_stt_key_edit.setText(self.cfg.openai_stt_api_key)
+            self.openai_stt_base_url_edit.setText(self.cfg.openai_stt_base_url or "https://api.openai.com/v1")
+            self._fill_cloud_model_combo(self.openai_stt_model_combo, "openai", self.cfg.openai_stt_model_id)
+            self.elevenlabs_stt_key_edit.setText(self.cfg.elevenlabs_stt_api_key)
+            self._fill_cloud_model_combo(self.elevenlabs_stt_model_combo, "elevenlabs", self.cfg.elevenlabs_stt_model_id)
+            self.cloud_max_chunk_spin.setValue(max(30, min(300, int(self.cfg.cloud_max_chunk_seconds or 60))))
+            self._fill_cloud_fallback_combo()
+
+    def _fill_cloud_model_combo(self, combo: QComboBox, provider: str, current: str) -> None:
+        """Заполняет combo моделей провайдера из реестра ModelManager + текущее значение."""
+        combo.blockSignals(True)
+        combo.clear()
+        seen: set[str] = set()
+        for key in self.models.cloud_model_keys():
+            if cloud_provider_of(key) != provider:
+                continue
+            mid = key.split(":", 2)[2] if key.count(":") >= 2 else ""
+            if mid and mid not in seen:
+                combo.addItem(mid, mid)
+                seen.add(mid)
+        if current and current not in seen:
+            combo.addItem(current, current)
+        if current:
+            idx = combo.findData(current)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+
+    def _fill_cloud_fallback_combo(self) -> None:
+        """Заполняет combo выбора fallback-модели — только установленные локальные
+        транскрипционные модели (TASK-046). Список совпадает с группой
+        «── Локальные ──» на вкладке «Диктовка»."""
+        if not hasattr(self, "cloud_fallback_combo"):
+            return
+        self.cloud_fallback_combo.blockSignals(True)
+        self.cloud_fallback_combo.clear()
+        local_keys = [k for k in self.models.available_model_keys() if not is_cloud_model_key(k)]
+        for key in local_keys:
+            self.cloud_fallback_combo.addItem(model_display_name(key), key)
+        # Выбрать текущий; если его нет в доступных — берём DEFAULT_MODEL_KEY
+        current = self.cfg.cloud_fallback_model_key or DEFAULT_MODEL_KEY
+        idx = self.cloud_fallback_combo.findData(current)
+        if idx < 0:
+            idx = self.cloud_fallback_combo.findData(DEFAULT_MODEL_KEY)
+        if idx >= 0:
+            self.cloud_fallback_combo.setCurrentIndex(idx)
+        self.cloud_fallback_combo.blockSignals(False)
 
     def _connect_settings_autosave(self) -> None:
         self.hotkey_edit.editingFinished.connect(self.schedule_settings_autosave)
@@ -606,6 +948,22 @@ class MainWindow(QMainWindow):
         self.file_stable_timestamps_check.stateChanged.connect(self.save_file_options)
         self.file_diarization_check.stateChanged.connect(self.save_file_options)
         self.file_speaker_count_combo.currentIndexChanged.connect(self.save_file_options)
+        self.file_summary_check.stateChanged.connect(self.save_file_options)
+        self.api_enabled_check.stateChanged.connect(self.schedule_settings_autosave)
+        self.api_port_edit.editingFinished.connect(self.schedule_settings_autosave)
+        self.api_key_edit.editingFinished.connect(self.schedule_settings_autosave)
+        # Cloud STT (US-015, US-016, US-032). Изменение ключа/URL/модели
+        # триггерит autosave + перестроение реестра cloud-моделей.
+        if hasattr(self, "openai_stt_key_edit"):
+            self.openai_stt_key_edit.editingFinished.connect(self.on_cloud_settings_changed)
+            self.openai_stt_base_url_edit.editingFinished.connect(self.on_cloud_settings_changed)
+            self.openai_stt_model_combo.editTextChanged.connect(self.schedule_settings_autosave)
+            self.openai_stt_model_combo.currentIndexChanged.connect(self.schedule_settings_autosave)
+            self.elevenlabs_stt_key_edit.editingFinished.connect(self.on_cloud_settings_changed)
+            self.elevenlabs_stt_model_combo.editTextChanged.connect(self.schedule_settings_autosave)
+            self.elevenlabs_stt_model_combo.currentIndexChanged.connect(self.schedule_settings_autosave)
+            self.cloud_max_chunk_spin.valueChanged.connect(self.schedule_settings_autosave)
+            self.cloud_fallback_combo.currentIndexChanged.connect(self.schedule_settings_autosave)
 
     def save_file_options(self) -> None:
         if self._settings_loading:
@@ -613,6 +971,8 @@ class MainWindow(QMainWindow):
         self.cfg.file_stable_timestamps_enabled = self.file_stable_timestamps_check.isChecked()
         self.cfg.file_diarization_enabled = self.file_diarization_check.isChecked()
         self.cfg.file_speaker_count = str(self.file_speaker_count_combo.currentData() or "auto")
+        if hasattr(self, "file_summary_check"):
+            self.cfg.summary_enabled = self.file_summary_check.isChecked()
         self.cfg.save()
         if self.cfg.file_diarization_enabled and not self.models.is_installed("addon:sortformer"):
             self.status_label.setText("Для диаризации нужно загрузить дополнительную модель Sortformer во вкладке «Модели».")
@@ -640,21 +1000,95 @@ class MainWindow(QMainWindow):
         self.cfg.selected_model = DEFAULT_MODEL_KEY
         self.cfg.save()
 
-    def refresh_available_models_combo(self) -> None:
+    def _populate_model_combo_with_groups(self, combo: QComboBox, target_key: str) -> None:
+        """Заполнить combo моделей с группами «── Локальные ──» / «── Облачные ──».
+        Используется и для model_combo (диктовка), и для file_model_combo (файлы).
+        TASK-051 (US-017): общий построитель — cloud-модели доступны и для файлов.
+        """
+        from PySide6.QtGui import QBrush, QColor
+
+        std_model = QStandardItemModel(combo)
+
+        def add_header(text: str) -> None:
+            item = QStandardItem(text)
+            item.setFlags(Qt.NoItemFlags)  # disabled, не выбираемый
+            item.setData(None, Qt.UserRole)
+            item.setData(QIcon(), Qt.DecorationRole)
+            std_model.appendRow(item)
+
+        def add_model_row(key: str, *, disabled: bool = False, suffix: str = "") -> None:
+            label = model_display_name(key) + suffix
+            item = QStandardItem(label)
+            item.setData(key, Qt.UserRole)
+            if disabled:
+                item.setFlags(Qt.ItemIsEnabled & ~Qt.ItemIsSelectable | Qt.NoItemFlags)
+                item.setForeground(QBrush(QColor("#71717a")))
+            std_model.appendRow(item)
+
+        # ── Локальные ──
+        add_header("── Локальные ──")
+        local_keys = [k for k in self.models.available_model_keys() if not is_cloud_model_key(k)]
+        for key in local_keys:
+            add_model_row(key)
+
+        # ── Облачные ──
+        cloud_keys = self.models.cloud_model_keys()
+        if cloud_keys:
+            add_header("── Облачные ──")
+            for key in cloud_keys:
+                available = self.models.is_available(key)
+                if available:
+                    add_model_row(key)
+                else:
+                    add_model_row(key, disabled=True, suffix=" (не настроено)")
+
+        combo.setModel(std_model)
+        # Восстановить выбор. Поиск по UserRole.
+        self._select_combo_by_userdata(combo, str(target_key))
+
+    def refresh_available_models_combo(self, *, force_current: bool = False) -> None:
+        """Перерисовать combo выбора модели.
+        force_current=True — игнорировать combo.currentData() и принудительно
+        выбрать cfg.selected_model. Нужно после cloud→локальная fallback
+        (BUG-CL-01): иначе combo держит старую cloud-модель, потому что она
+        тоже is_available (ключ задан), и побеждает над только что переключённой
+        локальной моделью в cfg.
+
+        TASK-051 (US-017): file_model_combo теперь тоже с группами Локальные/Облачные.
+        """
         current = self.cfg.selected_model if self.models.is_available(self.cfg.selected_model) else DEFAULT_MODEL_KEY
-        for combo in [getattr(self, "model_combo", None), getattr(self, "file_model_combo", None)]:
-            if combo is None:
-                continue
-            previous = combo.currentData() or current
-            combo.blockSignals(True)
-            combo.clear()
-            for key in self.models.available_model_keys():
-                spec = ALL_MODELS[key]
-                combo.addItem(f"{spec.engine} — {spec.name}", key)
-            self._set_combo_value(combo, previous if self.models.is_available(str(previous)) else current)
-            combo.blockSignals(False)
-        if hasattr(self, "model_combo"):
-            self._set_combo_value(self.model_combo, current)
+
+        # file_model_combo (файлы) — теперь с группами и cloud-моделями (US-017).
+        # Поле для расшифровки файлов хранится в cfg.file_selected_model отдельно от диктовки.
+        fcombo = getattr(self, "file_model_combo", None)
+        if fcombo is not None:
+            file_current = getattr(self.cfg, "file_selected_model", None) or current
+            if not self.models.is_available(file_current):
+                file_current = current if self.models.is_available(current) else DEFAULT_MODEL_KEY
+            previous = file_current if force_current else (fcombo.currentData() or file_current)
+            fcombo.blockSignals(True)
+            self._populate_model_combo_with_groups(
+                fcombo,
+                target_key=str(previous) if (previous and self.models.is_available(str(previous))) else file_current,
+            )
+            fcombo.blockSignals(False)
+
+        # model_combo (диктовка) — с группами «Локальные» / «Облачные» (US-021).
+        mcombo = getattr(self, "model_combo", None)
+        if mcombo is not None:
+            previous = current if force_current else (mcombo.currentData() or current)
+            mcombo.blockSignals(True)
+            target_key = previous if (previous and self.models.is_available(str(previous))) else current
+            self._populate_model_combo_with_groups(mcombo, target_key=str(target_key))
+            mcombo.blockSignals(False)
+
+    @staticmethod
+    def _select_combo_by_userdata(combo: QComboBox, value: str) -> None:
+        """Найти и выделить элемент по UserRole (нужно для QStandardItemModel)."""
+        for i in range(combo.count()):
+            if combo.itemData(i) == value:
+                combo.setCurrentIndex(i)
+                return
 
     def start_preload_selected_model(self) -> None:
         key = self.cfg.selected_model
@@ -813,28 +1247,17 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.information(self, "Логи", f"Папка логов: {path}\n\nНе удалось открыть автоматически: {exc}")
 
-    def open_sound_settings(self) -> None:
-        if os.name != "nt":
-            QMessageBox.information(self, "Звук", "Быстрое открытие настроек звука доступно только в Windows.")
-            return
+    def open_models_folder(self) -> None:
+        path = models_dir()
         try:
-            os.startfile("ms-settings:sound")  # type: ignore[attr-defined]
+            if os.name == "nt":
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.information(self, "Звук", f"Откройте вручную: Параметры → Система → Звук.\n\nНе удалось открыть автоматически: {exc}")
-
-    def open_microphone_privacy_settings(self) -> None:
-        if os.name != "nt":
-            QMessageBox.information(self, "Микрофон", "Быстрое открытие настроек микрофона доступно только в Windows.")
-            return
-        try:
-            os.startfile("ms-settings:privacy-microphone")  # type: ignore[attr-defined]
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.information(
-                self,
-                "Микрофон",
-                "Откройте вручную: Параметры → Конфиденциальность и безопасность → Микрофон.\n\n"
-                f"Не удалось открыть автоматически: {exc}",
-            )
+            QMessageBox.information(self, "Модели", f"Папка моделей: {path}\n\nНе удалось открыть автоматически: {exc}")
 
     def _mic_autodetect_running(self) -> bool:
         return bool(self.microphone_autodetect_worker and self.microphone_autodetect_worker.isRunning())
@@ -896,47 +1319,6 @@ class MainWindow(QMainWindow):
             self._flash_button_state(self.autodetect_mic_btn, "Не найден", kind="error", seconds=5)
             log.info("Microphone autodetect UI state: error shown")
 
-    def test_microphone_access(self) -> None:
-        if self.recorder.is_recording:
-            self.status_label.setText("Сейчас уже идёт запись. Остановите её перед проверкой микрофона.")
-            if hasattr(self, "test_mic_btn"):
-                self._flash_button_state(self.test_mic_btn, "Идёт запись", kind="error", seconds=4)
-            return
-        if self.transcribe_worker and self.transcribe_worker.isRunning():
-            self.status_label.setText("Дождитесь окончания расшифровки перед проверкой микрофона.")
-            if hasattr(self, "test_mic_btn"):
-                self._flash_button_state(self.test_mic_btn, "Занято", kind="error", seconds=4)
-            return
-        try:
-            if hasattr(self, "test_mic_btn"):
-                self._set_button_busy(self.test_mic_btn, "Проверяем…")
-            self.save_settings(auto=True)
-            recorder = AudioRecorder(sample_rate=self.cfg.sample_rate, input_device_id=self.cfg.audio_input_device_id, meeting_compatibility=self.cfg.audio_meeting_compatibility)
-            recorder.start()
-            self.microphone_test_recorder = recorder
-            selected = self.microphone_combo.currentText() if hasattr(self, "microphone_combo") else "выбранный микрофон"
-            self.status_label.setText(f"Микрофон доступен: {selected}. Windows должна зафиксировать обращение к микрофону.")
-            if hasattr(self, "test_mic_btn"):
-                self._flash_button_state(self.test_mic_btn, "Микрофон работает ✓", kind="success", seconds=4)
-                log.info("Microphone test UI state: success shown")
-            log.info("Microphone test succeeded: %s", selected)
-
-            def finish_test() -> None:
-                try:
-                    recorder.cancel()
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("Microphone test cleanup failed: %s", exc)
-                if self.microphone_test_recorder is recorder:
-                    self.microphone_test_recorder = None
-
-            QTimer.singleShot(700, finish_test)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Microphone test failed")
-            self.status_label.setText(f"Микрофон недоступен: {exc}")
-            if hasattr(self, "test_mic_btn"):
-                self._flash_button_state(self.test_mic_btn, "Недоступен", kind="error", seconds=5)
-                log.info("Microphone test UI state: error shown")
-
     def on_dictation_model_changed(self) -> None:
         if self._settings_loading or not hasattr(self, "model_combo"):
             return
@@ -971,6 +1353,15 @@ class MainWindow(QMainWindow):
         key = self.selected_table_model_key()
         if not key:
             QMessageBox.information(self, "Модели", "Сначала выберите модель.")
+            return
+        # Summary models — set as active summarization model
+        if self.models.is_summary_model(key):
+            if not self.models.is_installed(key):
+                QMessageBox.information(self, "Модели", "Эта модель ещё не загружена. Сначала загрузите её.")
+                return
+            self.cfg.selected_summary_model = key
+            self.cfg.save()
+            self.status_label.setText(f"Модель суммаризации: {model_display_name(key)}")
             return
         if not self.models.is_transcription_model(key):
             QMessageBox.information(self, "Модели", "Это дополнительная модель для функций файлов. Её нельзя выбрать как активную модель диктовки.")
@@ -1091,12 +1482,207 @@ class MainWindow(QMainWindow):
     def _file_job_running(self) -> bool:
         return bool(self.file_transcribe_worker and self.file_transcribe_worker.isRunning())
 
+    # ────────────────────────────────────────────────────────────────────
+    # US-019 (TASK-062..065): Матрица блокировок диктовка ↔ расшифровка файла
+    # ────────────────────────────────────────────────────────────────────
+    # | Диктовка     | Файл         | Поведение                         |
+    # |--------------|--------------|-----------------------------------|
+    # | локальная    | локальная    | ЗАПРЕТ — второй процесс блокирован |
+    # | локальная    | облачная     | разрешено                          |
+    # | облачная     | локальная    | разрешено                          |
+    # | облачная     | облачная     | разрешено                          |
+    #
+    # Облачные операции не используют локальный микрофон/модель, поэтому
+    # ресурсного конфликта нет. Локальный микрофон используется только
+    # диктовкой (запись), локальная модель — обоими (CPU/GPU). Конфликт
+    # ресурса возможен только при лок+лок.
+
+    def is_dictation_busy(self) -> bool:
+        """TASK-063: идёт ли сейчас запись или локальная/cloud расшифровка диктовки."""
+        if self.recorder.is_recording:
+            return True
+        if self.transcribe_worker and self.transcribe_worker.isRunning():
+            return True
+        return False
+
+    def is_file_busy(self) -> bool:
+        """TASK-063: идёт ли сейчас расшифровка файла."""
+        return self._file_job_running()
+
+    def _dictation_model_key(self) -> str:
+        """Активная или планируемая модель диктовки (берётся из cfg)."""
+        return str(self.cfg.selected_model or DEFAULT_MODEL_KEY)
+
+    def _file_model_key(self) -> str:
+        """Активная или планируемая модель расшифровки файла."""
+        # Если воркер уже запущен — берём model_key из воркера
+        if self.file_transcribe_worker and self.file_transcribe_worker.isRunning():
+            return str(getattr(self.file_transcribe_worker, "model_key", "") or self.cfg.file_selected_model or self.cfg.selected_model)
+        # Иначе — то, что выбрано в combo / cfg
+        fcombo = getattr(self, "file_model_combo", None)
+        if fcombo is not None:
+            data = fcombo.currentData()
+            if data:
+                return str(data)
+        return str(self.cfg.file_selected_model or self.cfg.selected_model or DEFAULT_MODEL_KEY)
+
+    def dictation_uses_local(self) -> bool:
+        """TASK-063: True если активная/планируемая модель диктовки — локальная."""
+        return not is_cloud_model_key(self._dictation_model_key())
+
+    def file_uses_local(self) -> bool:
+        """TASK-063: True если активная/планируемая модель файла — локальная."""
+        return not is_cloud_model_key(self._file_model_key())
+
+    def _can_start_dictation(self) -> tuple[bool, str]:
+        """TASK-065: разрешено ли запустить диктовку прямо сейчас.
+
+        Запрет ТОЛЬКО при попытке запустить локальную диктовку, когда уже
+        идёт локальная расшифровка файла. Cloud-комбинации разрешены.
+        Возвращает (ok, reason). reason — текст для статус-бара.
+        """
+        if self.is_file_busy() and self.file_uses_local() and self.dictation_uses_local():
+            return False, (
+                "Идёт локальная расшифровка файла. Чтобы диктовать параллельно — "
+                "выберите облачную модель."
+            )
+        return True, ""
+
+    def _can_start_file_transcribe(self) -> tuple[bool, str]:
+        """TASK-065: разрешено ли запустить расшифровку файла прямо сейчас.
+
+        Запрет ТОЛЬКО при попытке локальной расшифровки файла, когда уже
+        идёт локальная диктовка. Cloud-комбинации разрешены.
+        Возвращает (ok, reason). reason — текст для сообщения пользователю.
+        """
+        if self.is_dictation_busy() and self.dictation_uses_local() and self.file_uses_local():
+            return False, (
+                "Идёт локальная диктовка. Дождитесь её завершения или выберите "
+                "облачную модель для расшифровки файла."
+            )
+        return True, ""
+
+    def _confirm_cloud_oversize_file(self, file_size_mb: float, limit_mb: int, provider: str) -> bool:
+        """TASK-053 (US-017): диалог при превышении лимита провайдера.
+
+        Три кнопки: «Расшифровать через облако с автонарезкой» (default),
+        «Переключусь на локальную модель» (закрывает диалог + подсветка
+        file_model_combo на 1.5 сек), «Отмена».
+
+        Возвращает True — если пользователь выбрал продолжить через cloud+автонарезка.
+        Возвращает False — если выбрал переключиться на локальную или отменил.
+        """
+        provider_label = {"openai": "OpenAI", "elevenlabs": "ElevenLabs"}.get(provider, provider or "провайдера")
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Файл превышает лимит провайдера")
+        dialog.setIcon(QMessageBox.Information)
+        dialog.setText(
+            f"Размер файла: {file_size_mb:.1f} МБ.\n"
+            f"Лимит {provider_label} для прямой отправки: {limit_mb} МБ.\n\n"
+            f"Как продолжить расшифровку?"
+        )
+        dialog.setInformativeText(
+            "Файл будет автоматически разделён на части и отправлен в облако "
+            "параллельно. Длинные записи (1–3 часа) обрабатываются за минуты — "
+            "независимо от размера."
+        )
+        btn_cloud = dialog.addButton("Расшифровать через облако с автонарезкой", QMessageBox.AcceptRole)
+        btn_local = dialog.addButton("Переключусь на локальную модель", QMessageBox.ActionRole)
+        btn_cancel = dialog.addButton("Отмена", QMessageBox.RejectRole)
+        dialog.setDefaultButton(btn_cloud)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked is btn_cloud:
+            return True
+        if clicked is btn_local:
+            # Подсветка file_model_combo на 1.5 сек — визуальная подсказка
+            self._highlight_file_model_combo()
+            return False
+        # Cancel / закрытие крестиком
+        return False
+
+    def _cloud_internet_preflight(self, model_key: str) -> bool:
+        """TASK-054 (US-017): pre-flight проверка интернета перед cloud-расшифровкой.
+
+        Возвращает True — продолжать запуск воркера.
+        Возвращает False — была применена авто-замена на локальную модель;
+        пользователь должен сам нажать «Расшифровать» повторно.
+        """
+        from . import cloud_stt
+        provider = cloud_provider_of(model_key)
+        if provider == "openai":
+            host = cloud_stt._host_from_url(self.cfg.openai_stt_base_url)
+        elif provider == "elevenlabs":
+            host = cloud_stt.ELEVENLABS_HOST
+        else:
+            return True
+        try:
+            ok = cloud_stt.is_internet_available(host)
+        except Exception:  # noqa: BLE001
+            ok = True  # неуверены — пусть воркер сам отработает с fallback
+        if ok:
+            return True
+        # Сети нет — авто-fallback на локальную
+        fallback_key = self.cfg.cloud_fallback_model_key or DEFAULT_MODEL_KEY
+        if not self.models.is_available(fallback_key):
+            fallback_key = DEFAULT_MODEL_KEY
+        self.cfg.selected_model = fallback_key
+        self.cfg.file_selected_model = fallback_key
+        try:
+            self.cfg.save()
+        except Exception:  # noqa: BLE001
+            pass
+        self.refresh_available_models_combo(force_current=True)
+        local_name = model_display_name(fallback_key)
+        cloud_name = model_display_name(model_key)
+        msg = (
+            f"Нет соединения с интернетом. {cloud_name} недоступна. "
+            f"Переключено на локальную: {local_name}. Запустите расшифровку повторно."
+        )
+        self.status_label.setText(msg)
+        log.warning("Cloud file pre-flight: no internet (%s) → fallback to %s", host, fallback_key)
+        try:
+            tray = getattr(self, "tray", None)
+            if tray is not None and tray.isVisible():
+                tray.showMessage("Облако недоступно", msg, QSystemTrayIcon.Warning, 6000)
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def _highlight_file_model_combo(self) -> None:
+        """TASK-053 (US-017): кратковременная подсветка file_model_combo
+        после выбора «Переключусь на локальную модель» — чтобы пользователь
+        понял, где выбирать модель."""
+        fcombo = getattr(self, "file_model_combo", None)
+        if fcombo is None:
+            return
+        try:
+            original_style = fcombo.styleSheet()
+        except Exception:  # noqa: BLE001
+            original_style = ""
+        try:
+            fcombo.setStyleSheet(original_style + " QComboBox { border: 2px solid #f59e0b; }")
+            QTimer.singleShot(1500, lambda: fcombo.setStyleSheet(original_style))
+            fcombo.setFocus()
+            try:
+                fcombo.showPopup()
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            pass
+
     def start_file_transcription(self) -> None:
-        if self.recorder.is_recording or (self.transcribe_worker and self.transcribe_worker.isRunning()) or self._mic_autodetect_running():
-            QMessageBox.information(self, "Файлы", "Сейчас идёт диктовка, распознавание голоса или автонастройка микрофона. Завершите текущую операцию перед расшифровкой файла.")
+        # US-019 (TASK-064/065): матричная проверка вместо глобальной блокировки.
+        # Лок+лок → запрет; лок+cloud / cloud+лок / cloud+cloud → разрешено.
+        if self._mic_autodetect_running():
+            QMessageBox.information(self, "Файлы", "Идёт автонастройка микрофона. Дождитесь её завершения.")
             return
         if self._file_job_running():
             QMessageBox.information(self, "Файлы", "Файл уже расшифровывается. Дождитесь завершения или нажмите «Отменить».")
+            return
+        ok, reason = self._can_start_file_transcribe()
+        if not ok:
+            QMessageBox.information(self, "Файлы", reason)
             return
         path = self.selected_file_path
         if path is None:
@@ -1108,13 +1694,40 @@ class MainWindow(QMainWindow):
         if not is_supported_audio_file(path):
             QMessageBox.warning(self, "Файл", "Формат файла пока не поддерживается. Выберите wav, mp3, m4a, mp4, webm, ogg или flac.")
             return
-        key = str(self.file_model_combo.currentData() or self.cfg.selected_model)
+        key = str(self.file_model_combo.currentData() or self.cfg.file_selected_model or self.cfg.selected_model)
         if not self.models.is_available(key):
             QMessageBox.information(self, "Модели", "Выбранная модель ещё не загружена. Сначала загрузите её во вкладке «Модели».")
             self.refresh_available_models_combo()
             return
+        # TASK-051 (US-017): сохраняем выбор файловой модели отдельно от диктовки
+        self.cfg.file_selected_model = key
         self.save_settings(auto=True)
         self.save_file_options()
+        # TASK-053 (US-017): pre-flight проверка размера для cloud-моделей.
+        # Если исходный файл превышает лимит провайдера — показываем диалог
+        # с 3 кнопками: «cloud+автонарезка» (default), «переключусь на локальную»,
+        # «отмена». На «переключусь» — подсвечиваем file_model_combo на 1.5с.
+        if is_cloud_model_key(key):
+            provider = cloud_provider_of(key)
+            try:
+                from .cloud_stt import provider_file_size_limit_mb as _limit_mb_fn
+                limit_mb = _limit_mb_fn(provider)
+            except Exception:  # noqa: BLE001
+                limit_mb = None
+            if limit_mb:
+                try:
+                    file_size_mb = path.stat().st_size / (1024.0 * 1024.0)
+                except Exception:  # noqa: BLE001
+                    file_size_mb = 0.0
+                if file_size_mb > limit_mb:
+                    if not self._confirm_cloud_oversize_file(file_size_mb, limit_mb, provider):
+                        return
+            # TASK-054 (US-017): pre-flight проверка интернета для cloud-моделей.
+            # Делаем до конвертации файла в WAV — это экономит время если сети нет.
+            # При недоступности — авто-fallback на cloud_fallback_model_key и return,
+            # пользователь увидит уведомление и сам решит запускать ли расшифровку локально.
+            if not self._cloud_internet_preflight(key):
+                return
         if self.file_stable_timestamps_check.isChecked() and not self.models.is_installed("addon:vad"):
             self.tabs.setCurrentIndex(2)
             QMessageBox.information(self, "Точные таймкоды", "Сначала загрузите дополнительную модель «VAD для точных таймкодов» во вкладке «Модели».")
@@ -1150,6 +1763,8 @@ class MainWindow(QMainWindow):
         self.file_transcribe_worker.finished_text.connect(self.on_file_transcription_done)
         self.file_transcribe_worker.failed.connect(self.on_file_transcription_failed)
         self.file_transcribe_worker.cancelled.connect(self.on_file_transcription_cancelled)
+        # TASK-055 (US-017): cloud→локальная fallback при сбое cloud-расшифровки файла
+        self.file_transcribe_worker.fallback_applied.connect(self.on_cloud_fallback_applied)
         self.file_transcribe_worker.start()
         log.info("File transcription started: model=%s path=%s", key, path)
 
@@ -1165,9 +1780,22 @@ class MainWindow(QMainWindow):
         self.file_progress.setValue(progress.percent)
         self.file_progress.setFormat(progress.message)
         self.file_status_label.setText(progress.message)
-        self.status_label.setText(progress.message)
+        # TASK-080 (US-019): не перезаписываем status_label, если идёт диктовка —
+        # иначе её сообщения о записи/распознавании затираются прогрессом файла.
+        if not self.is_dictation_busy() and not getattr(self, "result_preview_active", False):
+            self.status_label.setText(progress.message)
+        # TASK-080: overlay не должен перезаписываться прогрессом файла,
+        # если в этот момент идёт диктовка (recording/processing) или
+        # пользователю показывается развёрнутый результат (result_preview_active).
+        # Overlay диктовки имеет приоритет — пользователь должен видеть свой
+        # текст для копирования, а не «Файл · 42%».
         if self.cfg.overlay_enabled:
-            self.overlay.show_processing(f"Файл · {progress.percent}%")
+            if self.is_dictation_busy() or getattr(self, "result_preview_active", False):
+                # Overlay сейчас обслуживает диктовку — НЕ трогаем его.
+                # Прогресс файла виден на вкладке «Файлы» (file_progress + file_status_label).
+                pass
+            else:
+                self.overlay.show_processing(f"Файл · {progress.percent}%")
 
     def on_file_transcription_block(self, block: object) -> None:
         if not isinstance(block, FileTranscriptBlock):
@@ -1209,6 +1837,15 @@ class MainWindow(QMainWindow):
         self.file_status_label.setText("Отмена запрошена. Дождитесь завершения фонового процесса…")
         self.file_progress.setFormat("Отмена…")
         self.status_label.setText("Отмена расшифровки файла запрошена. Результат будет проигнорирован.")
+        # TASK-084 (US-019): hotkey re-register СРАЗУ при клике cancel
+        # (не дожидаясь окончания всех in-flight чанков, что может занять
+        # до 30 сек). Keyboard listener мог потерять Win32-хук во время
+        # длительной cloud-операции.
+        try:
+            self.register_hotkey(show_errors=False)
+            log.info("Hotkey re-registered on cancel click (defensive)")
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Hotkey re-register on cancel failed: %s", exc)
 
     def _reset_file_transcription_ui(self) -> None:
         self.file_transcribe_btn.setEnabled(True)
@@ -1243,7 +1880,16 @@ class MainWindow(QMainWindow):
         self.file_progress.setValue(100)
         self.file_progress.setFormat("100% · готово")
         self._reset_file_transcription_ui()
+        # TASK-081 (US-019): defensive перерегистрация hotkey также после
+        # успешного завершения длительной cloud-расшифровки.
+        try:
+            self.register_hotkey(show_errors=False)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Hotkey re-register after done failed: %s", exc)
         log.info("File transcription done: model=%s path=%s chars=%s", model_key, file_path, len(text))
+        # SUM-01: Auto-summarize if checkbox is checked
+        if text and self.file_summary_check.isChecked():
+            self._start_file_summary(text)
 
     def on_file_transcription_failed(self, detail: str) -> None:
         if self.file_cancel_requested:
@@ -1261,9 +1907,19 @@ class MainWindow(QMainWindow):
         self.file_cancel_requested = False
         self.file_status_label.setText("Расшифровка файла отменена. История и буфер обмена не изменены.")
         self.status_label.setText("Расшифровка файла отменена.")
-        if self.cfg.overlay_enabled:
+        if self.cfg.overlay_enabled and not self.is_dictation_busy():
             self.overlay.show_cancelled(seconds=3)
         self._reset_file_transcription_ui()
+        # TASK-081 (US-019): defensive перерегистрация hotkey.
+        # После длительной cloud-расшифровки (особенно с отменой через
+        # ThreadPoolExecutor.shutdown) keyboard listener иногда теряет
+        # активный Win32-хук. register_hotkey() переустанавливает его
+        # поверх старого — это безопасно (см. CLAUDE.md, раздел про hotkey).
+        try:
+            self.register_hotkey(show_errors=False)
+            log.info("Hotkey re-registered after file transcription cancel (defensive)")
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Hotkey re-register failed: %s", exc)
         log.info("File transcription cancelled")
 
     def save_settings(self, *, auto: bool = False) -> None:
@@ -1288,6 +1944,57 @@ class MainWindow(QMainWindow):
             self.cfg.file_speaker_count = str(self.file_speaker_count_combo.currentData() or "auto")
         self.cfg.live_transcription = False
         self.cfg.live_insert_confirmed_text = False
+        if hasattr(self, "summary_prompt_edit"):
+            self.cfg.summary_system_prompt = self.summary_prompt_edit.toPlainText().strip()
+        if hasattr(self, "api_enabled_check"):
+            self.cfg.api_enabled = self.api_enabled_check.isChecked()
+        if hasattr(self, "api_port_edit") and self.api_port_edit.text().strip():
+            try:
+                self.cfg.api_port = int(self.api_port_edit.text().strip())
+            except ValueError:
+                pass
+        if hasattr(self, "api_key_edit"):
+            self.cfg.api_key = self.api_key_edit.text().strip()
+        # Cloud STT (US-015, US-016, US-032)
+        if hasattr(self, "openai_stt_key_edit"):
+            old_openai_key = self.cfg.openai_stt_api_key
+            old_openai_url = self.cfg.openai_stt_base_url
+            old_eleven_key = self.cfg.elevenlabs_stt_api_key
+            self.cfg.openai_stt_api_key = self.openai_stt_key_edit.text().strip()
+            self.cfg.openai_stt_base_url = (self.openai_stt_base_url_edit.text().strip() or "https://api.openai.com/v1")
+            self.cfg.openai_stt_model_id = str(self.openai_stt_model_combo.currentText() or "").strip()
+            self.cfg.elevenlabs_stt_api_key = self.elevenlabs_stt_key_edit.text().strip()
+            self.cfg.elevenlabs_stt_model_id = str(self.elevenlabs_stt_model_combo.currentText() or "").strip()
+            self.cfg.cloud_max_chunk_seconds = int(self.cloud_max_chunk_spin.value())
+            fb = str(self.cloud_fallback_combo.currentData() or DEFAULT_MODEL_KEY)
+            self.cfg.cloud_fallback_model_key = fb
+            # Если ключи/URL изменились — инвалидируем кэш discover и
+            # перестраиваем реестр (без HTTP — только из cfg.*_stt_model_id).
+            # После смены ключа cloud-модели в списке диктовки исчезают, пока
+            # пользователь не нажмёт «Проверить соединение» (US-021 — не показываем
+            # модели, не подтверждённые провайдером).
+            if (
+                old_openai_key != self.cfg.openai_stt_api_key
+                or old_openai_url != self.cfg.openai_stt_base_url
+                or old_eleven_key != self.cfg.elevenlabs_stt_api_key
+            ):
+                try:
+                    from . import cloud_stt as _cs
+                    _cs.invalidate_discover_cache()
+                except Exception:  # noqa: BLE001
+                    pass
+                # При смене ключа сбрасываем сохранённую модель — иначе
+                # старая запись cfg.openai_stt_model_id будет регистрировать
+                # модель чужого провайдера в реестре.
+                if old_openai_key != self.cfg.openai_stt_api_key:
+                    self.cfg.openai_stt_model_id = ""
+                if old_eleven_key != self.cfg.elevenlabs_stt_api_key:
+                    self.cfg.elevenlabs_stt_model_id = ""
+                try:
+                    self.models.refresh_cloud_models(self.cfg)
+                    self.refresh_available_models_combo()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("refresh_cloud_models after settings change failed: %s", exc)
         self.cfg.language = str(self.language_combo.currentData())
         self.cfg.device = str(self.device_combo.currentData())
         self.cfg.compute_type = str(self.compute_combo.currentData())
@@ -1453,22 +2160,51 @@ class MainWindow(QMainWindow):
 
 
     def toggle_recording(self) -> None:
-        if self._file_job_running():
-            self.status_label.setText("Идёт расшифровка файла. Диктовка временно недоступна.")
-            if self.cfg.overlay_enabled:
-                self.overlay.show_processing()
-            return
-        if self._mic_autodetect_running():
+        # US-019 (TASK-064): убрана глобальная блокировка при file_job_running.
+        # Вместо неё — матричная проверка через _can_start_dictation().
+        # Микрофон-автодетект и активный TranscribeWorker всё ещё блокируют
+        # (это технические ограничения, не относящиеся к матрице US-019).
+        # TASK-083 (US-019): расширенное логирование точки отказа.
+        recorder_active = bool(self.recorder.is_recording)
+        transcribe_running = bool(self.transcribe_worker and self.transcribe_worker.isRunning())
+        file_running = bool(self._file_job_running())
+        mic_auto = bool(self._mic_autodetect_running())
+        log.info(
+            "Toggle recording requested. recorder_active=%s transcribe_running=%s file_running=%s mic_auto=%s file_uses_local=%s dictation_uses_local=%s",
+            recorder_active, transcribe_running, file_running, mic_auto,
+            self.file_uses_local() if file_running else None,
+            self.dictation_uses_local(),
+        )
+        if mic_auto:
+            log.info("toggle_recording BLOCKED: mic autodetect running")
             self.status_label.setText("Идёт автонастройка микрофона. Диктовка временно недоступна.")
             return
-        if self.transcribe_worker and self.transcribe_worker.isRunning():
+        if transcribe_running:
+            log.info("toggle_recording BLOCKED: transcribe_worker still running")
             return
-        if self.recorder.is_recording:
+        if recorder_active:
+            log.info("toggle_recording: stopping current recording")
             self.stop_recording()
-        else:
-            self.start_recording()
+            return
+        # TASK-065: матричная проверка перед стартом записи (лок+лок → запрет).
+        ok, reason = self._can_start_dictation()
+        if not ok:
+            log.info("toggle_recording BLOCKED by _can_start_dictation: %s", reason)
+            self.status_label.setText(reason)
+            if self.cfg.overlay_enabled:
+                # Кратко покажем плашку, чтобы пользователь увидел статус
+                try:
+                    self.overlay.show_processing()
+                    QTimer.singleShot(1200, self.overlay.show_idle)
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+        log.info("toggle_recording: starting recording")
+        self.start_recording()
 
     def start_recording(self) -> None:
+        # TASK-083 (US-019): логирование точки входа в start_recording
+        log.info("start_recording entered. selected_model=%s overlay_enabled=%s", self.cfg.selected_model, self.cfg.overlay_enabled)
         try:
             self.save_settings(auto=True)
             self.cfg = AppConfig.load()
@@ -1539,10 +2275,14 @@ class MainWindow(QMainWindow):
         self.toggle_btn.setEnabled(True)
         self.toggle_btn.setText("Начать запись")
         self.record_badge.setText("Распознаю")
-        self.status_label.setText("Финальная расшифровка локально…")
+        # BUG-CL-03: для cloud-моделей пишем «отправляю в облако», а не «локально»
+        cfg = AppConfig.load()
+        if is_cloud_model_key(cfg.selected_model):
+            self.status_label.setText(f"Отправляю в облако: {model_display_name(cfg.selected_model)}…")
+        else:
+            self.status_label.setText("Финальная расшифровка локально…")
         if self.cfg.overlay_enabled:
             self.overlay.show_processing()
-        cfg = AppConfig.load()
         # Start the final pass immediately. Live results that arrive after stop are ignored;
         # the final pass is the source of truth and does not consume live text.
         self.pending_final = None
@@ -1585,10 +2325,41 @@ class MainWindow(QMainWindow):
 
     def _begin_final_transcription(self, wav_path: Path, duration: float, cfg: AppConfig) -> None:
         self.pending_final = None
+        # US-015/US-016: запоминаем исходно выбранную модель, чтобы в сообщении
+        # о fallback показать что именно облако упало.
+        self._last_requested_model = cfg.selected_model
         self.transcribe_worker = TranscribeWorker(self.models, cfg.selected_model, wav_path, duration, cfg, is_live=False)
         self.transcribe_worker.finished_text.connect(lambda text, dur: self.on_transcription_done(text, dur, wav_path))
+        self.transcribe_worker.fallback_applied.connect(self.on_cloud_fallback_applied)
         self.transcribe_worker.failed.connect(lambda detail, path=wav_path: self.on_transcription_failed(detail, path))
         self.transcribe_worker.start()
+
+    def on_cloud_fallback_applied(self, fallback_key: str, reason: str) -> None:
+        """US-015/US-016: облачная модель упала → переключились на локальную.
+        Перечитываем cfg (transcribe_with_fallback его сохранил), обновляем UI.
+        BUG-CL-01: force_current=True гарантирует, что combo переключится на
+        локальную модель, а не останется на cloud (которая всё ещё is_available)."""
+        try:
+            self.cfg = AppConfig.load()
+        except Exception:  # noqa: BLE001
+            pass
+        self.refresh_available_models_combo(force_current=True)
+        local_name = model_display_name(fallback_key)
+        # Имя облачной модели для сообщения — берём то, что было выбрано
+        cloud_requested = getattr(self, "_last_requested_model", "")
+        cloud_name = model_display_name(cloud_requested) if cloud_requested else "Облачная модель"
+        msg = (
+            f"{cloud_name} недоступна ({reason}). "
+            f"Переключено на локальную: {local_name}. "
+            f"Чтобы вернуться к облаку — выберите её в списке снова."
+        )
+        self.status_label.setText(msg)
+        log.warning("Cloud fallback: %s → %s (%s)", cloud_requested, fallback_key, reason)
+        # Уведомление через системный трей, если возможно
+        try:
+            self.tray.showMessage("Voice Input Local", msg, QSystemTrayIcon.Warning, 6000)
+        except Exception:  # noqa: BLE001
+            pass
 
     def on_transcription_done(self, text: str, duration: float, wav_path: Path) -> None:
         if self.cancel_requested:
@@ -1788,6 +2559,14 @@ class MainWindow(QMainWindow):
         item = current.data(Qt.UserRole)
         if isinstance(item, HistoryItem):
             self.history_text.setPlainText(item.text)
+            if item.summary:
+                self.history_summary_label.setVisible(True)
+                self.history_summary_text.setVisible(True)
+                self.history_summary_text.setPlainText(item.summary)
+            else:
+                self.history_summary_label.setVisible(False)
+                self.history_summary_text.setVisible(False)
+                self.history_summary_text.clear()
 
     def delete_history_item(self) -> None:
         current = self.history_list.currentItem()
@@ -1798,6 +2577,295 @@ class MainWindow(QMainWindow):
             self.history.delete(item.id)
             self.refresh_history()
             self.history_text.clear()
+
+    def _get_summary_model_path(self) -> str | None:
+        """Resolve GGUF path for the selected summary model, or None."""
+        key = self.cfg.selected_summary_model
+        if not key or key not in SUMMARY_MODELS:
+            # Try default
+            key = DEFAULT_SUMMARY_MODEL_KEY
+        if not self.models.is_installed(key):
+            return None
+        return str(self.models.summary_model_gguf_path(key))
+
+    def _start_file_summary(self, text: str) -> None:
+        """SUM-01: Start summarization after file transcription."""
+        if self.summarize_worker and self.summarize_worker.isRunning():
+            return
+        model_path = self._get_summary_model_path()
+        if not model_path:
+            self.status_label.setText("Модель суммаризации не загружена. Загрузите её на вкладке Модели.")
+            return
+        self.file_summary_label.setVisible(True)
+        self.file_summary_text.setVisible(True)
+        self.file_summary_text.setPlainText("Суммаризирую…")
+        self.status_label.setText("Формирую краткое резюме…")
+        prompt = self.cfg.summary_system_prompt
+        self.summarize_worker = SummarizeWorker(text, model_path, prompt)
+        self.summarize_worker.finished_text.connect(self._on_file_summary_done)
+        self.summarize_worker.failed.connect(self._on_summary_failed)
+        self.summarize_worker.start()
+
+    def _on_file_summary_done(self, summary: str) -> None:
+        if summary.strip():
+            self.file_summary_text.setPlainText(summary)
+            self.status_label.setText("Расшифровка и суммаризация завершены.")
+        else:
+            self.file_summary_text.setPlainText("Суммаризация не дала результата.")
+            self.status_label.setText("Файл расшифрован, но суммаризация пуста.")
+
+    def summarize_history_item(self) -> None:
+        """SUM-02: Summarize an existing history item without re-transcribing."""
+        current = self.history_list.currentItem()
+        if not current:
+            QMessageBox.information(self, "Суммаризация", "Сначала выберите запись в списке.")
+            return
+        item = current.data(Qt.UserRole)
+        if not isinstance(item, HistoryItem) or not item.text.strip():
+            QMessageBox.information(self, "Суммаризация", "Выбранная запись не содержит текста.")
+            return
+        if self.summarize_worker and self.summarize_worker.isRunning():
+            self.status_label.setText("Суммаризация уже выполняется, дождитесь завершения.")
+            return
+        model_path = self._get_summary_model_path()
+        if not model_path:
+            QMessageBox.information(self, "Суммаризация", "Модель суммаризации не загружена. Загрузите её на вкладке Модели.")
+            return
+        self.summarize_history_btn.setEnabled(False)
+        self.status_label.setText("Суммаризирую…")
+        prompt = self.cfg.summary_system_prompt
+        self.summarize_worker = SummarizeWorker(item.text, model_path, prompt)
+        self.summarize_worker.finished_text.connect(lambda text, item_id=item.id: self._on_history_summary_done(text, item_id))
+        self.summarize_worker.failed.connect(self._on_summary_failed)
+        self.summarize_worker.start()
+
+    def _on_history_summary_done(self, summary: str, item_id: int) -> None:
+        self.summarize_history_btn.setEnabled(True)
+        if summary.strip():
+            self.history.update_summary(item_id, summary)
+            self.history_summary_label.setVisible(True)
+            self.history_summary_text.setVisible(True)
+            self.history_summary_text.setPlainText(summary)
+            self.status_label.setText("Суммаризация завершена.")
+        else:
+            self.status_label.setText("Суммаризация не дала результата.")
+
+    def _on_summary_failed(self, detail: str) -> None:
+        self.summarize_history_btn.setEnabled(True)
+        self.file_summary_label.setVisible(False)
+        self.file_summary_text.setVisible(False)
+        log.error("Summarization failed: %s", detail)
+        self.status_label.setText("Суммаризация не удалась. Подробности в логах.")
+        QMessageBox.warning(self, "Суммаризация", detail)
+
+    def _start_api_server(self) -> None:
+        """Start the REST API server if enabled (API-01..04)."""
+        missing: list[str] = []
+        for pkg in ("fastapi", "uvicorn", "multipart"):
+            try:
+                __import__(pkg)
+            except ImportError:
+                missing.append(pkg if pkg != "multipart" else "python-multipart")
+        if missing:
+            pkgs = ", ".join(missing)
+            log.warning("API server dependencies missing: %s", pkgs)
+            self.status_label.setText(f"API-сервер недоступен: pip install {pkgs}")
+            return
+        try:
+            from .api_server import run_api_server
+            run_api_server(self.models, self.cfg)
+            self.status_label.setText(f"API-сервер запущен на порту {self.cfg.api_port}.")
+            log.info("API server started on port %d", self.cfg.api_port)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("API server failed to start")
+            self.status_label.setText(f"API-сервер не запустился: {exc}")
+
+    def reset_summary_prompt(self) -> None:
+        """SUM-03: Reset summary prompt to default."""
+        self.summary_prompt_edit.setPlainText("")
+        self.cfg.summary_system_prompt = ""
+        self.cfg.save()
+        self.status_label.setText("Промпт суммаризации сброшен к значению по умолчанию.")
+
+    # ── Cloud STT (US-015, US-016) ─────────────────────────────────────
+
+    def on_cloud_settings_changed(self) -> None:
+        """Сработало изменение ключа/URL cloud-провайдера → autosave.
+        Сам пересчёт реестра cloud-моделей делается в save_settings()
+        при детекте изменения ключа/URL."""
+        self.schedule_settings_autosave()
+
+    def start_initial_cloud_discover(self) -> None:
+        """TASK-045: при старте программы — фоновая проверка соединения и
+        автозагрузка списка моделей для каждого настроенного cloud-провайдера.
+        При успехе тихо обновляет реестр; при ошибке (401/403/таймаут) — лог +
+        статус-бар + трей-уведомление; если cfg.selected_model был cloud и
+        discover упал — переключаемся на cfg.cloud_fallback_model_key."""
+        try:
+            import requests  # noqa: F401
+        except ImportError:
+            log.warning("Initial cloud discover skipped: requests not installed")
+            return
+        self._initial_cloud_check_workers: list = []
+        if self.cfg.openai_stt_api_key:
+            w = CloudConnectionCheckWorker(
+                "openai",
+                self.cfg.openai_stt_api_key,
+                self.cfg.openai_stt_base_url or "https://api.openai.com/v1",
+            )
+            w.result.connect(lambda ok, msg, models, p="openai": self._on_initial_cloud_check_done(p, ok, msg, models))
+            self._initial_cloud_check_workers.append(w)
+            w.start()
+            log.info("Initial cloud discover: started for openai")
+        if self.cfg.elevenlabs_stt_api_key:
+            w = CloudConnectionCheckWorker("elevenlabs", self.cfg.elevenlabs_stt_api_key, "")
+            w.result.connect(lambda ok, msg, models, p="elevenlabs": self._on_initial_cloud_check_done(p, ok, msg, models))
+            self._initial_cloud_check_workers.append(w)
+            w.start()
+            log.info("Initial cloud discover: started for elevenlabs")
+
+    def _apply_cloud_models_to_settings_combo(self, provider: str, models: list) -> None:
+        """TASK-049: общая логика обновления combo моделей в настройках после
+        успешного discover (стартового или по кнопке). Сохраняет текущее
+        значение если оно входит в новый список, иначе берёт первый id."""
+        combo = self.openai_stt_model_combo if provider == "openai" else getattr(self, "elevenlabs_stt_model_combo", None)
+        if combo is None:
+            return
+        current = combo.currentText().strip()
+        combo.blockSignals(True)
+        combo.clear()
+        for mid in models:
+            combo.addItem(mid, mid)
+        if models:
+            if current and current in models:
+                combo.setCurrentIndex(combo.findData(current))
+            else:
+                combo.setCurrentIndex(0)
+        elif current:
+            # discover пустой → сохраняем пользовательский ввод
+            combo.addItem(current, current)
+            combo.setCurrentIndex(combo.count() - 1)
+        combo.blockSignals(False)
+
+    def _on_initial_cloud_check_done(self, provider: str, ok: bool, message: str, models: list) -> None:
+        """Результат стартовой проверки cloud. Тихо при успехе; уведомление при сбое."""
+        prefix = "OpenAI" if provider == "openai" else "ElevenLabs"
+        log.info("Initial cloud discover [%s]: ok=%s msg=%s models=%d", provider, ok, message, len(models))
+        if ok:
+            try:
+                self.models.set_cloud_models(provider, list(models))
+                self.refresh_available_models_combo()
+                self._apply_cloud_models_to_settings_combo(provider, list(models))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Initial set_cloud_models failed: %s", exc)
+            return
+        # Ошибка: уведомляем + проверяем не нужно ли fallback
+        self.status_label.setText(f"{prefix}: {message} (стартовая проверка)")
+        try:
+            self.tray.showMessage("Voice Input Local", f"{prefix}: {message}", QSystemTrayIcon.Warning, 5000)
+        except Exception:  # noqa: BLE001
+            pass
+        # Если в cfg выбрана cloud-модель этого провайдера — переключаемся на fallback
+        if is_cloud_model_key(self.cfg.selected_model) and cloud_provider_of(self.cfg.selected_model) == provider:
+            fallback_key = self.cfg.cloud_fallback_model_key or DEFAULT_MODEL_KEY
+            if not self.models.is_available(fallback_key):
+                fallback_key = DEFAULT_MODEL_KEY
+            old = self.cfg.selected_model
+            self.cfg.selected_model = fallback_key
+            try:
+                self.cfg.save()
+            except Exception:  # noqa: BLE001
+                pass
+            log.warning("Initial cloud discover failed for selected model %s → switched to fallback %s", old, fallback_key)
+            self.refresh_available_models_combo(force_current=True)
+
+    def check_cloud_connection(self, provider: str) -> None:
+        """Кнопка «Проверить соединение» — асинхронно проверяет ключ
+        и обновляет список моделей провайдера в combo (US-015, US-016)."""
+        if provider == "openai":
+            api_key = self.openai_stt_key_edit.text().strip()
+            base_url = (self.openai_stt_base_url_edit.text().strip() or "https://api.openai.com/v1")
+            button = self.openai_check_btn
+        elif provider == "elevenlabs":
+            api_key = self.elevenlabs_stt_key_edit.text().strip()
+            base_url = ""
+            button = self.elevenlabs_check_btn
+        else:
+            return
+        if not api_key:
+            self.status_label.setText(f"Заполните API Key для {provider}.")
+            return
+        try:
+            import requests  # noqa: F401
+        except ImportError:
+            self.status_label.setText(
+                "Не установлена библиотека requests. Выполните: "
+                ".venv\\Scripts\\pip install requests"
+            )
+            return
+        self.save_settings(auto=True)
+        button.setEnabled(False)
+        button.setText("Проверяю…")
+        self.status_label.setText(f"Проверка соединения с {provider}…")
+        worker = CloudConnectionCheckWorker(provider, api_key, base_url)
+        self._cloud_check_worker = worker
+        worker.result.connect(lambda ok, msg, models, p=provider, b=button: self._on_cloud_check_done(p, b, ok, msg, models))
+        worker.start()
+
+    def _on_cloud_check_done(self, provider: str, button: QPushButton, ok: bool, message: str, models: list) -> None:
+        button.setEnabled(True)
+        button.setText("Проверить соединение и обновить список моделей")
+        prefix = "OpenAI" if provider == "openai" else "ElevenLabs"
+        log.info("Cloud verify result: provider=%s ok=%s msg=%s models=%d", provider, ok, message, len(models))
+        if ok:
+            combo = self.openai_stt_model_combo if provider == "openai" else self.elevenlabs_stt_model_combo
+            current = combo.currentText().strip()
+            combo.blockSignals(True)
+            combo.clear()
+            for mid in models:
+                combo.addItem(mid, mid)
+            if models:
+                if current and current in models:
+                    combo.setCurrentIndex(combo.findData(current))
+                else:
+                    combo.setCurrentIndex(0)
+            elif current:
+                combo.addItem(current, current)
+                combo.setCurrentIndex(combo.count() - 1)
+            combo.blockSignals(False)
+            chosen = combo.currentText().strip()
+            if provider == "openai":
+                if chosen and (self.cfg.openai_stt_model_id != chosen) and (
+                    not self.cfg.openai_stt_model_id or self.cfg.openai_stt_model_id not in (models or [])
+                ):
+                    log.info("Cloud verify: reset stale cfg.openai_stt_model_id %r → %r",
+                             self.cfg.openai_stt_model_id, chosen)
+                    self.cfg.openai_stt_model_id = chosen
+                    self.cfg.save()
+            elif provider == "elevenlabs":
+                if chosen and (self.cfg.elevenlabs_stt_model_id != chosen) and (
+                    not self.cfg.elevenlabs_stt_model_id or self.cfg.elevenlabs_stt_model_id not in (models or [])
+                ):
+                    log.info("Cloud verify: reset stale cfg.elevenlabs_stt_model_id %r → %r",
+                             self.cfg.elevenlabs_stt_model_id, chosen)
+                    self.cfg.elevenlabs_stt_model_id = chosen
+                    self.cfg.save()
+            try:
+                self.models.set_cloud_models(provider, list(models))
+                self.refresh_available_models_combo()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("set_cloud_models after verify failed: %s", exc)
+            if models:
+                self.status_label.setText(f"{prefix}: {message}. Моделей найдено: {len(models)}.")
+            else:
+                hint = (
+                    f"{prefix}: {message}. STT-моделей не найдено. "
+                    "Введите id модели вручную в поле выше (combo редактируемое). "
+                    "Подсказка: в app.log записан полный список моделей провайдера."
+                )
+                self.status_label.setText(hint)
+        else:
+            self.status_label.setText(f"{prefix}: {message}")
 
     def clear_history(self) -> None:
         result = QMessageBox.question(self, "Очистить историю", "Удалить все сохранённые расшифровки?")
@@ -1817,22 +2885,55 @@ class MainWindow(QMainWindow):
         self.unregister_cancel_hotkey()
         if self.file_transcribe_worker and self.file_transcribe_worker.isRunning():
             self.file_transcribe_worker.cancel()
-        self.hotkey.stop()
-        self.overlay.hide_overlay()
-        app = QApplication.instance()
-        if app is not None:
-            app.quit()
+            self.file_transcribe_worker.wait(3000)
+        if self.transcribe_worker and self.transcribe_worker.isRunning():
+            self.transcribe_worker.wait(2000)
+        if self.preload_worker and self.preload_worker.isRunning():
+            self.preload_worker.wait(1500)
+        try:
+            self.hotkey.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.tray.hide()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.overlay.hide()
+        except Exception:  # noqa: BLE001
+            pass
+        QApplication.quit()
 
 
 def run() -> int:
+    """Entry point: создаёт QApplication, главное окно и запускает event loop."""
     setup_logging()
-    app = QApplication(sys.argv)
-    app.setApplicationName("Voice Input Local")
-    icon = QIcon(str(app_icon_path()))
-    if not icon.isNull():
-        app.setWindowIcon(icon)
+    app = QApplication.instance() or QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+
+    from PySide6.QtCore import QLockFile, QStandardPaths
+    import tempfile as _tempfile
+    _lock_dir = QStandardPaths.writableLocation(QStandardPaths.TempLocation) or _tempfile.gettempdir()
+    _lock_path = str(Path(_lock_dir) / "VoiceInputLocal.lock")
+    _lock = QLockFile(_lock_path)
+    _lock.setStaleLockTime(30000)
+    if not _lock.tryLock(100):
+        log.warning("Another VoiceInputLocal instance is already running (lock=%s). Exiting.", _lock_path)
+        try:
+            QMessageBox.information(
+                None,
+                "Voice Input Local",
+                "Приложение уже запущено. Откройте его из системного трея. "
+                "Если значка нет — завершите процесс VoiceInputLocal.exe / python.exe в Диспетчере задач и запустите снова.",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return 0
+    app._voice_input_lock = _lock  # type: ignore[attr-defined]
+
+    icon_path = app_icon_path()
+    if icon_path:
+        app.setWindowIcon(QIcon(str(icon_path)))
     window = MainWindow()
-    if "--minimized" not in sys.argv:
-        window.show()
+    window.show()
     return app.exec()

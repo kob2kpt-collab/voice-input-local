@@ -28,6 +28,18 @@ if (-not (Test-Path -LiteralPath "requirements.txt")) {
 & .\.venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
 & .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
+# Summarization support: install llama-cpp-python from pre-built CPU wheels
+# (avoids the need for C++ compiler on Windows)
+Write-Host "Installing summarization engine (llama-cpp-python)..."
+try {
+  & .\.venv\Scripts\python.exe -m pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+  Write-Host "llama-cpp-python installed successfully."
+} catch {
+  Write-Host "WARNING: Could not install llama-cpp-python. Summarization will be unavailable."
+  Write-Host "You can install it manually later:"
+  Write-Host "  .\.venv\Scripts\pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu"
+}
+
 $Desktop = [Environment]::GetFolderPath("Desktop")
 $ShortcutPath = Join-Path $Desktop "Voice Input Local.lnk"
 $TargetPath = Join-Path (Get-Location) "run.bat"

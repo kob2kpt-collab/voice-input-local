@@ -21,6 +21,7 @@ class HistoryItem:
     file_name: str = ""
     file_path: str = ""
     segments_json: str = ""
+    summary: str = ""
 
 
 class HistoryStore:
@@ -57,6 +58,8 @@ class HistoryStore:
                 conn.execute("ALTER TABLE transcripts ADD COLUMN file_path TEXT NOT NULL DEFAULT ''")
             if "segments_json" not in columns:
                 conn.execute("ALTER TABLE transcripts ADD COLUMN segments_json TEXT NOT NULL DEFAULT ''")
+            if "summary" not in columns:
+                conn.execute("ALTER TABLE transcripts ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
             conn.commit()
 
     def add(
@@ -74,10 +77,10 @@ class HistoryStore:
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO transcripts(created_at, model_key, duration_seconds, inserted, text, source, file_name, file_path, segments_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO transcripts(created_at, model_key, duration_seconds, inserted, text, source, file_name, file_path, segments_json, summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (datetime.now().isoformat(timespec="seconds"), model_key, duration_seconds, 1 if inserted else 0, text, source, file_name, file_path, segments_json),
+                (datetime.now().isoformat(timespec="seconds"), model_key, duration_seconds, 1 if inserted else 0, text, source, file_name, file_path, segments_json, ""),
             )
             conn.commit()
             return int(cur.lastrowid)
@@ -97,9 +100,15 @@ class HistoryStore:
                 file_name=str(r["file_name"] if "file_name" in r.keys() else ""),
                 file_path=str(r["file_path"] if "file_path" in r.keys() else ""),
                 segments_json=str(r["segments_json"] if "segments_json" in r.keys() else ""),
+                summary=str(r["summary"] if "summary" in r.keys() else ""),
             )
             for r in rows
         ]
+
+    def update_summary(self, item_id: int, summary: str) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE transcripts SET summary = ? WHERE id = ?", (summary, item_id))
+            conn.commit()
 
     def delete(self, item_id: int) -> None:
         with self._connect() as conn:

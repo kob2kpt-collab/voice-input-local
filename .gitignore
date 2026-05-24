@@ -21,3 +21,13 @@ recordings/
 # Secrets
 .env
 *.token
+
+# Internal project management (not for public release)
+project-dashboard.html
+project-data.json
+CLAUDE.md
+docs/testing/
+
+# Backups created during AI-assisted edits (see CLAUDE.md, incident 2026-05-24)
+*.bak
+*.broken

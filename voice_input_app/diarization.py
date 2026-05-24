@@ -49,9 +49,53 @@ def _read_wav_float32(path: Path) -> tuple[np.ndarray, int]:
     return audio, rate
 
 
+def _mfcc_like(y: np.ndarray, rate: int, n_coeffs: int = 13) -> np.ndarray:
+    """Compute simple MFCC-like features using mel-spaced filterbank."""
+    n_fft = min(512, len(y))
+    if n_fft < 16:
+        return np.zeros(n_coeffs, dtype=np.float32)
+    win = np.hanning(n_fft).astype(np.float32)
+    # Use multiple frames and average
+    hop = n_fft // 2
+    frames = []
+    for start in range(0, max(1, len(y) - n_fft + 1), hop):
+        frame = y[start:start + n_fft] * win
+        frames.append(np.abs(np.fft.rfft(frame)) + 1e-10)
+    if not frames:
+        return np.zeros(n_coeffs, dtype=np.float32)
+    avg_spec = np.mean(frames, axis=0)
+    # Simple mel-scale filterbank (26 filters)
+    n_filters = 26
+    low_mel = 0.0
+    high_mel = 2595.0 * math.log10(1.0 + (rate / 2.0) / 700.0)
+    mel_points = np.linspace(low_mel, high_mel, n_filters + 2)
+    hz_points = 700.0 * (10.0 ** (mel_points / 2595.0) - 1.0)
+    freq_bins = np.floor((n_fft + 1) * hz_points / rate).astype(int)
+    freq_bins = np.clip(freq_bins, 0, len(avg_spec) - 1)
+    filter_energies = np.zeros(n_filters, dtype=np.float32)
+    for i in range(n_filters):
+        lo, mid, hi = int(freq_bins[i]), int(freq_bins[i + 1]), int(freq_bins[i + 2])
+        if lo == hi:
+            continue
+        for j in range(lo, mid + 1):
+            if j < len(avg_spec):
+                w = (j - lo) / max(1, mid - lo)
+                filter_energies[i] += avg_spec[j] * w
+        for j in range(mid, hi + 1):
+            if j < len(avg_spec):
+                w = (hi - j) / max(1, hi - mid)
+                filter_energies[i] += avg_spec[j] * w
+    log_energies = np.log(filter_energies + 1e-10)
+    # DCT-II to get cepstral coefficients
+    coeffs = np.zeros(n_coeffs, dtype=np.float32)
+    for k in range(n_coeffs):
+        coeffs[k] = np.sum(log_energies * np.cos(math.pi * k * (np.arange(n_filters) + 0.5) / n_filters))
+    return coeffs
+
+
 def _features(y: np.ndarray, rate: int) -> np.ndarray:
     if y.size == 0:
-        return np.zeros(12, dtype=np.float32)
+        return np.zeros(25, dtype=np.float32)
     y = y.astype(np.float32)
     if y.size > rate * 8:
         y = y[: rate * 8]
@@ -74,7 +118,10 @@ def _features(y: np.ndarray, rate: int) -> np.ndarray:
     low_energy = float(np.sum(spec[:third]) / total)
     high_energy = float(np.sum(spec[-third:]) / total)
     log_rms = math.log(rms + 1e-6)
-    return np.array([log_rms, zcr, centroid, spread, rolloff, low_energy, high_energy, *bands], dtype=np.float32)
+    # MFCC-like coefficients for better speaker discrimination (QUA-01)
+    mfcc = _mfcc_like(y, rate, n_coeffs=13)
+    base = np.array([log_rms, zcr, centroid, spread, rolloff, low_energy, high_energy, *bands], dtype=np.float32)
+    return np.concatenate([base, mfcc[:12]])
 
 
 def _speaker_count_from_setting(value: str, feature_count: int, duration: float) -> int:
@@ -87,22 +134,23 @@ def _speaker_count_from_setting(value: str, feature_count: int, duration: float)
     return min(4, max(2, int(round(math.sqrt(feature_count / 4.0)))))
 
 
-def _kmeans(features: np.ndarray, k: int, iterations: int = 35) -> np.ndarray:
-    if len(features) == 0:
-        return np.array([], dtype=np.int32)
-    if k <= 1:
-        return np.zeros(len(features), dtype=np.int32)
-    mean = features.mean(axis=0)
-    std = features.std(axis=0) + 1e-6
-    x = (features - mean) / std
-    centers = [x[0]]
+def _kmeans_single(x: np.ndarray, k: int, iterations: int = 50, seed_offset: int = 0) -> tuple[np.ndarray, float]:
+    """Single k-means run. Returns (labels, inertia)."""
+    n = len(x)
+    # K-means++ initialization
+    rng = np.random.RandomState(42 + seed_offset)
+    centers = [x[rng.randint(n)]]
     while len(centers) < k:
         d = np.min(np.stack([np.sum((x - c) ** 2, axis=1) for c in centers]), axis=0)
-        centers.append(x[int(np.argmax(d))])
-    centers = np.stack(centers)
-    labels = np.zeros(len(x), dtype=np.int32)
+        probs = d / (d.sum() + 1e-12)
+        cum = np.cumsum(probs)
+        r = rng.rand()
+        idx = int(np.searchsorted(cum, r))
+        centers.append(x[min(idx, n - 1)])
+    centers_arr = np.stack(centers)
+    labels = np.zeros(n, dtype=np.int32)
     for _ in range(iterations):
-        dist = np.stack([np.sum((x - c) ** 2, axis=1) for c in centers], axis=1)
+        dist = np.stack([np.sum((x - c) ** 2, axis=1) for c in centers_arr], axis=1)
         new_labels = dist.argmin(axis=1).astype(np.int32)
         if np.array_equal(new_labels, labels):
             break
@@ -110,11 +158,35 @@ def _kmeans(features: np.ndarray, k: int, iterations: int = 35) -> np.ndarray:
         for idx in range(k):
             mask = labels == idx
             if np.any(mask):
-                centers[idx] = x[mask].mean(axis=0)
-    return labels
+                centers_arr[idx] = x[mask].mean(axis=0)
+    inertia = 0.0
+    for idx in range(k):
+        mask = labels == idx
+        if np.any(mask):
+            inertia += float(np.sum((x[mask] - centers_arr[idx]) ** 2))
+    return labels, inertia
 
 
-def _smooth(labels: np.ndarray, passes: int = 2) -> np.ndarray:
+def _kmeans(features: np.ndarray, k: int, iterations: int = 50, restarts: int = 3) -> np.ndarray:
+    """K-means with multiple restarts for better clustering (QUA-01)."""
+    if len(features) == 0:
+        return np.array([], dtype=np.int32)
+    if k <= 1:
+        return np.zeros(len(features), dtype=np.int32)
+    mean = features.mean(axis=0)
+    std = features.std(axis=0) + 1e-6
+    x = (features - mean) / std
+    best_labels = None
+    best_inertia = float("inf")
+    for r in range(restarts):
+        labels, inertia = _kmeans_single(x, k, iterations=iterations, seed_offset=r)
+        if inertia < best_inertia:
+            best_inertia = inertia
+            best_labels = labels
+    return best_labels if best_labels is not None else np.zeros(len(features), dtype=np.int32)
+
+
+def _smooth(labels: np.ndarray, passes: int = 3) -> np.ndarray:
     if labels.size < 3:
         return labels
     out = labels.copy()
@@ -125,11 +197,11 @@ def _smooth(labels: np.ndarray, passes: int = 2) -> np.ndarray:
     return out
 
 
-def _build_windows(audio: np.ndarray, rate: int, *, win_s: float = 1.8, hop_s: float = 0.9) -> tuple[list[tuple[float, float]], np.ndarray]:
+def _build_windows(audio: np.ndarray, rate: int, *, win_s: float = 2.0, hop_s: float = 0.75) -> tuple[list[tuple[float, float]], np.ndarray]:
     win = max(1, int(win_s * rate))
     hop = max(1, int(hop_s * rate))
     if audio.size <= 0:
-        return [], np.zeros((0, 12), dtype=np.float32)
+        return [], np.zeros((0, 25), dtype=np.float32)
     rms_all: list[float] = []
     starts = list(range(0, max(1, audio.size - win + 1), hop))
     if not starts or starts[-1] + win < audio.size:
@@ -154,7 +226,7 @@ def _build_windows(audio: np.ndarray, rate: int, *, win_s: float = 1.8, hop_s: f
             y = audio[s : min(audio.size, s + win)]
             windows.append((s / float(rate), min(audio.size, s + win) / float(rate)))
             feats.append(_features(y, rate))
-    return windows, np.stack(feats) if feats else np.zeros((0, 12), dtype=np.float32)
+    return windows, np.stack(feats) if feats else np.zeros((0, 25), dtype=np.float32)
 
 
 def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
