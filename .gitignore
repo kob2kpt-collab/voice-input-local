@@ -30,4 +30,3 @@ docs/testing/
 
 # Backups created during AI-assisted edits (see CLAUDE.md, incident 2026-05-24)
 *.bak
-*.broken

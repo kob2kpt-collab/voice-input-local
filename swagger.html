@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Voice Input Local — API Swagger</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface2: #1c2129;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text2: #8b949e;
+    --accent: #58a6ff;
+    --accent-dim: #1f6feb33;
+    --green: #3fb950;
+    --green-dim: #23863533;
+    --orange: #d29922;
+    --orange-dim: #9e6a0333;
+    --red: #f85149;
+    --red-dim: #f8514933;
+    --blue: #58a6ff;
+    --method-get: #3fb950;
+    --method-get-bg: #23863520;
+    --method-post: #d29922;
+    --method-post-bg: #9e6a0320;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    padding: 24px;
+  }
+
+  .header {
+    max-width: 960px;
+    margin: 0 auto 32px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .header h1 {
+    font-size: 28px;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+
+  .header p { color: var(--text2); font-size: 14px; }
+
+  .server-bar {
+    max-width: 960px;
+    margin: 0 auto 24px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+
+  .server-bar label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text2);
+    white-space: nowrap;
+  }
+
+  .server-bar input {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    color: var(--text);
+    font-size: 14px;
+    font-family: 'SFMono-Regular', Consolas, monospace;
+  }
+
+  .server-bar input:focus { outline: none; border-color: var(--accent); }
+
+  .api-key-input {
+    width: 220px !important;
+    flex: none !important;
+  }
+
+  .status-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--text2);
+    flex-shrink: 0;
+    transition: background 0.3s;
+  }
+
+  .status-dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .status-dot.err { background: var(--red); box-shadow: 0 0 6px var(--red); }
+
+  .container { max-width: 960px; margin: 0 auto; }
+
+  /* --- Endpoint card --- */
+  .endpoint {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 16px;
+    overflow: hidden;
+    transition: border-color 0.2s;
+  }
+
+  .endpoint:hover { border-color: #484f58; }
+
+  .endpoint-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 18px;
+    cursor: pointer;
+    user-select: none;
+    background: var(--surface);
+  }
+
+  .method-badge {
+    font-size: 12px;
+    font-weight: 700;
+    padding: 4px 10px;
+    border-radius: 4px;
+    letter-spacing: 0.5px;
+    font-family: monospace;
+    min-width: 52px;
+    text-align: center;
+  }
+
+  .method-badge.get { background: var(--method-get-bg); color: var(--method-get); border: 1px solid var(--method-get); }
+  .method-badge.post { background: var(--method-post-bg); color: var(--method-post); border: 1px solid var(--method-post); }
+
+  .endpoint-path {
+    font-family: 'SFMono-Regular', Consolas, monospace;
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  .endpoint-desc {
+    font-size: 13px;
+    color: var(--text2);
+    margin-left: auto;
+  }
+
+  .chevron {
+    color: var(--text2);
+    transition: transform 0.2s;
+    font-size: 18px;
+    margin-left: 8px;
+  }
+
+  .endpoint.open .chevron { transform: rotate(90deg); }
+
+  .endpoint-body {
+    display: none;
+    padding: 20px;
+    background: var(--bg);
+    border-top: 1px solid var(--border);
+  }
+
+  .endpoint.open .endpoint-body { display: block; }
+
+  /* --- Form elements --- */
+  .field { margin-bottom: 16px; }
+
+  .field label {
+    display: block;
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 6px;
+    color: var(--text2);
+  }
+
+  .field label .required { color: var(--red); margin-left: 2px; }
+  .field label .optional { color: var(--text2); font-weight: 400; font-style: italic; }
+
+  .field input[type="text"],
+  .field input[type="number"],
+  .field select {
+    width: 100%;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+  }
+
+  .field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
+
+  .field input[type="file"] {
+    width: 100%;
+    background: var(--surface);
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    padding: 16px;
+    color: var(--text);
+    font-size: 14px;
+    cursor: pointer;
+  }
+
+  .field input[type="file"]:hover { border-color: var(--accent); }
+
+  .checkbox-row {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+
+  .checkbox-row label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 400;
+    color: var(--text);
+    cursor: pointer;
+  }
+
+  .checkbox-row input[type="checkbox"] {
+    width: 16px; height: 16px;
+    accent-color: var(--accent);
+  }
+
+  .field-hint {
+    font-size: 12px;
+    color: var(--text2);
+    margin-top: 4px;
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 24px;
+    border: none;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .btn-primary {
+    background: var(--accent);
+    color: #fff;
+  }
+
+  .btn-primary:hover { background: #79c0ff; }
+  .btn-primary:active { transform: scale(0.98); }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .btn-secondary {
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+
+  .btn-secondary:hover { background: #272d36; }
+
+  .btn-bar {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  /* --- Response area --- */
+  .response-area {
+    margin-top: 20px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .response-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    background: var(--surface);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text2);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .status-badge {
+    padding: 2px 10px;
+    border-radius: 10px;
+    font-size: 12px;
+    font-weight: 700;
+    font-family: monospace;
+  }
+
+  .status-badge.s2xx { background: var(--green-dim); color: var(--green); }
+  .status-badge.s4xx { background: var(--orange-dim); color: var(--orange); }
+  .status-badge.s5xx { background: var(--red-dim); color: var(--red); }
+  .status-badge.loading { background: var(--accent-dim); color: var(--accent); }
+
+  .response-body {
+    padding: 16px;
+    background: var(--bg);
+    max-height: 500px;
+    overflow: auto;
+  }
+
+  .response-body pre {
+    font-family: 'SFMono-Regular', Consolas, monospace;
+    font-size: 13px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.5;
+  }
+
+  .response-time { font-size: 12px; color: var(--text2); margin-left: auto; }
+
+  /* --- Polling --- */
+  .poll-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    margin-top: 12px;
+    background: var(--surface);
+    border-radius: 8px;
+    font-size: 13px;
+    border: 1px solid var(--border);
+  }
+
+  .spinner {
+    width: 16px; height: 16px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .hidden { display: none !important; }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: #484f58; }
+
+  .section-title {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text2);
+    margin-bottom: 12px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .file-info {
+    font-size: 12px;
+    color: var(--text2);
+    margin-top: 6px;
+  }
+
+  .task-id-display {
+    font-family: monospace;
+    font-size: 13px;
+    color: var(--accent);
+    user-select: all;
+    cursor: pointer;
+  }
+
+  .copy-btn {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text2);
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+
+  .copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Voice Input Local API</h1>
+  <p>Интерактивная документация для тестирования REST API расшифровки аудио. Версия 1.0</p>
+</div>
+
+<div class="server-bar">
+  <label>Сервер:</label>
+  <input type="text" id="baseUrl" value="http://127.0.0.1:8672" />
+  <label>API-ключ:</label>
+  <input type="text" id="apiKey" class="api-key-input" placeholder="Пусто = без авторизации" />
+  <div class="status-dot" id="statusDot" title="Статус подключения"></div>
+  <button class="btn btn-secondary" onclick="checkConnection()" style="padding:6px 14px;font-size:13px;">Проверить</button>
+</div>
+
+<div class="container">
+
+  <!-- ========== GET /capabilities ========== -->
+  <div class="endpoint" id="ep-capabilities">
+    <div class="endpoint-header" onclick="toggleEndpoint('ep-capabilities')">
+      <span class="method-badge get">GET</span>
+      <span class="endpoint-path">/capabilities</span>
+      <span class="endpoint-desc">Список доступных моделей и функций</span>
+      <span class="chevron">›</span>
+    </div>
+    <div class="endpoint-body">
+      <p style="color:var(--text2);font-size:14px;margin-bottom:16px;">
+        Возвращает список установленных моделей транскрипции, их статус и поддерживаемые функции API.
+        Параметров не требует.
+      </p>
+      <div class="btn-bar">
+        <button class="btn btn-primary" onclick="callCapabilities()">Выполнить</button>
+      </div>
+      <div id="resp-capabilities" class="hidden"></div>
+    </div>
+  </div>
+
+  <!-- ========== POST /transcribe ========== -->
+  <div class="endpoint" id="ep-transcribe">
+    <div class="endpoint-header" onclick="toggleEndpoint('ep-transcribe')">
+      <span class="method-badge post">POST</span>
+      <span class="endpoint-path">/transcribe</span>
+      <span class="endpoint-desc">Отправить файл на расшифровку</span>
+      <span class="chevron">›</span>
+    </div>
+    <div class="endpoint-body">
+      <p style="color:var(--text2);font-size:14px;margin-bottom:20px;">
+        Загружает аудио/видео файл и ставит его в очередь на расшифровку. Возвращает <code>task_id</code>
+        для отслеживания результата через <code>GET /result/{task_id}</code>.
+      </p>
+
+      <div class="section-title">Параметры запроса</div>
+
+      <div class="field">
+        <label>file <span class="required">*</span></label>
+        <input type="file" id="transcribeFile"
+               accept=".wav,.mp3,.m4a,.mp4,.webm,.ogg,.flac,.aac,.wma,.mov,.mkv" />
+        <div class="field-hint">Форматы: wav, mp3, m4a, mp4, webm, ogg, flac, aac, wma, mov, mkv</div>
+        <div class="file-info" id="fileInfo"></div>
+      </div>
+
+      <div class="field">
+        <label>model <span class="optional">(опционально)</span></label>
+        <select id="transcribeModel">
+          <option value="">По умолчанию (из настроек программы)</option>
+          <option value="whisper:tiny">whisper:tiny — Tiny (быстрая, низкое качество)</option>
+          <option value="whisper:base">whisper:base — Base</option>
+          <option value="whisper:small">whisper:small — Small (по умолчанию)</option>
+          <option value="whisper:medium">whisper:medium — Medium</option>
+          <option value="whisper:large-v3">whisper:large-v3 — Large v3 (лучшее качество)</option>
+          <option value="whisper:large-v3-turbo">whisper:large-v3-turbo — Large v3 Turbo</option>
+          <option value="parakeet:0.6b">parakeet:0.6b — Parakeet 0.6B (English)</option>
+          <option value="parakeet:1.1b">parakeet:1.1b — Parakeet 1.1B (English)</option>
+        </select>
+        <div class="field-hint">Выберите модель или оставьте по умолчанию. Модель должна быть скачана в приложении.</div>
+      </div>
+
+      <div class="field">
+        <label>Опции</label>
+        <div class="checkbox-row">
+          <label><input type="checkbox" id="transcribeTimestamps" /> timestamps — временные метки</label>
+          <label><input type="checkbox" id="transcribeDiarization" /> diarization — разделение по спикерам</label>
+          <label><input type="checkbox" id="transcribeSummary" /> summary — авто-суммаризация</label>
+        </div>
+      </div>
+
+      <div class="btn-bar">
+        <button class="btn btn-primary" id="btnTranscribe" onclick="callTranscribe()">Отправить на расшифровку</button>
+        <label style="font-size:13px;color:var(--text2);display:flex;align-items:center;gap:6px;">
+          <input type="checkbox" id="autoPoll" checked style="accent-color:var(--accent);width:14px;height:14px;" />
+          Автоматически получить результат
+        </label>
+      </div>
+
+      <div id="poll-status" class="poll-status hidden">
+        <div class="spinner"></div>
+        <span id="poll-text">Ожидание результата...</span>
+        <button class="btn btn-secondary" onclick="stopPolling()" style="margin-left:auto;padding:4px 12px;font-size:12px;">Остановить</button>
+      </div>
+
+      <div id="resp-transcribe" class="hidden"></div>
+    </div>
+  </div>
+
+  <!-- ========== GET /result/{task_id} ========== -->
+  <div class="endpoint" id="ep-result">
+    <div class="endpoint-header" onclick="toggleEndpoint('ep-result')">
+      <span class="method-badge get">GET</span>
+      <span class="endpoint-path">/result/{task_id}</span>
+      <span class="endpoint-desc">Получить результат расшифровки</span>
+      <span class="chevron">›</span>
+    </div>
+    <div class="endpoint-body">
+      <p style="color:var(--text2);font-size:14px;margin-bottom:20px;">
+        Возвращает статус и результат задачи по её идентификатору. Статусы:
+        <code>queued</code> → <code>processing</code> → <code>done</code> / <code>error</code>.
+        Результат хранится 1 час.
+      </p>
+
+      <div class="section-title">Параметры</div>
+
+      <div class="field">
+        <label>task_id <span class="required">*</span></label>
+        <div style="display:flex;gap:8px;">
+          <input type="text" id="resultTaskId" placeholder="UUID задачи, например 550e8400-e29b-..." style="flex:1;" />
+          <button class="btn btn-secondary" onclick="pasteLastTaskId()" style="padding:6px 14px;font-size:13px;white-space:nowrap;">
+            Вставить последний
+          </button>
+        </div>
+        <div class="field-hint">Скопируйте task_id из ответа POST /transcribe или нажмите «Вставить последний»</div>
+      </div>
+
+      <div class="btn-bar">
+        <button class="btn btn-primary" onclick="callResult()">Получить результат</button>
+      </div>
+      <div id="resp-result" class="hidden"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ---------- State ----------
+let lastTaskId = '';
+let pollTimer = null;
+let pollCount = 0;
+
+function getBase() { return document.getElementById('baseUrl').value.replace(/\/+$/, ''); }
+function getHeaders() {
+  const h = {};
+  const key = document.getElementById('apiKey').value.trim();
+  if (key) h['Authorization'] = 'Bearer ' + key;
+  return h;
+}
+
+// ---------- UI helpers ----------
+function toggleEndpoint(id) {
+  document.getElementById(id).classList.toggle('open');
+}
+
+function renderResponse(containerId, status, body, timeMs) {
+  const c = document.getElementById(containerId);
+  c.classList.remove('hidden');
+  const sClass = status < 300 ? 's2xx' : status < 500 ? 's4xx' : 's5xx';
+  let pretty;
+  try { pretty = JSON.stringify(typeof body === 'string' ? JSON.parse(body) : body, null, 2); }
+  catch { pretty = body; }
+
+  c.innerHTML = `
+    <div class="response-area">
+      <div class="response-header">
+        <span>Ответ</span>
+        <span class="status-badge ${sClass}">${status}</span>
+        <span class="response-time">${timeMs} мс</span>
+        <button class="copy-btn" onclick="copyText(this)" style="margin-left:auto;">Копировать</button>
+      </div>
+      <div class="response-body"><pre>${escapeHtml(pretty)}</pre></div>
+    </div>`;
+}
+
+function renderLoading(containerId) {
+  const c = document.getElementById(containerId);
+  c.classList.remove('hidden');
+  c.innerHTML = `
+    <div class="response-area">
+      <div class="response-header">
+        <span>Ответ</span>
+        <span class="status-badge loading">загрузка...</span>
+      </div>
+      <div class="response-body" style="display:flex;align-items:center;gap:10px;">
+        <div class="spinner"></div> <span style="color:var(--text2)">Отправка запроса...</span>
+      </div>
+    </div>`;
+}
+
+function renderError(containerId, msg) {
+  const c = document.getElementById(containerId);
+  c.classList.remove('hidden');
+  c.innerHTML = `
+    <div class="response-area">
+      <div class="response-header">
+        <span>Ошибка</span>
+        <span class="status-badge s5xx">ERR</span>
+      </div>
+      <div class="response-body"><pre style="color:var(--red);">${escapeHtml(msg)}</pre></div>
+    </div>`;
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function copyText(btn) {
+  const pre = btn.closest('.response-area').querySelector('pre');
+  navigator.clipboard.writeText(pre.textContent);
+  btn.textContent = 'Скопировано!';
+  setTimeout(() => btn.textContent = 'Копировать', 1500);
+}
+
+function pasteLastTaskId() {
+  if (lastTaskId) {
+    document.getElementById('resultTaskId').value = lastTaskId;
+  } else {
+    alert('Пока нет task_id. Сначала отправьте файл через POST /transcribe.');
+  }
+}
+
+// File info
+document.getElementById('transcribeFile').addEventListener('change', function() {
+  const f = this.files[0];
+  const info = document.getElementById('fileInfo');
+  if (f) {
+    const sizeMB = (f.size / 1048576).toFixed(2);
+    info.textContent = `${f.name} — ${sizeMB} МБ`;
+  } else {
+    info.textContent = '';
+  }
+});
+
+// ---------- API calls ----------
+async function checkConnection() {
+  const dot = document.getElementById('statusDot');
+  dot.className = 'status-dot';
+  try {
+    const r = await fetch(getBase() + '/capabilities', { headers: getHeaders() });
+    dot.className = r.ok ? 'status-dot ok' : 'status-dot err';
+    dot.title = r.ok ? 'Подключено' : `Ошибка: ${r.status}`;
+  } catch (e) {
+    dot.className = 'status-dot err';
+    dot.title = 'Нет связи: ' + e.message;
+  }
+}
+
+async function callCapabilities() {
+  renderLoading('resp-capabilities');
+  const t0 = performance.now();
+  try {
+    const r = await fetch(getBase() + '/capabilities', { headers: getHeaders() });
+    const body = await r.json();
+    renderResponse('resp-capabilities', r.status, body, Math.round(performance.now() - t0));
+
+    // Auto-fill model select with available models
+    if (r.ok && body.models) {
+      const sel = document.getElementById('transcribeModel');
+      const existing = new Set([...sel.options].map(o => o.value));
+      body.models.forEach(m => {
+        if (!existing.has(m.key)) {
+          const opt = document.createElement('option');
+          opt.value = m.key;
+          opt.textContent = `${m.key} — ${m.name}${m.available ? '' : ' (не скачана)'}`;
+          sel.appendChild(opt);
+        }
+      });
+    }
+  } catch (e) {
+    renderError('resp-capabilities', 'Не удалось подключиться к серверу.\n\n' + e.message +
+      '\n\nУбедитесь, что:\n1. Приложение Voice Input Local запущено\n2. API включён в настройках\n3. Адрес и порт указаны верно');
+  }
+}
+
+async function callTranscribe() {
+  const fileInput = document.getElementById('transcribeFile');
+  if (!fileInput.files.length) {
+    alert('Выберите аудио/видео файл для расшифровки.');
+    return;
+  }
+
+  const form = new FormData();
+  form.append('file', fileInput.files[0]);
+
+  const model = document.getElementById('transcribeModel').value;
+  if (model) form.append('model', model);
+  form.append('timestamps', document.getElementById('transcribeTimestamps').checked);
+  form.append('diarization', document.getElementById('transcribeDiarization').checked);
+  form.append('summary', document.getElementById('transcribeSummary').checked);
+
+  renderLoading('resp-transcribe');
+  document.getElementById('btnTranscribe').disabled = true;
+  const t0 = performance.now();
+
+  try {
+    const r = await fetch(getBase() + '/transcribe', {
+      method: 'POST',
+      headers: getHeaders(),
+      body: form,
+    });
+    const body = await r.json();
+    const ms = Math.round(performance.now() - t0);
+    renderResponse('resp-transcribe', r.status, body, ms);
+
+    if (r.ok && body.task_id) {
+      lastTaskId = body.task_id;
+      document.getElementById('resultTaskId').value = lastTaskId;
+
+      if (document.getElementById('autoPoll').checked) {
+        startPolling(body.task_id);
+      }
+    }
+  } catch (e) {
+    renderError('resp-transcribe', 'Ошибка отправки: ' + e.message);
+  } finally {
+    document.getElementById('btnTranscribe').disabled = false;
+  }
+}
+
+async function callResult() {
+  const taskId = document.getElementById('resultTaskId').value.trim();
+  if (!taskId) {
+    alert('Введите task_id.');
+    return;
+  }
+
+  renderLoading('resp-result');
+  const t0 = performance.now();
+  try {
+    const r = await fetch(getBase() + '/result/' + encodeURIComponent(taskId), { headers: getHeaders() });
+    const body = await r.json();
+    renderResponse('resp-result', r.status, body, Math.round(performance.now() - t0));
+  } catch (e) {
+    renderError('resp-result', 'Ошибка запроса: ' + e.message);
+  }
+}
+
+// ---------- Auto-polling ----------
+function startPolling(taskId) {
+  stopPolling();
+  pollCount = 0;
+  const ps = document.getElementById('poll-status');
+  ps.classList.remove('hidden');
+  document.getElementById('poll-text').textContent = 'Ожидание результата...';
+
+  pollTimer = setInterval(async () => {
+    pollCount++;
+    document.getElementById('poll-text').textContent =
+      `Ожидание результата... (попытка ${pollCount})`;
+    try {
+      const r = await fetch(getBase() + '/result/' + encodeURIComponent(taskId), { headers: getHeaders() });
+      const body = await r.json();
+
+      if (body.status === 'done' || body.status === 'error') {
+        stopPolling();
+        // Open result endpoint and show
+        const epResult = document.getElementById('ep-result');
+        if (!epResult.classList.contains('open')) epResult.classList.add('open');
+        document.getElementById('resultTaskId').value = taskId;
+        const fakeMs = '--';
+        renderResponse('resp-result', r.status, body, fakeMs);
+
+        document.getElementById('poll-text').textContent =
+          body.status === 'done'
+            ? `Готово! Расшифровано ${body.text ? body.text.length : 0} символов.`
+            : `Ошибка: ${body.error || 'неизвестная ошибка'}`;
+
+        // Change spinner to checkmark or cross
+        const spinner = ps.querySelector('.spinner');
+        if (spinner) {
+          spinner.style.animation = 'none';
+          spinner.style.border = 'none';
+          spinner.textContent = body.status === 'done' ? '✓' : '✗';
+          spinner.style.color = body.status === 'done' ? 'var(--green)' : 'var(--red)';
+          spinner.style.fontSize = '16px';
+          spinner.style.fontWeight = '700';
+          spinner.style.width = 'auto';
+          spinner.style.height = 'auto';
+        }
+      }
+
+      if (pollCount > 300) { // 5 min max
+        stopPolling();
+        document.getElementById('poll-text').textContent = 'Превышено время ожидания (5 мин).';
+      }
+    } catch (e) {
+      // network error during poll — keep trying
+    }
+  }, 1000);
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+// Auto-check connection on load
+window.addEventListener('load', () => {
+  setTimeout(checkConnection, 500);
+});
+</script>
+
+</body>
+</html>

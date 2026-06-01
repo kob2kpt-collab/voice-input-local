@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import time
+import math
 from pathlib import Path
 from string import punctuation
 
@@ -15,10 +16,13 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -44,16 +48,23 @@ from . import autostart
 from .audio_recorder import AudioRecorder, list_input_devices
 from .audio_files import SUPPORTED_AUDIO_EXTENSIONS, format_duration, is_supported_audio_file
 from . import __version__
-from .config import AppConfig
+from .config import AppConfig, CloudConnection, CONNECTION_TYPE_OPENAI, CONNECTION_TYPE_ELEVENLABS, DEFAULT_OPENAI_INITIAL_PROMPT, DEFAULT_POSTPROCESS_SYSTEM_PROMPT, DEFAULT_SUMMARY_SYSTEM_PROMPT
 from .history import HistoryItem, HistoryStore
+from . import export as history_export
 from .hotkeys import HotkeyService, normalize_hotkey
 from .insert import copy_and_maybe_paste, focused_control_accepts_text, foreground_belongs_to_current_process, foreground_matches_window_handle
 from .logger import get_logger, setup_logging
-from .models import ALL_MODELS, DEFAULT_MODEL_KEY, DEFAULT_SUMMARY_MODEL_KEY, SUMMARY_MODELS, DownloadProgress, ModelManager, TRANSCRIPTION_MODELS, cloud_provider_of, is_cloud_model_key, merge_transcript_parts, model_display_name
-from .overlay import RecordingOverlay
+from .models import ALL_MODELS, DEFAULT_MODEL_KEY, DEFAULT_SUMMARY_MODEL_KEY, SUMMARY_MODELS, DownloadProgress, ModelManager, TRANSCRIPTION_MODELS, cloud_connection_id_of, cloud_provider_of, is_cloud_model_key, merge_transcript_parts, model_display_name
+from .overlay import HotkeySafeComboBox, RecordingOverlay
+from .cloud_security_dialog import (
+    confirm_external_switch,
+    confirm_safe_switch,
+    host_is_cloudru,
+    normalize_endpoint,
+)
 from .paths import app_icon_path, logs_dir, models_dir
 from .updater import UpdateInfo, launch_update_file, normalize_repo
-from .workers import CloudConnectionCheckWorker, DownloadWorker, FileProgress, FileTranscribeWorker, FileTranscriptBlock, MicrophoneAutodetectWorker, MicrophoneAutodetectResult, PreloadWorker, SummarizeWorker, TranscribeWorker, UpdateCheckWorker, UpdateDownloadWorker
+from .workers import CloudConnectionCheckWorker, ConnectionVerifyWorker, LlmConnectionCheckWorker, PostProcessWorker, DownloadWorker, FileProgress, FileTranscribeWorker, FileTranscriptBlock, MicrophoneAutodetectWorker, MicrophoneAutodetectResult, PreloadWorker, SummarizeWorker, TranscribeWorker, UpdateCheckWorker, UpdateDownloadWorker
 try:
     from .summarizer import DEFAULT_SUMMARY_PROMPT
 except ImportError:
@@ -188,7 +199,156 @@ class NoScrollSpinBox(QSpinBox):
         event.ignore()
 
 
+class ConnectionDialog(QDialog):
+    """US-037: диалог создания/редактирования облачного подключения.
+
+    Поля: Название, Тип (OpenAI-совместимый / ElevenLabs), API URL, API Key,
+    кнопка «Проверить соединение» (verify + discover в фоне). Возвращает
+    CloudConnection через result_connection() при принятии.
+    """
+
+    def __init__(self, parent=None, connection=None, initial_safe=False) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Подключение" if connection is None else "Редактирование подключения")
+        self.setModal(True)
+        self.setMinimumWidth(420)
+        self._conn = connection
+        self._discovered = list(connection.discovered_models) if connection else []
+        self._check_worker = None
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.name_edit = QLineEdit(connection.name if connection else "")
+        self.name_edit.setPlaceholderText("Например: OpenAI основной, Groq быстрый")
+        form.addRow("Название", self.name_edit)
+
+        self.type_combo = QComboBox()
+        self.type_combo.addItem("OpenAI-совместимый API", CONNECTION_TYPE_OPENAI)
+        self.type_combo.addItem("ElevenLabs API", CONNECTION_TYPE_ELEVENLABS)
+        if connection is not None:
+            _i = self.type_combo.findData(connection.type)
+            if _i >= 0:
+                self.type_combo.setCurrentIndex(_i)
+        self.type_combo.currentIndexChanged.connect(self._on_type_changed)
+        form.addRow("Тип", self.type_combo)
+
+        self.url_edit = QLineEdit(connection.base_url if connection else "https://api.openai.com/v1")
+        self.url_edit.setPlaceholderText("https://api.openai.com/v1")
+        self.url_edit.textChanged.connect(self._update_safe_enabled)
+        form.addRow("API URL", self.url_edit)
+
+        self.key_edit = QLineEdit(connection.api_key if connection else "")
+        self.key_edit.setEchoMode(QLineEdit.Password)
+        self.key_edit.setPlaceholderText("sk-…")
+        form.addRow("API Key", self.key_edit)
+
+        # US-018 (per-connection): пометка безопасного внутреннего эндпоинта Cloud.ru.
+        # Активна только если тип OpenAI-совместимый и Base URL содержит домен cloud.ru.
+        self.safe_endpoint_check = QCheckBox("Внутренний безопасный эндпоинт Cloud.ru (данные не покидают защищённый контур)")
+        self.safe_endpoint_check.setToolTip("Доступно только для Base URL с доменом cloud.ru. Отметьте для внутренней модели Cloud.ru — переключение на неё показывает зелёное «безопасно» вместо предупреждения о передаче данных наружу.")
+        self.safe_endpoint_check.setChecked(bool(initial_safe))
+        form.addRow("", self.safe_endpoint_check)
+        layout.addLayout(form)
+
+        self.test_btn = QPushButton("Проверить соединение")
+        self.test_btn.clicked.connect(self._on_test)
+        layout.addWidget(self.test_btn)
+
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        self.status_label.setObjectName("Subtitle")
+        layout.addWidget(self.status_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("Сохранить")
+        buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._on_type_changed()
+
+    def _on_type_changed(self) -> None:
+        is_el = self.type_combo.currentData() == CONNECTION_TYPE_ELEVENLABS
+        # ElevenLabs — единый эндпоинт, URL не нужен.
+        self.url_edit.setEnabled(not is_el)
+        if is_el:
+            self.url_edit.clear()
+        elif not self.url_edit.text().strip():
+            self.url_edit.setText("https://api.openai.com/v1")
+        self._update_safe_enabled()
+
+    def _update_safe_enabled(self) -> None:
+        is_openai = self.type_combo.currentData() == CONNECTION_TYPE_OPENAI
+        ok = is_openai and host_is_cloudru(self.url_edit.text().strip())
+        self.safe_endpoint_check.setEnabled(ok)
+        if not ok and self.safe_endpoint_check.isChecked():
+            self.safe_endpoint_check.setChecked(False)
+
+    def is_marked_safe(self) -> bool:
+        return self.safe_endpoint_check.isChecked() and self.safe_endpoint_check.isEnabled()
+
+    def _on_test(self) -> None:
+        key = self.key_edit.text().strip()
+        if not key:
+            self.status_label.setText("Введите API Key перед проверкой.")
+            return
+        ctype = self.type_combo.currentData()
+        url = self.url_edit.text().strip() or "https://api.openai.com/v1"
+        self.test_btn.setEnabled(False)
+        self.status_label.setText("Проверяю соединение…")
+        # US-037: подключение находит ВСЕ модели эндпоинта (фильтр по типу
+        # функции применяется позже в настройках конкретной функции).
+        w = ConnectionVerifyWorker(ctype, key, url if ctype == CONNECTION_TYPE_OPENAI else "")
+        self._check_worker = w
+        w.result.connect(self._on_test_result)
+        w.start()
+
+    def _on_test_result(self, ok: bool, message: str, models: list) -> None:
+        self.test_btn.setEnabled(True)
+        if ok:
+            self._discovered = list(models or [])
+            extra = f" Найдено моделей: {len(self._discovered)}." if self._discovered else ""
+            self.status_label.setText(f"✓ Соединение успешно.{extra}")
+        else:
+            self.status_label.setText(f"✗ {message}")
+
+    def _on_accept(self) -> None:
+        if not self.name_edit.text().strip():
+            self.status_label.setText("Введите название подключения.")
+            return
+        if not self.key_edit.text().strip():
+            self.status_label.setText("Введите API Key.")
+            return
+        self.accept()
+
+    def result_connection(self) -> "CloudConnection":
+        ctype = self.type_combo.currentData()
+        url = self.url_edit.text().strip() if ctype == CONNECTION_TYPE_OPENAI else ""
+        key = self.key_edit.text().strip()
+        name = self.name_edit.text().strip()
+        if self._conn is not None:
+            self._conn.name = name
+            self._conn.type = ctype
+            self._conn.base_url = url
+            self._conn.api_key = key
+            self._conn.discovered_models = list(self._discovered)
+            return self._conn
+        c = CloudConnection(name=name, type=ctype, base_url=url, api_key=key)
+        c.discovered_models = list(self._discovered)
+        return c
+
+
 class HotkeySignal(QObject):
+    triggered = Signal()
+
+
+# US-026: сигналы Push-to-Talk. Колбэки приходят из потока библиотеки keyboard,
+# поэтому маршалятся в Qt-поток через сигналы (QueuedConnection), как HotkeySignal.
+class PttPressSignal(QObject):
+    triggered = Signal()
+
+
+class PttReleaseSignal(QObject):
     triggered = Signal()
 
 
@@ -240,6 +400,14 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             log.warning("Initial refresh_cloud_models failed: %s", exc)
         self._cloud_check_worker = None  # ссылка на CloudConnectionCheckWorker (anti-GC)
+        self._llm_check_worker = None  # ссылка на LlmConnectionCheckWorker (anti-GC, US-034)
+        self._postprocess_worker = None  # ссылка на PostProcessWorker (anti-GC, US-034)
+        self._dictation_used_cloud = False  # US-034: последняя диктовка шла через облачный STT
+        # US-018: сессионное (в памяти) подавление уведомлений о cloud-моделях.
+        # Ключ набора: "<provider>|<normalized_endpoint>". Сбрасывается в
+        # save_settings при смене ключа/URL провайдера (см. правило AC US-018).
+        self._cloud_warned_session: set[str] = set()
+        self._cloud_safe_confirmed_session: set[str] = set()
         self.recorder = AudioRecorder(sample_rate=self.cfg.sample_rate, input_device_id=self.cfg.audio_input_device_id, meeting_compatibility=self.cfg.audio_meeting_compatibility)
         self.transcribe_worker: TranscribeWorker | None = None
         self.file_transcribe_worker: FileTranscribeWorker | None = None
@@ -258,15 +426,31 @@ class MainWindow(QMainWindow):
         self.pending_final: tuple[Path, float, AppConfig] | None = None
         self.hotkey_signal = HotkeySignal()
         self.hotkey_signal.triggered.connect(self.toggle_recording)
+        # US-026: сигналы Push-to-Talk (старт по нажатию, стоп по отпусканию).
+        self.ptt_press_signal = PttPressSignal()
+        self.ptt_press_signal.triggered.connect(self.on_hotkey_press)
+        self.ptt_release_signal = PttReleaseSignal()
+        self.ptt_release_signal.triggered.connect(self.on_hotkey_release)
         self.cancel_signal = CancelSignal()
         self.cancel_signal.triggered.connect(self.cancel_current_action)
-        self.hotkey = HotkeyService(lambda: self.hotkey_signal.triggered.emit())
+        self.hotkey = HotkeyService(
+            lambda: self.hotkey_signal.triggered.emit(),
+            on_press=lambda: self.ptt_press_signal.triggered.emit(),
+            on_release=lambda: self.ptt_release_signal.triggered.emit(),
+        )
         self.cancel_hotkey_handle = None
         self.record_blink = False
         self.overlay = RecordingOverlay()
         self.overlay.restore_position(self.cfg.overlay_x, self.cfg.overlay_y)
         self.overlay.copy_requested.connect(self.copy_overlay_result)
         self.overlay.position_changed.connect(self.on_overlay_position_changed)
+        # US-019 / US-038: выбор модели через overlay-пикер.
+        self.overlay.model_selected.connect(self.on_overlay_model_chosen)
+        self.overlay.settings_requested.connect(self.on_overlay_settings_requested)
+        self.overlay.picker_requested.connect(self.on_overlay_picker_requested)
+        self.overlay.picker_cancelled.connect(self.on_overlay_picker_cancelled)
+        self._overlay_picker_context = "quick"
+        self._last_file_overlay_text = "Файл…"
         self.model_status_overrides: dict[str, str] = {}
         self.downloading_keys: set[str] = set()
         self.download_progress_frames = ["◌", "◔", "◑", "◕"]
@@ -344,6 +528,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._files_tab(), "Файлы")
         self.tabs.addTab(self._models_tab(), "Модели")
         self.tabs.addTab(self._settings_tab(), "Настройки")
+        self.tabs.addTab(self._api_tab(), "API-Сервер")
         self.tabs.addTab(self._history_tab(), "История")
         root.addWidget(self.tabs, 1)
         self.setCentralWidget(central)
@@ -355,7 +540,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
 
         row = QHBoxLayout()
-        self.model_combo = QComboBox()
+        self.model_combo = HotkeySafeComboBox()  # US-019: Space не открывает список (часть хоткея)
         self.model_combo.setToolTip("Выберите загруженную модель. Она станет активной сразу и начнёт готовиться в фоне.")
         self.model_combo.currentIndexChanged.connect(self.on_dictation_model_changed)
         row.addWidget(QLabel("Активная модель:"))
@@ -429,6 +614,12 @@ class MainWindow(QMainWindow):
         self.file_stable_timestamps_check.setToolTip("Выключено по умолчанию. Улучшает разбивку фраз и таймкоды при обработке файлов.")
         self.file_diarization_check = QCheckBox("Определять говорящих (диаризация, до 4 спикеров)")
         self.file_diarization_check.setToolTip("Выключено по умолчанию. Требует дополнительную Sortformer ONNX-модель. Доступно только для обработки файлов.")
+        # TASK-061 (US-017): inline-подсказка о способе диаризации для cloud-моделей.
+        # Для OpenAI — локальный пост-процесс на CPU, для ElevenLabs — нативно.
+        self.file_diarization_hint = QLabel("")
+        self.file_diarization_hint.setObjectName("Subtitle")
+        self.file_diarization_hint.setWordWrap(True)
+        self.file_diarization_hint.setVisible(False)
         speaker_row = QHBoxLayout()
         self.file_speaker_count_combo = NoScrollComboBox()
         self.file_speaker_count_combo.addItem("Авто", "auto")
@@ -442,6 +633,7 @@ class MainWindow(QMainWindow):
         self.file_summary_check.setToolTip("После расшифровки локальная LLM-модель создаст краткое резюме. Модель скачается автоматически при первом использовании (~2.5 ГБ).")
         options_box.addWidget(self.file_stable_timestamps_check)
         options_box.addWidget(self.file_diarization_check)
+        options_box.addWidget(self.file_diarization_hint)
         options_box.addLayout(speaker_row)
         options_box.addWidget(self.file_summary_check)
         layout.addLayout(options_box)
@@ -483,7 +675,8 @@ class MainWindow(QMainWindow):
         self.file_result_text = QTextEdit()
         self.file_result_text.setReadOnly(True)
         self.file_result_text.setPlaceholderText("Здесь появится результат расшифровки файла.")
-        layout.addWidget(self.file_result_text, 1)
+        self.file_result_text.setMinimumHeight(90)
+        layout.addWidget(self.file_result_text, 2)
 
         self.file_summary_label = QLabel("Суммаризация:")
         self.file_summary_label.setObjectName("Subtitle")
@@ -492,15 +685,39 @@ class MainWindow(QMainWindow):
         self.file_summary_text = QTextEdit()
         self.file_summary_text.setReadOnly(True)
         self.file_summary_text.setPlaceholderText("Здесь появится краткое резюме расшифровки.")
-        self.file_summary_text.setMaximumHeight(180)
+        self.file_summary_text.setMinimumHeight(60)
+        self.file_summary_text.setMaximumHeight(220)
         self.file_summary_text.setVisible(False)
-        layout.addWidget(self.file_summary_text)
-        return tab
+        layout.addWidget(self.file_summary_text, 1)
+
+        # US-037: вкладку «Файлы» оборачиваем в прокрутку — появление панели
+        # резюме НЕ меняет размер окна, содержимое просто прокручивается вниз.
+        tab.setMinimumHeight(tab.sizeHint().height())
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(tab)
+        return scroll
 
     def _models_tab(self) -> QWidget:
+        # US-020: вкладка «Модели» делится на подвкладки «Локальные» и
+        # «Облачные» — каждая занимает всё пространство страницы.
+        tab = QWidget()
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.models_subtabs = QTabWidget()
+        self.models_subtabs.addTab(self._local_models_subtab(), "Локальные модели")
+        self.models_subtabs.addTab(self._cloud_models_subtab(), "Облачные модели")
+        outer.addWidget(self.models_subtabs)
+        self._refresh_connections_table()
+        return tab
+
+    def _local_models_subtab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
         self.models_table = QTableWidget(0, 6)
         self.models_table.setHorizontalHeaderLabels(["Движок", "Модель", "Язык", "Размер", "Статус", "Комментарий"])
         self.models_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -524,6 +741,447 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         layout.addLayout(row)
         return tab
+
+    def _cloud_models_subtab(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+
+        cloud_hint = QLabel(
+            "Подключения к облачным провайдерам (OpenAI-совместимый API, ElevenLabs). "
+            "Создайте подключение один раз — оно используется в диктовке, постобработке и суммаризации."
+        )
+        cloud_hint.setWordWrap(True)
+        cloud_hint.setObjectName("Subtitle")
+        layout.addWidget(cloud_hint)
+
+        conn_label = QLabel("Подключения")
+        conn_label.setObjectName("Title")
+        conn_label.setStyleSheet("font-size: 15px; margin-top: 4px;")
+        layout.addWidget(conn_label)
+
+        self.connections_table = QTableWidget(0, 3)
+        self.connections_table.setHorizontalHeaderLabels(["Название", "Тип", "Статус"])
+        self.connections_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.connections_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.connections_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.connections_table.verticalHeader().setVisible(False)
+        _conn_hh = self.connections_table.horizontalHeader()
+        _conn_hh.setStretchLastSection(False)
+        _conn_hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        _conn_hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        _conn_hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.connections_table.doubleClicked.connect(lambda *_: self._on_edit_connection())
+        self.connections_table.itemSelectionChanged.connect(self._update_connection_buttons)
+        self.connections_table.setMinimumHeight(150)
+        self.connections_table.setMaximumHeight(240)
+        layout.addWidget(self.connections_table)
+
+        self.connections_empty_hint = QLabel(
+            "Подключений нет. Нажмите «Добавить подключение», чтобы настроить облачного провайдера."
+        )
+        self.connections_empty_hint.setWordWrap(True)
+        self.connections_empty_hint.setObjectName("Subtitle")
+        layout.addWidget(self.connections_empty_hint)
+
+        crow = QHBoxLayout()
+        self.add_connection_btn = QPushButton("Добавить подключение")
+        self.edit_connection_btn = QPushButton("Редактировать")
+        self.delete_connection_btn = QPushButton("Удалить")
+        self.delete_connection_btn.setObjectName("Danger")
+        self.add_connection_btn.clicked.connect(self._on_add_connection)
+        self.edit_connection_btn.clicked.connect(self._on_edit_connection)
+        self.delete_connection_btn.clicked.connect(self._on_delete_connection)
+        crow.addWidget(self.add_connection_btn)
+        crow.addWidget(self.edit_connection_btn)
+        crow.addWidget(self.delete_connection_btn)
+        crow.addStretch(1)
+        layout.addLayout(crow)
+
+        # ── Диктовка (облако): Initial Prompt, чанк, fallback — US-035/US-037 ──
+        dict_sep = QLabel("Настройки облачной расшифровки")
+        dict_sep.setObjectName("Title")
+        dict_sep.setStyleSheet("font-size: 15px; margin-top: 14px;")
+        layout.addWidget(dict_sep)
+
+        dict_note = QLabel("Облачную модель диктовки выбирайте на вкладке «Диктовка» (реквизиты берутся из подключения). Здесь — параметры облачной диктовки.")
+        dict_note.setWordWrap(True)
+        dict_note.setObjectName("Subtitle")
+        layout.addWidget(dict_note)
+
+        dict_group = QWidget()
+        dgl = QFormLayout(dict_group)
+        dgl.setContentsMargins(0, 0, 0, 0)
+
+        self.openai_initial_prompt_edit = QTextEdit()
+        self.openai_initial_prompt_edit.setPlaceholderText("Пример стиля пунктуации/форматирования. Оставьте пустым, чтобы не передавать prompt.")
+        self.openai_initial_prompt_edit.setMinimumHeight(70)
+        self.openai_initial_prompt_edit.setMaximumHeight(110)
+        self.openai_initial_prompt_edit.setToolTip("Не команда модели, а пример стиля. Влияет на пунктуацию/форматирование, не меняет содержание. ~50 слов (лимит API 224 токена). Только диктовка через OpenAI-совместимый API; ElevenLabs не поддерживает.")
+        dgl.addRow("Initial Prompt (Whisper/OpenAI)", self.openai_initial_prompt_edit)
+
+        self.openai_prompt_reset_btn = QPushButton("Сбросить к дефолту")
+        self.openai_prompt_reset_btn.setToolTip("Восстановить дефолтный пример стиля пунктуации.")
+        self.openai_prompt_reset_btn.clicked.connect(self.on_reset_openai_initial_prompt)
+        dgl.addRow("", self.openai_prompt_reset_btn)
+
+        self.cloud_max_chunk_spin = NoScrollSpinBox()
+        self.cloud_max_chunk_spin.setRange(30, 300)
+        self.cloud_max_chunk_spin.setSuffix(" сек")
+        self.cloud_max_chunk_spin.setToolTip("Длинная диктовка нарезается на чанки этой длины и отправляется в облако параллельно (US-032).")
+        _chunk_note = QLabel("Длинная запись разбивается на части указанной длины и отправляется в облако параллельно — это ускоряет и стабилизирует расшифровку длинных диктовок и файлов.")
+        _chunk_note.setWordWrap(True)
+        _chunk_note.setObjectName("Subtitle")
+        _chunk_cell = QWidget()
+        _cv = QVBoxLayout(_chunk_cell)
+        _cv.setContentsMargins(0, 0, 0, 0)
+        _cv.setSpacing(2)
+        _cv.addWidget(self.cloud_max_chunk_spin)
+        _cv.addWidget(_chunk_note)
+        dgl.addRow("Длина чанка для облака", _chunk_cell)
+
+        self.cloud_fallback_combo = NoScrollComboBox()
+        self.cloud_fallback_combo.setToolTip("Локальная модель, которая используется при недоступности облака.")
+        _fb_note = QLabel("Если облачная модель недоступна (нет интернета или сбой API), расшифровка автоматически выполнится этой локальной моделью.")
+        _fb_note.setWordWrap(True)
+        _fb_note.setObjectName("Subtitle")
+        _fb_cell = QWidget()
+        _fv = QVBoxLayout(_fb_cell)
+        _fv.setContentsMargins(0, 0, 0, 0)
+        _fv.setSpacing(2)
+        _fv.addWidget(self.cloud_fallback_combo)
+        _fv.addWidget(_fb_note)
+        dgl.addRow("Fallback при сбое облака", _fb_cell)
+
+        layout.addWidget(dict_group)
+
+        # ── Улучшение расшифровки (постобработка облачной LLM) — US-020/US-034 ──
+        pp_sep = QLabel("Улучшение расшифровки")
+        pp_sep.setObjectName("Title")
+        pp_sep.setStyleSheet("font-size: 15px; margin-top: 14px;")
+        layout.addWidget(pp_sep)
+
+        self.postprocess_enabled_check = QCheckBox("Включить постобработку расшифровки облачной LLM")
+        self.postprocess_enabled_check.setToolTip("Работает только при использовании облачных STT-моделей. При локальной расшифровке постобработка не выполняется.")
+        self.postprocess_enabled_check.toggled.connect(self._on_postprocess_enabled_toggled)
+        layout.addWidget(self.postprocess_enabled_check)
+
+        pp_note = QLabel("Сырой текст расшифровки (через облачный STT) прогоняется через облачную LLM: пунктуация, грамматика, формулировки. Локальная расшифровка не затрагивается.")
+        pp_note.setWordWrap(True)
+        pp_note.setObjectName("Subtitle")
+        layout.addWidget(pp_note)
+
+        self.postprocess_group = QWidget()
+        pg = QFormLayout(self.postprocess_group)
+        pg.setContentsMargins(0, 0, 0, 0)
+
+        self.postprocess_conn_combo = NoScrollComboBox()
+        self.postprocess_conn_combo.setToolTip("Облачное подключение (OpenAI-совместимое) для постобработки. Создайте его в блоке «Подключения» выше.")
+        self.postprocess_conn_combo.currentIndexChanged.connect(self._on_postprocess_conn_changed)
+        pg.addRow("Подключение", self.postprocess_conn_combo)
+
+        # Скрытые поля совместимости: реквизиты берутся из выбранного подключения.
+        self.postprocess_base_url_edit = QLineEdit()
+        self.postprocess_base_url_edit.setVisible(False)
+        self.postprocess_key_edit = QLineEdit()
+        self.postprocess_key_edit.setEchoMode(QLineEdit.Password)
+        self.postprocess_key_edit.setVisible(False)
+
+        self.postprocess_model_combo = EditableClickToOpenComboBox()
+        self.postprocess_model_combo.setToolTip("Модель LLM (text→text) для постобработки. Список отфильтрован по подключению.")
+        pg.addRow("Модель", self.postprocess_model_combo)
+
+        self.postprocess_check_btn = QPushButton("Проверить соединение и обновить список моделей")
+        self.postprocess_check_btn.clicked.connect(self.check_llm_connection)
+        pg.addRow("", self.postprocess_check_btn)
+
+        self.postprocess_prompt_edit = QTextEdit()
+        self.postprocess_prompt_edit.setMinimumHeight(180)
+        self.postprocess_prompt_edit.setMaximumHeight(340)
+        self.postprocess_prompt_edit.setToolTip("Инструкция для LLM: только форматирование (пунктуация, грамматика), без изменения смысла.")
+        pg.addRow("Системный промпт", self.postprocess_prompt_edit)
+
+        self.postprocess_prompt_reset_btn = QPushButton("Сбросить к дефолту")
+        self.postprocess_prompt_reset_btn.setToolTip("Восстановить дефолтный системный промпт постобработки.")
+        self.postprocess_prompt_reset_btn.clicked.connect(self.on_reset_postprocess_prompt)
+        pg.addRow("", self.postprocess_prompt_reset_btn)
+
+        self.postprocess_reasoning_check = QCheckBox("Рассуждение модели (Reasoning)")
+        self.postprocess_reasoning_check.setToolTip("Рассуждение замедляет ответ; включайте только если качество важнее скорости.")
+        self.postprocess_reasoning_check.toggled.connect(self._on_postprocess_reasoning_toggled)
+        pg.addRow("Reasoning", self.postprocess_reasoning_check)
+
+        self.postprocess_effort_row = QWidget()
+        er = QHBoxLayout(self.postprocess_effort_row)
+        er.setContentsMargins(0, 0, 0, 0)
+        er.addWidget(QLabel("Уровень рассуждения:"))
+        self.postprocess_reasoning_effort_combo = NoScrollComboBox()
+        for _lvl, _name in (("low", "Низкий (быстро)"), ("medium", "Средний"), ("high", "Высокий (медленно)")):
+            self.postprocess_reasoning_effort_combo.addItem(_name, _lvl)
+        self.postprocess_reasoning_effort_combo.setToolTip("low — быстрее, high — качественнее, но медленнее.")
+        er.addWidget(self.postprocess_reasoning_effort_combo)
+        er.addStretch(1)
+        pg.addRow("", self.postprocess_effort_row)
+
+        self.postprocess_warn_label = QLabel("Заполните параметры подключения.")
+        self.postprocess_warn_label.setObjectName("Subtitle")
+        self.postprocess_warn_label.setStyleSheet("color: #f59e0b;")
+        self.postprocess_warn_label.setVisible(False)
+        pg.addRow("", self.postprocess_warn_label)
+
+        layout.addWidget(self.postprocess_group)
+
+        # ── Суммаризация (облако) — US-036/US-037 ──
+        sm_sep = QLabel("Суммаризация")
+        sm_sep.setObjectName("Title")
+        sm_sep.setStyleSheet("font-size: 15px; margin-top: 14px;")
+        layout.addWidget(sm_sep)
+
+        sm_note = QLabel("Подключение и модель для облачной суммаризации. Способ суммаризации (локально или облако) выбирается в «Настройках»; промпт и Reasoning — ниже.")
+        sm_note.setWordWrap(True)
+        sm_note.setObjectName("Subtitle")
+        layout.addWidget(sm_note)
+
+        sm_group = QWidget()
+        smg = QFormLayout(sm_group)
+        smg.setContentsMargins(0, 0, 0, 0)
+
+        self.summary_conn_combo = NoScrollComboBox()
+        self.summary_conn_combo.setToolTip("Облачное подключение (OpenAI-совместимое) для суммаризации. Создайте его в блоке «Подключения» выше.")
+        self.summary_conn_combo.currentIndexChanged.connect(self._on_summary_conn_changed)
+        smg.addRow("Подключение", self.summary_conn_combo)
+
+        # Скрытые поля совместимости: реквизиты берутся из выбранного подключения.
+        self.summary_base_url_edit = QLineEdit()
+        self.summary_base_url_edit.setVisible(False)
+        self.summary_key_edit = QLineEdit()
+        self.summary_key_edit.setEchoMode(QLineEdit.Password)
+        self.summary_key_edit.setVisible(False)
+
+        self.summary_model_combo = EditableClickToOpenComboBox()
+        self.summary_model_combo.setToolTip("Модель LLM (text→text) для суммаризации. Список отфильтрован по подключению.")
+        smg.addRow("Модель", self.summary_model_combo)
+
+        self.summary_check_btn = QPushButton("Проверить соединение и обновить список моделей")
+        self.summary_check_btn.clicked.connect(self.check_summary_connection)
+        smg.addRow("", self.summary_check_btn)
+
+        self.summary_prompt_edit = QTextEdit()
+        self.summary_prompt_edit.setPlaceholderText("Системный промпт суммаризации (используется и для локального, и для облачного режима).")
+        self.summary_prompt_edit.setMinimumHeight(180)
+        self.summary_prompt_edit.setMaximumHeight(340)
+        self.summary_prompt_edit.setToolTip("Роль, задача, ограничения и формат ответа. Кнопка «По умолчанию» вернёт встроенное значение.")
+        smg.addRow("Системный промпт", self.summary_prompt_edit)
+
+        self.summary_prompt_reset_btn = QPushButton("По умолчанию")
+        self.summary_prompt_reset_btn.setToolTip("Сбросить промпт суммаризации к встроенному значению.")
+        self.summary_prompt_reset_btn.clicked.connect(self.reset_summary_prompt)
+        smg.addRow("", self.summary_prompt_reset_btn)
+
+        self.summary_reasoning_check = QCheckBox("Рассуждение модели (Reasoning)")
+        self.summary_reasoning_check.setToolTip("Модель размышляет перед ответом: качественнее, но медленнее. Для облачных моделей передаётся уровень рассуждения; для локальной Qwen3 включается режим thinking.")
+        self.summary_reasoning_check.toggled.connect(self._on_summary_reasoning_toggled)
+        smg.addRow("Reasoning", self.summary_reasoning_check)
+
+        self.summary_effort_row = QWidget()
+        ser = QHBoxLayout(self.summary_effort_row)
+        ser.setContentsMargins(0, 0, 0, 0)
+        ser.addWidget(QLabel("Уровень рассуждения:"))
+        self.summary_reasoning_effort_combo = NoScrollComboBox()
+        for _lvl, _name in (("low", "Низкий (быстро)"), ("medium", "Средний"), ("high", "Высокий (медленно)")):
+            self.summary_reasoning_effort_combo.addItem(_name, _lvl)
+        self.summary_reasoning_effort_combo.setToolTip("Применяется к облачным моделям. low — быстрее, high — качественнее.")
+        ser.addWidget(self.summary_reasoning_effort_combo)
+        ser.addStretch(1)
+        smg.addRow("", self.summary_effort_row)
+
+        layout.addWidget(sm_group)
+        layout.addStretch(1)
+        self._refresh_connection_pickers()
+        scroll.setWidget(tab)
+        return scroll
+
+    # ── US-037: выбор подключения для функций (постобработка и др.) ──────
+    def _fill_llm_model_combo(self, combo, conn, current: str = "") -> None:
+        """Заполнить combo моделями подключения, отфильтрованными до text→text."""
+        models = []
+        if conn is not None:
+            try:
+                from .cloud_llm import _is_text_io_model
+                models = [m for m in (conn.discovered_models or []) if _is_text_io_model(m)]
+            except Exception:  # noqa: BLE001
+                models = list(conn.discovered_models or [])
+        combo.blockSignals(True)
+        combo.clear()
+        for m in models:
+            combo.addItem(m)
+        if current:
+            combo.setCurrentText(current)
+        combo.blockSignals(False)
+
+    def _sync_postprocess_conn(self, autosave: bool) -> None:
+        if not hasattr(self, "postprocess_conn_combo"):
+            return
+        conn = self.cfg.connection_by_id(self.postprocess_conn_combo.currentData() or "")
+        if conn is not None:
+            self.postprocess_base_url_edit.setText(conn.base_url or "https://api.openai.com/v1")
+            self.postprocess_key_edit.setText(conn.api_key or "")
+            self._fill_llm_model_combo(self.postprocess_model_combo, conn, getattr(self.cfg, "postprocess_model_id", "") or "")
+        if hasattr(self, "postprocess_warn_label"):
+            need = bool(getattr(self, "postprocess_enabled_check", None) and self.postprocess_enabled_check.isChecked())
+            self.postprocess_warn_label.setVisible(need and conn is None)
+        if autosave:
+            self.schedule_settings_autosave()
+
+    def _on_postprocess_conn_changed(self) -> None:
+        self._sync_postprocess_conn(autosave=True)
+
+    def _sync_summary_conn(self, autosave: bool) -> None:
+        if not hasattr(self, "summary_conn_combo"):
+            return
+        conn = self.cfg.connection_by_id(self.summary_conn_combo.currentData() or "")
+        if conn is not None:
+            self.summary_base_url_edit.setText(conn.base_url or "https://api.openai.com/v1")
+            self.summary_key_edit.setText(conn.api_key or "")
+            self._fill_llm_model_combo(self.summary_model_combo, conn, getattr(self.cfg, "summary_model_id", "") or "")
+        if autosave:
+            self.schedule_settings_autosave()
+
+    def _on_summary_conn_changed(self) -> None:
+        self._sync_summary_conn(autosave=True)
+
+    def _refresh_connection_pickers(self) -> None:
+        """US-037: наполнить выпадающие списки «Подключение» в функциях."""
+        if hasattr(self, "postprocess_conn_combo"):
+            combo = self.postprocess_conn_combo
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("— выберите подключение —", "")
+            for c in (getattr(self.cfg, "cloud_connections", None) or []):
+                if c.type == "openai":
+                    combo.addItem(c.name or c.id, c.id)
+            cur = getattr(self.cfg, "postprocess_connection_id", "") or ""
+            idx = combo.findData(cur)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+            self._sync_postprocess_conn(autosave=False)
+        if hasattr(self, "summary_conn_combo"):
+            combo = self.summary_conn_combo
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("— выберите подключение —", "")
+            for c in (getattr(self.cfg, "cloud_connections", None) or []):
+                if c.type == "openai":
+                    combo.addItem(c.name or c.id, c.id)
+            cur = getattr(self.cfg, "summary_connection_id", "") or ""
+            idx = combo.findData(cur)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+            self._sync_summary_conn(autosave=False)
+
+    # ── US-037: управление облачными подключениями ──────────────────────
+    def _refresh_connections_table(self) -> None:
+        tbl = getattr(self, "connections_table", None)
+        if tbl is None:
+            return
+        conns = list(getattr(self.cfg, "cloud_connections", None) or [])
+        type_label = {"openai": "OpenAI-совм.", "elevenlabs": "ElevenLabs"}
+        tbl.setRowCount(len(conns))
+        for r, c in enumerate(conns):
+            tbl.setItem(r, 0, QTableWidgetItem(c.name or "(без названия)"))
+            tbl.setItem(r, 1, QTableWidgetItem(type_label.get(c.type, c.type)))
+            status = "Ключ задан" if c.api_key else "Нет ключа"
+            if c.discovered_models:
+                status += f" · моделей: {len(c.discovered_models)}"
+            tbl.setItem(r, 2, QTableWidgetItem(status))
+        if hasattr(self, "connections_empty_hint"):
+            self.connections_empty_hint.setVisible(not conns)
+        self._update_connection_buttons()
+
+    def _update_connection_buttons(self) -> None:
+        has_sel = getattr(self, "connections_table", None) is not None and self.connections_table.currentRow() >= 0
+        if hasattr(self, "edit_connection_btn"):
+            self.edit_connection_btn.setEnabled(has_sel)
+            self.delete_connection_btn.setEnabled(has_sel)
+
+    def _selected_connection(self):
+        conns = list(getattr(self.cfg, "cloud_connections", None) or [])
+        r = self.connections_table.currentRow()
+        if 0 <= r < len(conns):
+            return conns[r]
+        return None
+
+    def _on_add_connection(self) -> None:
+        dlg = ConnectionDialog(self)
+        if dlg.exec():
+            conn = dlg.result_connection()
+            self.cfg.cloud_connections.append(conn)
+            self._apply_connection_safe(conn, dlg.is_marked_safe())
+            self._after_connections_changed()
+
+    def _on_edit_connection(self) -> None:
+        conn = self._selected_connection()
+        if conn is None:
+            return
+        dlg = ConnectionDialog(self, connection=conn, initial_safe=self._endpoint_marked_safe(conn.base_url))
+        if dlg.exec():
+            dlg.result_connection()  # мутирует conn на месте
+            self._apply_connection_safe(conn, dlg.is_marked_safe())
+            self._after_connections_changed()
+
+    def _apply_connection_safe(self, conn, safe: bool) -> None:
+        """US-018 (per-connection): добавить/убрать base_url подключения в списке
+        безопасных эндпоинтов Cloud.ru и сбросить сессионные подтверждения для него."""
+        lst = list(getattr(self.cfg, "cloud_internal_safe_endpoints", []))
+        norm = normalize_endpoint(conn.base_url)
+        present = norm in {normalize_endpoint(x) for x in lst}
+        if safe and conn.type == "openai" and host_is_cloudru(conn.base_url):
+            if norm and not present:
+                lst.append((conn.base_url or "").strip())
+        else:
+            lst = [x for x in lst if normalize_endpoint(x) != norm]
+        self.cfg.cloud_internal_safe_endpoints = lst
+        if norm:
+            self._cloud_warned_session = {k for k in self._cloud_warned_session if not k.endswith("|" + norm)}
+            self._cloud_safe_confirmed_session = {k for k in self._cloud_safe_confirmed_session if not k.endswith("|" + norm)}
+
+    def _on_delete_connection(self) -> None:
+        conn = self._selected_connection()
+        if conn is None:
+            return
+        used = []
+        if getattr(self.cfg, "postprocess_connection_id", "") == conn.id:
+            used.append("постобработка")
+        if getattr(self.cfg, "summary_connection_id", "") == conn.id:
+            used.append("суммаризация")
+        if is_cloud_model_key(self.cfg.selected_model or "") and cloud_connection_id_of(self.cfg.selected_model) == conn.id:
+            used.append("диктовка")
+        msg = f"Удалить подключение «{conn.name or conn.id}»?"
+        if used:
+            msg += "\n\nОно используется в: " + ", ".join(used) + ". После удаления выберите другое подключение в соответствующей функции."
+        if QMessageBox.question(self, "Удаление подключения", msg) != QMessageBox.Yes:
+            return
+        self.cfg.cloud_connections = [c for c in self.cfg.cloud_connections if c.id != conn.id]
+        self._after_connections_changed()
+
+    def _after_connections_changed(self) -> None:
+        try:
+            self.cfg.save()
+            self.models.refresh_cloud_models(self.cfg)
+            self.refresh_available_models_combo()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("after connections changed failed: %s", exc)
+        self._refresh_connections_table()
+        if hasattr(self, "_refresh_connection_pickers"):
+            try:
+                self._refresh_connection_pickers()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("refresh connection pickers failed: %s", exc)
 
     def _settings_tab(self) -> QWidget:
         # ── QScrollArea & dark theme ────────────────────────────────────
@@ -597,6 +1255,15 @@ class MainWindow(QMainWindow):
         self.hotkey_hint_label.setObjectName("Subtitle")
         self.hotkey_hint_label.setWordWrap(True)
         form.addRow("", self.hotkey_hint_label)
+        # US-026: режим горячей клавиши (Переключатель / Push-to-Talk).
+        self.hotkey_mode_combo = NoScrollComboBox()
+        self.hotkey_mode_combo.addItem("Переключатель (нажать / нажать ещё раз)", "toggle")
+        self.hotkey_mode_combo.addItem("Зажать и держать (Push-to-Talk)", "ptt")
+        form.addRow("Режим клавиши", self.hotkey_mode_combo)
+        self.hotkey_mode_hint_label = QLabel("Переключатель: нажать — запись, нажать снова — расшифровка. Push-to-Talk: держать — запись, отпустить — расшифровка. Для Push-to-Talk выбирайте комбинацию с Ctrl или Alt (например Ctrl+Space): одиночную клавишу пришлось бы удерживать всю диктовку, и она печаталась бы в текущем поле ввода.")
+        self.hotkey_mode_hint_label.setObjectName("Subtitle")
+        self.hotkey_mode_hint_label.setWordWrap(True)
+        form.addRow("", self.hotkey_mode_hint_label)
         form.addRow("Вставка", self.auto_paste_check)
         form.addRow("Безопасная вставка", self.detect_text_field_check)
         form.addRow("Созвоны", self.meeting_compat_check)
@@ -615,106 +1282,60 @@ class MainWindow(QMainWindow):
         form.addRow("Ускорение Whisper", self.device_combo)
         form.addRow("Compute Whisper", self.compute_combo)
 
+        # US-037: облачные реквизиты теперь живут в «Подключениях» на вкладке
+        # «Модели». Раздел «Облачные модели» убран из «Настроек». Легаси-виджеты
+        # STT (ключи/URL/модели/проверка/безопасный эндпоинт) сохранены СКРЫТО
+        # для совместимости с обработчиками (check_cloud_connection,
+        # _apply_cloud_models_to_settings_combo, US-018, load/save, миграция).
+        # Управление облаком — через блок «Подключения» («Модели»). Initial Prompt,
+        # длина чанка и fallback перенесены на «Модели» → «Облачные модели».
+        self.cloud_stt_legacy_group = QWidget()
+        self.cloud_stt_legacy_group.setVisible(False)
+        _clg = QFormLayout(self.cloud_stt_legacy_group)
+        _clg.setContentsMargins(0, 0, 0, 0)
+        self.openai_stt_key_edit = QLineEdit()
+        self.openai_stt_key_edit.setEchoMode(QLineEdit.Password)
+        self.openai_stt_base_url_edit = QLineEdit()
+        self.openai_safe_endpoint_check = QCheckBox("Внутренний безопасный эндпоинт Cloud.ru")
+        self.openai_safe_endpoint_check.toggled.connect(self._on_openai_safe_endpoint_toggled)
+        self.openai_stt_base_url_edit.textChanged.connect(self._update_safe_endpoint_checkbox_enabled)
+        self.openai_stt_model_combo = EditableClickToOpenComboBox()
+        self.openai_check_btn = QPushButton("Проверить соединение")
+        self.openai_check_btn.clicked.connect(lambda: self.check_cloud_connection("openai"))
+        self.elevenlabs_stt_key_edit = QLineEdit()
+        self.elevenlabs_stt_key_edit.setEchoMode(QLineEdit.Password)
+        self.elevenlabs_stt_model_combo = EditableClickToOpenComboBox()
+        self.elevenlabs_check_btn = QPushButton("Проверить соединение")
+        self.elevenlabs_check_btn.clicked.connect(lambda: self.check_cloud_connection("elevenlabs"))
+        for _w in (
+            self.openai_stt_key_edit, self.openai_stt_base_url_edit, self.openai_safe_endpoint_check,
+            self.openai_stt_model_combo, self.openai_check_btn,
+            self.elevenlabs_stt_key_edit, self.elevenlabs_stt_model_combo, self.elevenlabs_check_btn,
+        ):
+            _clg.addRow("", _w)
+        form.addRow(self.cloud_stt_legacy_group)
+
+        # US-020/US-037: блок «Улучшение расшифровки» перенесён на вкладку «Модели» → «Облачные модели».
+
         summary_separator = QLabel("Суммаризация")
         summary_separator.setObjectName("Title")
         summary_separator.setStyleSheet("font-size: 16px; margin-top: 12px;")
         form.addRow(summary_separator)
-        self.summary_prompt_edit = QTextEdit()
-        self.summary_prompt_edit.setPlaceholderText("Системный промпт для суммаризации. Оставьте пустым для промпта по умолчанию.")
-        self.summary_prompt_edit.setMaximumHeight(120)
-        self.summary_prompt_edit.setToolTip("Настройте промпт под свой тип звонков: продажи, поддержка, переговоры.")
-        form.addRow("Промпт суммаризации", self.summary_prompt_edit)
-        self.summary_prompt_reset_btn = QPushButton("По умолчанию")
-        self.summary_prompt_reset_btn.setToolTip("Сбросить промпт суммаризации к встроенному значению.")
-        self.summary_prompt_reset_btn.clicked.connect(self.reset_summary_prompt)
-        form.addRow("", self.summary_prompt_reset_btn)
+        # US-037: промпт суммаризации и Reasoning перенесены на «Модели» → «Облачные модели». В «Настройках» остаётся только выбор способа.
 
-        # ── Cloud STT (US-015, US-016, US-032) ────────────────────────────
-        cloud_separator = QLabel("Облачные модели")
-        cloud_separator.setObjectName("Title")
-        cloud_separator.setStyleSheet("font-size: 16px; margin-top: 12px;")
-        form.addRow(cloud_separator)
-
-        cloud_hint = QLabel(
-            "Облачные модели обеспечивают более высокое качество распознавания, но требуют интернета "
-            "и передают аудио на серверы провайдера. Если связь пропадёт — программа автоматически переключится "
-            "на локальную модель из списка ниже."
+        # US-036: способ суммаризации — локально или облачная LLM.
+        self.summary_mode_combo = NoScrollComboBox()
+        self.summary_mode_combo.addItem("Локально (на этом компьютере)", "local")
+        self.summary_mode_combo.addItem("Облако (OpenAI-совместимый API)", "cloud")
+        self.summary_mode_combo.setToolTip(
+            "Локально — через скачанную GGUF-модель. Облако — через OpenAI-совместимый "
+            "API (быстрее, не нагружает компьютер, но передаёт текст на внешние серверы)."
         )
-        cloud_hint.setWordWrap(True)
-        cloud_hint.setObjectName("Subtitle")
-        form.addRow("", cloud_hint)
+        self.summary_mode_combo.currentIndexChanged.connect(self._on_summary_mode_changed)
+        form.addRow("Способ суммаризации", self.summary_mode_combo)
 
-        # OpenAI-compatible
-        self.openai_stt_key_edit = QLineEdit()
-        self.openai_stt_key_edit.setEchoMode(QLineEdit.Password)
-        self.openai_stt_key_edit.setPlaceholderText("sk-…")
-        self.openai_stt_key_edit.setToolTip("API-ключ OpenAI (или любого OpenAI-совместимого STT-провайдера).")
-        form.addRow("OpenAI API Key", self.openai_stt_key_edit)
-
-        self.openai_stt_base_url_edit = QLineEdit()
-        self.openai_stt_base_url_edit.setPlaceholderText("https://api.openai.com/v1")
-        self.openai_stt_base_url_edit.setToolTip("Base URL OpenAI-совместимого API. Для Groq: https://api.groq.com/openai/v1")
-        form.addRow("OpenAI Base URL", self.openai_stt_base_url_edit)
-
-        # TASK-048: editable + click-to-open поведение
-        self.openai_stt_model_combo = EditableClickToOpenComboBox()
-        self.openai_stt_model_combo.setToolTip(
-            "Модель STT провайдера. Нажмите «Проверить соединение», чтобы обновить список из API."
-        )
-        form.addRow("OpenAI Model", self.openai_stt_model_combo)
-
-        self.openai_check_btn = QPushButton("Проверить соединение и обновить список моделей")
-        self.openai_check_btn.clicked.connect(lambda: self.check_cloud_connection("openai"))
-        form.addRow("", self.openai_check_btn)
-
-        # ElevenLabs
-        self.elevenlabs_stt_key_edit = QLineEdit()
-        self.elevenlabs_stt_key_edit.setEchoMode(QLineEdit.Password)
-        self.elevenlabs_stt_key_edit.setPlaceholderText("…")
-        self.elevenlabs_stt_key_edit.setToolTip("API-ключ ElevenLabs.")
-        form.addRow("ElevenLabs API Key", self.elevenlabs_stt_key_edit)
-
-        # TASK-048: editable + click-to-open поведение
-        self.elevenlabs_stt_model_combo = EditableClickToOpenComboBox()
-        self.elevenlabs_stt_model_combo.setToolTip("Модель ElevenLabs STT (по умолчанию scribe_v1).")
-        form.addRow("ElevenLabs Model", self.elevenlabs_stt_model_combo)
-
-        self.elevenlabs_check_btn = QPushButton("Проверить соединение и обновить список моделей")
-        self.elevenlabs_check_btn.clicked.connect(lambda: self.check_cloud_connection("elevenlabs"))
-        form.addRow("", self.elevenlabs_check_btn)
-
-        # Параметры fallback и нарезки
-        self.cloud_max_chunk_spin = NoScrollSpinBox()
-        self.cloud_max_chunk_spin.setRange(30, 300)
-        self.cloud_max_chunk_spin.setSuffix(" сек")
-        self.cloud_max_chunk_spin.setToolTip(
-            "Длинная диктовка нарезается на чанки этой длины и отправляется в облако параллельно (US-032)."
-        )
-        form.addRow("Длина чанка для облака", self.cloud_max_chunk_spin)
-
-        self.cloud_fallback_combo = NoScrollComboBox()
-        # Заполняется в _load_settings_into_ui — все локальные транскрипционные модели
-        self.cloud_fallback_combo.setToolTip(
-            "Локальная модель, которая используется при недоступности облака."
-        )
-        form.addRow("Fallback при сбое облака", self.cloud_fallback_combo)
-
-        api_separator = QLabel("API-сервер")
-        api_separator.setObjectName("Title")
-        api_separator.setStyleSheet("font-size: 16px; margin-top: 12px;")
-        form.addRow(api_separator)
-        self.api_enabled_check = QCheckBox("Включить REST API (перезапуск требуется)")
-        self.api_enabled_check.setToolTip("Запускает HTTP-сервер на localhost для приёма запросов на расшифровку от внешних приложений.")
-        form.addRow("API", self.api_enabled_check)
-        self.api_port_edit = QLineEdit()
-        self.api_port_edit.setPlaceholderText("8672")
-        self.api_port_edit.setToolTip("Порт для API-сервера. По умолчанию 8672.")
-        form.addRow("Порт API", self.api_port_edit)
-        self.api_key_edit = QLineEdit()
-        self.api_key_edit.setEchoMode(QLineEdit.Password)
-        self.api_key_edit.setPlaceholderText("Оставьте пустым для открытого доступа")
-        self.api_key_edit.setToolTip("Bearer-токен для авторизации. Если пусто, API доступен без авторизации.")
-        form.addRow("API-ключ", self.api_key_edit)
+        # US-037: выбор подключения и модели суммаризации перенесён на «Модели» → «Облачные модели».
+        # US-029: настройки REST API-сервера вынесены в отдельную вкладку «API» (см. _api_tab).
         layout.addLayout(form)
 
         hint = QLabel("Настройки сохраняются автоматически. Кнопку сохранения нажимать больше не нужно.")
@@ -752,6 +1373,127 @@ class MainWindow(QMainWindow):
         scroll.setWidget(tab)
         return scroll
 
+    # ── Вкладка «API» (US-029, US-030) ─────────────────────────────────
+    def _api_tab(self) -> QWidget:
+        """US-029: отдельная вкладка с настройками REST API-сервера.
+        US-030: поля предзаполнены значениями по умолчанию (хост 127.0.0.1,
+        порт 8672, URL Swagger). Тёмный фон — через глобальное правило
+        QWidget { background: #101114 } в APP_STYLE (см. _settings_tab)."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+        form = QFormLayout()
+
+        title = QLabel("REST API-сервер")
+        title.setObjectName("Title")
+        title.setStyleSheet("font-size: 16px;")
+        form.addRow(title)
+
+        self.api_enabled_check = QCheckBox("Включить REST API (требуется перезапуск)")
+        self.api_enabled_check.setToolTip(
+            "Запускает HTTP-сервер для приёма запросов на расшифровку от внешних приложений."
+        )
+        form.addRow("API", self.api_enabled_check)
+
+        self.api_host_edit = QLineEdit()
+        self.api_host_edit.setPlaceholderText("127.0.0.1")
+        self.api_host_edit.setToolTip(
+            "Хост (адрес) API-сервера. По умолчанию 127.0.0.1 (только локально). "
+            "Укажите 0.0.0.0, чтобы принимать запросы из локальной сети."
+        )
+        form.addRow("Хост", self.api_host_edit)
+
+        self.api_port_edit = QLineEdit()
+        self.api_port_edit.setPlaceholderText("8672")
+        self.api_port_edit.setToolTip("Порт для API-сервера. По умолчанию 8672.")
+        form.addRow("Порт", self.api_port_edit)
+
+        self.api_key_edit = QLineEdit()
+        self.api_key_edit.setEchoMode(QLineEdit.Password)
+        self.api_key_edit.setPlaceholderText("Оставьте пустым для открытого доступа")
+        self.api_key_edit.setToolTip(
+            "Bearer-токен для авторизации. Если пусто, API доступен без авторизации."
+        )
+        form.addRow("API-ключ", self.api_key_edit)
+
+        self.api_swagger_url_label = QLabel()
+        self.api_swagger_url_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.api_swagger_url_label.setToolTip("Адрес интерактивной документации API (Swagger UI).")
+        form.addRow("Swagger UI", self.api_swagger_url_label)
+
+        layout.addLayout(form)
+
+        btns = QHBoxLayout()
+        self.open_swagger_btn = QPushButton("Открыть Swagger")
+        self.open_swagger_btn.setFocusPolicy(Qt.NoFocus)
+        self.open_swagger_btn.setAutoDefault(False)
+        self.open_swagger_btn.setToolTip("Открыть Swagger UI в браузере по текущему адресу сервера.")
+        self.open_swagger_btn.clicked.connect(self.open_swagger)
+        btns.addWidget(self.open_swagger_btn)
+        btns.addStretch(1)
+        layout.addLayout(btns)
+
+        hint = QLabel(
+            "Настройки сохраняются автоматически. Изменения хоста/порта применяются "
+            "после перезапуска приложения. Если сервер запущен на 0.0.0.0, доступ к "
+            "нему открыт для устройств в сети — используйте API-ключ."
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("Subtitle")
+        layout.addWidget(hint)
+        layout.addStretch(1)
+
+        # US-030: пересборка адреса Swagger при изменении хоста/порта.
+        self.api_host_edit.textChanged.connect(self._update_swagger_url_label)
+        self.api_port_edit.textChanged.connect(self._update_swagger_url_label)
+        self._update_swagger_url_label()
+
+        scroll.setWidget(tab)
+        return scroll
+
+    def _current_api_host(self) -> str:
+        """US-030: текущий хост из поля или дефолт 127.0.0.1."""
+        host = ""
+        if hasattr(self, "api_host_edit"):
+            host = self.api_host_edit.text().strip()
+        if not host:
+            host = (getattr(self.cfg, "api_host", "") or "").strip() or "127.0.0.1"
+        # 0.0.0.0 слушает все интерфейсы, но открывать в браузере нужно localhost.
+        return "127.0.0.1" if host == "0.0.0.0" else host
+
+    def _current_api_port(self) -> int:
+        """US-030: текущий порт из поля или дефолт 8672."""
+        if hasattr(self, "api_port_edit"):
+            raw = self.api_port_edit.text().strip()
+            if raw.isdigit():
+                return int(raw)
+        return getattr(self.cfg, "api_port", 0) or 8672
+
+    def _swagger_url(self) -> str:
+        return f"http://{self._current_api_host()}:{self._current_api_port()}/docs"
+
+    def _update_swagger_url_label(self) -> None:
+        if hasattr(self, "api_swagger_url_label"):
+            self.api_swagger_url_label.setText(self._swagger_url())
+
+    def open_swagger(self) -> None:
+        """US-029/US-030: открыть Swagger UI в браузере по актуальному адресу."""
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        url = self._swagger_url()
+        if not self.cfg.api_enabled:
+            self.status_label.setText(
+                "API-сервер выключен — Swagger будет недоступен, пока вы не включите REST API "
+                "и не перезапустите приложение."
+            )
+        QDesktopServices.openUrl(QUrl(url))
+
     def _history_tab(self) -> QWidget:
         tab = QWidget()
         layout = QHBoxLayout(tab)
@@ -767,6 +1509,16 @@ class MainWindow(QMainWindow):
         right.addWidget(self.history_text, 1)
         copy_btn = QPushButton("Скопировать выбранную")
         copy_btn.clicked.connect(lambda: pyperclip.copy(self.history_text.toPlainText()))
+        # US-024: кнопка «Скачать» с выпадающим меню форматов экспорта
+        from PySide6.QtWidgets import QMenu
+
+        self.export_history_btn = QPushButton("Скачать ▾")
+        self.export_history_btn.setToolTip("Сохранить выбранную расшифровку в файл TXT, Markdown или PDF.")
+        export_menu = QMenu(self.export_history_btn)
+        export_menu.addAction("Скачать как TXT", lambda: self.export_history_item("txt"))
+        export_menu.addAction("Скачать как Markdown (.md)", lambda: self.export_history_item("md"))
+        export_menu.addAction("Скачать как PDF", lambda: self.export_history_item("pdf"))
+        self.export_history_btn.setMenu(export_menu)
         self.summarize_history_btn = QPushButton("Суммаризировать")
         self.summarize_history_btn.setToolTip("Сформировать краткое резюме из текста выбранной расшифровки.")
         self.summarize_history_btn.clicked.connect(self.summarize_history_item)
@@ -777,6 +1529,7 @@ class MainWindow(QMainWindow):
         clear_btn.setObjectName("Danger")
         clear_btn.clicked.connect(self.clear_history)
         right.addWidget(copy_btn)
+        right.addWidget(self.export_history_btn)
         right.addWidget(self.summarize_history_btn)
         right.addWidget(delete_btn)
         right.addWidget(clear_btn)
@@ -855,6 +1608,9 @@ class MainWindow(QMainWindow):
 
     def _load_settings_into_ui(self) -> None:
         self.hotkey_edit.setKeySequence(QKeySequence(self.cfg.hotkey))
+        _hm = getattr(self.cfg, "hotkey_mode", "toggle")
+        _hm_idx = self.hotkey_mode_combo.findData(_hm)
+        self.hotkey_mode_combo.setCurrentIndex(_hm_idx if _hm_idx >= 0 else 0)
         self.auto_paste_check.setChecked(self.cfg.auto_paste)
         self.detect_text_field_check.setChecked(self.cfg.paste_only_when_text_field_detected)
         self.meeting_compat_check.setChecked(self.cfg.audio_meeting_compatibility)
@@ -880,22 +1636,86 @@ class MainWindow(QMainWindow):
         if hasattr(self, "file_summary_check"):
             self.file_summary_check.setChecked(self.cfg.summary_enabled)
         if hasattr(self, "summary_prompt_edit"):
-            self.summary_prompt_edit.setPlainText(self.cfg.summary_system_prompt)
+            _s_prompt = getattr(self.cfg, "summary_system_prompt", "") or ""
+            self.summary_prompt_edit.setPlainText(_s_prompt if _s_prompt.strip() else DEFAULT_SUMMARY_SYSTEM_PROMPT)
+        if hasattr(self, "summary_mode_combo"):
+            _smode = getattr(self.cfg, "summary_mode", "local") or "local"
+            self.summary_mode_combo.blockSignals(True)
+            _sidx = self.summary_mode_combo.findData(_smode)
+            self.summary_mode_combo.setCurrentIndex(_sidx if _sidx >= 0 else 0)
+            self.summary_mode_combo.blockSignals(False)
+            self.summary_base_url_edit.setText(getattr(self.cfg, "summary_base_url", "") or "https://api.openai.com/v1")
+            self.summary_key_edit.setText(getattr(self.cfg, "summary_api_key", "") or "")
+            _smodel = getattr(self.cfg, "summary_model_id", "") or ""
+            self.summary_model_combo.blockSignals(True)
+            self.summary_model_combo.clear()
+            if _smodel:
+                self.summary_model_combo.addItem(_smodel, _smodel)
+                self.summary_model_combo.setCurrentIndex(0)
+            self.summary_model_combo.setEditText(_smodel)
+            self.summary_model_combo.blockSignals(False)
+            self.summary_reasoning_check.setChecked(bool(getattr(self.cfg, "summary_reasoning", False)))
+            _s_eff = getattr(self.cfg, "summary_reasoning_effort", "low") or "low"
+            _s_eff_idx = self.summary_reasoning_effort_combo.findData(_s_eff)
+            self.summary_reasoning_effort_combo.setCurrentIndex(_s_eff_idx if _s_eff_idx >= 0 else 0)
+            self._on_summary_reasoning_toggled(self.summary_reasoning_check.isChecked())
+            self._update_summary_cloud_group_visibility()
         if hasattr(self, "api_enabled_check"):
             self.api_enabled_check.setChecked(self.cfg.api_enabled)
+        if hasattr(self, "api_host_edit"):
+            # US-030: показываем сохранённое значение; для дефолта оставляем поле
+            # пустым (плейсхолдер 127.0.0.1), чтобы не путать с пользовательским вводом.
+            _host = (getattr(self.cfg, "api_host", "") or "").strip()
+            self.api_host_edit.setText("" if _host in ("", "127.0.0.1") else _host)
         if hasattr(self, "api_port_edit"):
             self.api_port_edit.setText(str(self.cfg.api_port) if self.cfg.api_port != 8672 else "")
         if hasattr(self, "api_key_edit"):
             self.api_key_edit.setText(self.cfg.api_key)
+        if hasattr(self, "api_swagger_url_label"):
+            self._update_swagger_url_label()
         # Cloud STT (US-015, US-016, US-032)
         if hasattr(self, "openai_stt_key_edit"):
             self.openai_stt_key_edit.setText(self.cfg.openai_stt_api_key)
             self.openai_stt_base_url_edit.setText(self.cfg.openai_stt_base_url or "https://api.openai.com/v1")
+            # US-018: восстановить состояние чекбокса «безопасный эндпоинт Cloud.ru».
+            if hasattr(self, "openai_safe_endpoint_check"):
+                _ep_norm = normalize_endpoint(self.cfg.openai_stt_base_url or "")
+                _safe_set = {normalize_endpoint(e) for e in getattr(self.cfg, "cloud_internal_safe_endpoints", [])}
+                self.openai_safe_endpoint_check.setChecked(bool(_ep_norm) and _ep_norm in _safe_set)
+                self._update_safe_endpoint_checkbox_enabled()
             self._fill_cloud_model_combo(self.openai_stt_model_combo, "openai", self.cfg.openai_stt_model_id)
+            # US-035: загрузка Initial Prompt
+            if hasattr(self, "openai_initial_prompt_edit"):
+                self.openai_initial_prompt_edit.setPlainText(
+                    self.cfg.openai_stt_initial_prompt if self.cfg.openai_stt_initial_prompt is not None else DEFAULT_OPENAI_INITIAL_PROMPT
+                )
             self.elevenlabs_stt_key_edit.setText(self.cfg.elevenlabs_stt_api_key)
             self._fill_cloud_model_combo(self.elevenlabs_stt_model_combo, "elevenlabs", self.cfg.elevenlabs_stt_model_id)
             self.cloud_max_chunk_spin.setValue(max(30, min(300, int(self.cfg.cloud_max_chunk_seconds or 60))))
             self._fill_cloud_fallback_combo()
+        # US-034: постобработка
+        if hasattr(self, "postprocess_enabled_check"):
+            self.postprocess_enabled_check.setChecked(bool(getattr(self.cfg, "postprocess_enabled", False)))
+            self.postprocess_base_url_edit.setText(getattr(self.cfg, "postprocess_base_url", "") or "https://api.openai.com/v1")
+            self.postprocess_key_edit.setText(getattr(self.cfg, "postprocess_api_key", "") or "")
+            _pp_model = getattr(self.cfg, "postprocess_model_id", "") or ""
+            self.postprocess_model_combo.blockSignals(True)
+            self.postprocess_model_combo.clear()
+            if _pp_model:
+                self.postprocess_model_combo.addItem(_pp_model, _pp_model)
+                self.postprocess_model_combo.setCurrentIndex(0)
+            self.postprocess_model_combo.setEditText(_pp_model)
+            self.postprocess_model_combo.blockSignals(False)
+            _pp_prompt = getattr(self.cfg, "postprocess_system_prompt", None)
+            self.postprocess_prompt_edit.setPlainText(
+                _pp_prompt if _pp_prompt is not None else DEFAULT_POSTPROCESS_SYSTEM_PROMPT
+            )
+            self.postprocess_reasoning_check.setChecked(bool(getattr(self.cfg, "postprocess_reasoning", False)))
+            _eff = getattr(self.cfg, "postprocess_reasoning_effort", "low") or "low"
+            _eff_idx = self.postprocess_reasoning_effort_combo.findData(_eff)
+            self.postprocess_reasoning_effort_combo.setCurrentIndex(_eff_idx if _eff_idx >= 0 else 0)
+            self._on_postprocess_enabled_toggled(self.postprocess_enabled_check.isChecked())
+            self._on_postprocess_reasoning_toggled(self.postprocess_reasoning_check.isChecked())
 
     def _fill_cloud_model_combo(self, combo: QComboBox, provider: str, current: str) -> None:
         """Заполняет combo моделей провайдера из реестра ModelManager + текущее значение."""
@@ -943,13 +1763,23 @@ class MainWindow(QMainWindow):
         self.update_repo_edit.editingFinished.connect(self.schedule_settings_autosave)
         for checkbox in [self.auto_paste_check, self.detect_text_field_check, self.meeting_compat_check, self.overlay_enabled_check, self.autostart_check, self.updates_enabled_check]:
             checkbox.stateChanged.connect(self.schedule_settings_autosave)
-        for combo in [self.microphone_combo, self.language_combo, self.device_combo, self.compute_combo]:
+        for combo in [self.microphone_combo, self.language_combo, self.device_combo, self.compute_combo, self.hotkey_mode_combo]:
             combo.currentIndexChanged.connect(self.schedule_settings_autosave)
         self.file_stable_timestamps_check.stateChanged.connect(self.save_file_options)
         self.file_diarization_check.stateChanged.connect(self.save_file_options)
         self.file_speaker_count_combo.currentIndexChanged.connect(self.save_file_options)
         self.file_summary_check.stateChanged.connect(self.save_file_options)
+        if hasattr(self, "summary_mode_combo"):
+            self.summary_base_url_edit.editingFinished.connect(self.schedule_settings_autosave)
+            self.summary_key_edit.editingFinished.connect(self.schedule_settings_autosave)
+            self.summary_model_combo.editTextChanged.connect(self.schedule_settings_autosave)
+            self.summary_model_combo.currentIndexChanged.connect(self.schedule_settings_autosave)
+            self.summary_reasoning_check.stateChanged.connect(self.schedule_settings_autosave)
+            self.summary_reasoning_effort_combo.currentIndexChanged.connect(self.schedule_settings_autosave)
+        # TASK-061 (US-017): реактивность опций таймкодов/диаризации к смене модели файла.
+        self.file_model_combo.currentIndexChanged.connect(self._update_file_options_for_model)
         self.api_enabled_check.stateChanged.connect(self.schedule_settings_autosave)
+        self.api_host_edit.editingFinished.connect(self.schedule_settings_autosave)
         self.api_port_edit.editingFinished.connect(self.schedule_settings_autosave)
         self.api_key_edit.editingFinished.connect(self.schedule_settings_autosave)
         # Cloud STT (US-015, US-016, US-032). Изменение ключа/URL/модели
@@ -959,11 +1789,53 @@ class MainWindow(QMainWindow):
             self.openai_stt_base_url_edit.editingFinished.connect(self.on_cloud_settings_changed)
             self.openai_stt_model_combo.editTextChanged.connect(self.schedule_settings_autosave)
             self.openai_stt_model_combo.currentIndexChanged.connect(self.schedule_settings_autosave)
+            # US-035: автосейв Initial Prompt при изменении
+            if hasattr(self, "openai_initial_prompt_edit"):
+                self.openai_initial_prompt_edit.textChanged.connect(self.schedule_settings_autosave)
             self.elevenlabs_stt_key_edit.editingFinished.connect(self.on_cloud_settings_changed)
             self.elevenlabs_stt_model_combo.editTextChanged.connect(self.schedule_settings_autosave)
             self.elevenlabs_stt_model_combo.currentIndexChanged.connect(self.schedule_settings_autosave)
             self.cloud_max_chunk_spin.valueChanged.connect(self.schedule_settings_autosave)
             self.cloud_fallback_combo.currentIndexChanged.connect(self.schedule_settings_autosave)
+        # US-034: автосейв постобработки
+        if hasattr(self, "postprocess_enabled_check"):
+            self.postprocess_enabled_check.stateChanged.connect(self.schedule_settings_autosave)
+            self.postprocess_reasoning_check.stateChanged.connect(self.schedule_settings_autosave)
+            self.postprocess_base_url_edit.editingFinished.connect(self.schedule_settings_autosave)
+            self.postprocess_key_edit.editingFinished.connect(self.schedule_settings_autosave)
+            self.postprocess_model_combo.editTextChanged.connect(self.schedule_settings_autosave)
+            self.postprocess_model_combo.currentIndexChanged.connect(self.schedule_settings_autosave)
+            self.postprocess_prompt_edit.textChanged.connect(self.schedule_settings_autosave)
+            self.postprocess_reasoning_effort_combo.currentIndexChanged.connect(self.schedule_settings_autosave)
+
+    def on_reset_openai_initial_prompt(self) -> None:
+        """US-035: сбросить поле Initial Prompt к дефолтному значению."""
+        if not hasattr(self, "openai_initial_prompt_edit"):
+            return
+        # US-035 diag: entry + before/after значения для каждого шага.
+        before_widget = self.openai_initial_prompt_edit.toPlainText()
+        before_cfg = getattr(self.cfg, "openai_stt_initial_prompt", "")
+        log.info(
+            "on_reset_openai_initial_prompt: ENTRY widget_chars=%d cfg_chars=%d default_chars=%d",
+            len(before_widget), len(before_cfg), len(DEFAULT_OPENAI_INITIAL_PROMPT),
+        )
+        self.openai_initial_prompt_edit.setPlainText(DEFAULT_OPENAI_INITIAL_PROMPT)
+        after_setplain_widget = self.openai_initial_prompt_edit.toPlainText()
+        log.info(
+            "on_reset_openai_initial_prompt: AFTER setPlainText widget_chars=%d preview=%r",
+            len(after_setplain_widget), after_setplain_widget[:60].replace("\n", " "),
+        )
+        # Останавливаем pending debounce таймер от textChanged
+        try:
+            self._settings_save_timer.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        self.save_settings(auto=True)
+        after_save_cfg = getattr(self.cfg, "openai_stt_initial_prompt", "")
+        log.info(
+            "on_reset_openai_initial_prompt: AFTER save_settings cfg_chars=%d preview=%r",
+            len(after_save_cfg), after_save_cfg[:60].replace("\n", " "),
+        )
 
     def save_file_options(self) -> None:
         if self._settings_loading:
@@ -973,6 +1845,18 @@ class MainWindow(QMainWindow):
         self.cfg.file_speaker_count = str(self.file_speaker_count_combo.currentData() or "auto")
         if hasattr(self, "file_summary_check"):
             self.cfg.summary_enabled = self.file_summary_check.isChecked()
+            # US-018 (guarded-хук): сейчас суммаризация локальная (llama-cpp, CPU),
+            # поэтому is_cloud_model_key(...) == False и уведомление НЕ показывается.
+            # Когда/если появится облачная суммаризация (cloud:* модель суммаризации) —
+            # при её включении сработает то же предупреждение о передаче данных.
+            if self.cfg.summary_enabled and is_cloud_model_key(
+                getattr(self.cfg, "selected_summary_model", "") or ""
+            ):
+                if not self._confirm_cloud_switch("summary"):
+                    self.cfg.summary_enabled = False
+                    self.file_summary_check.blockSignals(True)
+                    self.file_summary_check.setChecked(False)
+                    self.file_summary_check.blockSignals(False)
         self.cfg.save()
         if self.cfg.file_diarization_enabled and not self.models.is_installed("addon:sortformer"):
             self.status_label.setText("Для диаризации нужно загрузить дополнительную модель Sortformer во вкладке «Модели».")
@@ -1192,7 +2076,7 @@ class MainWindow(QMainWindow):
 
     def register_hotkey(self, show_errors: bool = True) -> bool:
         try:
-            self.hotkey.start(self.cfg.hotkey)
+            self.hotkey.start(self.cfg.hotkey, mode=getattr(self.cfg, "hotkey_mode", "toggle"))
             self.status_label.setText(f"Готово. Горячая клавиша: {self.cfg.hotkey}")
             self.overlay.set_hotkey(self.cfg.hotkey)
             self._set_hotkey_attention(False)
@@ -1319,6 +2203,127 @@ class MainWindow(QMainWindow):
             self._flash_button_state(self.autodetect_mic_btn, "Не найден", kind="error", seconds=5)
             log.info("Microphone autodetect UI state: error shown")
 
+    # --- US-018: уведомления безопасности при переключении на облачные модели ---
+    def _cloud_endpoint_for_provider(self, provider: str) -> str:
+        """base_url провайдера для проверки cloud.ru и показа в диалоге."""
+        if provider == "openai":
+            return getattr(self.cfg, "openai_stt_base_url", "") or ""
+        if provider == "elevenlabs":
+            return "https://api.elevenlabs.io"
+        if provider == "postprocess":
+            conn = self.cfg.connection_by_id(getattr(self.cfg, "postprocess_connection_id", "") or "")
+            return (conn.base_url if conn else getattr(self.cfg, "postprocess_base_url", "")) or ""
+        if provider == "summary":
+            conn = self.cfg.connection_by_id(getattr(self.cfg, "summary_connection_id", "") or "")
+            return (conn.base_url if conn else getattr(self.cfg, "summary_base_url", "")) or ""
+        return ""
+
+    def _cloud_provider_label(self, provider: str) -> str:
+        return {
+            "openai": "OpenAI-совместимый STT",
+            "elevenlabs": "ElevenLabs STT",
+            "postprocess": "Постобработка (облачная LLM)",
+            "summary": "Суммаризация (облачная LLM)",
+        }.get(provider, provider)
+
+    def _endpoint_marked_safe(self, endpoint: str) -> bool:
+        """True, если пользователь пометил этот эндпоинт безопасным (и это cloud.ru)."""
+        norm = normalize_endpoint(endpoint)
+        if not norm or not host_is_cloudru(endpoint):
+            return False
+        saved = {normalize_endpoint(e) for e in getattr(self.cfg, "cloud_internal_safe_endpoints", [])}
+        return norm in saved
+
+    def _confirm_cloud_endpoint(self, label: str, endpoint: str, sess_prefix: str) -> bool:
+        """US-018: показать нужное уведомление для конкретного облачного ЭНДПОИНТА.
+
+        True — продолжать; False — пользователь отменил (только для внешней
+        модели). Безопасные внутренние эндпоинты Cloud.ru → крупное зелёное
+        подтверждение однократно за сессию. Внешние → янтарное предупреждение,
+        подавляется в рамках сессии. Безопасность привязана к ЭНДПОИНТУ
+        (base_url подключения), а не к провайдеру — работает per-connection.
+        """
+        sess_key = f"{sess_prefix}|{normalize_endpoint(endpoint)}"
+        if self._endpoint_marked_safe(endpoint):
+            if sess_key not in self._cloud_safe_confirmed_session:
+                confirm_safe_switch(self, provider_label=label, endpoint=endpoint)
+                self._cloud_safe_confirmed_session.add(sess_key)
+            return True
+        if sess_key in self._cloud_warned_session:
+            return True
+        can_mark_safe = host_is_cloudru(endpoint)
+        accepted, mark_safe = confirm_external_switch(
+            self, provider_label=label, endpoint=endpoint, can_mark_safe=can_mark_safe
+        )
+        if not accepted:
+            return False
+        if mark_safe:
+            lst = list(getattr(self.cfg, "cloud_internal_safe_endpoints", []))
+            norm = normalize_endpoint(endpoint)
+            if norm and norm not in {normalize_endpoint(x) for x in lst}:
+                lst.append(endpoint.strip())
+                self.cfg.cloud_internal_safe_endpoints = lst
+                self.cfg.save()
+            self._cloud_safe_confirmed_session.add(sess_key)
+        else:
+            self._cloud_warned_session.add(sess_key)
+        return True
+
+    def _confirm_cloud_switch(self, provider: str) -> bool:
+        """US-018: уведомление при переходе на облачную функцию (postprocess/summary/STT).
+        Эндпоинт берётся из подключения функции (или legacy base_url)."""
+        endpoint = self._cloud_endpoint_for_provider(provider)
+        label = self._cloud_provider_label(provider)
+        return self._confirm_cloud_endpoint(label, endpoint, provider)
+
+    def _confirm_cloud_model_switch(self, key: str) -> bool:
+        """US-018: смена МОДЕЛИ диктовки. Эндпоинт берётся из подключения,
+        на которое ссылается cloud-ключ (cloud:<connection_id>:<model_id>)."""
+        if not is_cloud_model_key(key):
+            return True
+        from .models import resolve_cloud_connection
+        conn = resolve_cloud_connection(self.cfg, key)
+        if conn is None:
+            return True
+        endpoint = conn.base_url if conn.type == "openai" else "https://api.elevenlabs.io"
+        label = conn.name or ("ElevenLabs STT" if conn.type == "elevenlabs" else "Облачная STT")
+        return self._confirm_cloud_endpoint(label, endpoint, "dictation")
+
+    def _update_safe_endpoint_checkbox_enabled(self) -> None:
+        """US-018: чекбокс «безопасный эндпоинт» активен только для домена cloud.ru."""
+        if not hasattr(self, "openai_safe_endpoint_check"):
+            return
+        url = self.openai_stt_base_url_edit.text().strip()
+        is_cloudru = host_is_cloudru(url)
+        self.openai_safe_endpoint_check.setEnabled(is_cloudru)
+        if not is_cloudru and self.openai_safe_endpoint_check.isChecked():
+            self.openai_safe_endpoint_check.blockSignals(True)
+            self.openai_safe_endpoint_check.setChecked(False)
+            self.openai_safe_endpoint_check.blockSignals(False)
+
+    def _on_openai_safe_endpoint_toggled(self, checked: bool) -> None:
+        """US-018: пользователь вручную помечает/снимает безопасный эндпоинт Cloud.ru."""
+        if getattr(self, "_settings_loading", False):
+            return
+        url = self.openai_stt_base_url_edit.text().strip()
+        norm = normalize_endpoint(url)
+        lst = list(getattr(self.cfg, "cloud_internal_safe_endpoints", []))
+        if checked:
+            if not host_is_cloudru(url):
+                self.openai_safe_endpoint_check.blockSignals(True)
+                self.openai_safe_endpoint_check.setChecked(False)
+                self.openai_safe_endpoint_check.blockSignals(False)
+                return
+            if norm and norm not in {normalize_endpoint(x) for x in lst}:
+                lst.append(url)
+        else:
+            lst = [x for x in lst if normalize_endpoint(x) != norm]
+        self.cfg.cloud_internal_safe_endpoints = lst
+        # Статус безопасности openai изменился — сбросить его сессионные подтверждения.
+        self._cloud_warned_session = {k for k in self._cloud_warned_session if not k.startswith("openai|")}
+        self._cloud_safe_confirmed_session = {k for k in self._cloud_safe_confirmed_session if not k.startswith("openai|")}
+        self.cfg.save()
+
     def on_dictation_model_changed(self) -> None:
         if self._settings_loading or not hasattr(self, "model_combo"):
             return
@@ -1330,6 +2335,11 @@ class MainWindow(QMainWindow):
             self.refresh_available_models_combo()
             return
         if self.cfg.selected_model == key:
+            return
+        if is_cloud_model_key(key) and not self._confirm_cloud_model_switch(key):
+            # US-018: пользователь отменил переход на облачную модель —
+            # вернуть combo к текущей модели (guard выше предотвращает рекурсию).
+            self._set_combo_value(self.model_combo, self.cfg.selected_model)
             return
         self.cfg.selected_model = key
         self.cfg.save()
@@ -1343,6 +2353,9 @@ class MainWindow(QMainWindow):
         if not self.models.is_available(key):
             QMessageBox.information(self, "Модели", "Эта модель ещё не загружена. Сначала загрузите её во вкладке «Модели».")
             self.refresh_available_models_combo()
+            return
+        if is_cloud_model_key(key) and not self._confirm_cloud_model_switch(key):
+            self.refresh_available_models_combo()  # US-018: отмена — вернуть прежнюю модель в combo
             return
         self.cfg.selected_model = key
         self.cfg.save()
@@ -1369,6 +2382,8 @@ class MainWindow(QMainWindow):
         if not self.models.is_available(key):
             QMessageBox.information(self, "Модели", "Эта модель ещё не загружена. Активной можно сделать только загруженную модель.")
             return
+        if is_cloud_model_key(key) and not self._confirm_cloud_model_switch(key):
+            return  # US-018: пользователь отменил переход на облачную модель
         self.cfg.selected_model = key
         self.cfg.save()
         self.refresh_available_models_combo()
@@ -1533,6 +2548,38 @@ class MainWindow(QMainWindow):
     def file_uses_local(self) -> bool:
         """TASK-063: True если активная/планируемая модель файла — локальная."""
         return not is_cloud_model_key(self._file_model_key())
+
+    def _update_file_options_for_model(self) -> None:
+        """TASK-061 (US-017): реактивность чекбоксов «Точные таймкоды» и
+        «Диаризация» при смене модели на вкладке «Файлы».
+
+        Cloud-модели отдают таймкоды нативно (verbose_json у OpenAI, words у
+        ElevenLabs) — дополнительная локальная VAD-модель им не нужна. Диаризация
+        для OpenAI выполняется локальным пост-процессом на CPU, для ElevenLabs —
+        нативно (diarize=true). Для локальных моделей — прежнее поведение.
+        """
+        if not hasattr(self, "file_diarization_hint"):
+            return
+        key = self._file_model_key()
+        is_cloud = is_cloud_model_key(key)
+        provider = cloud_provider_of(key) if is_cloud else ""
+        # Таймкоды: cloud не требует доп. VAD-модель.
+        if is_cloud:
+            self.file_stable_timestamps_check.setToolTip(
+                "Cloud-модель отдаёт таймкоды нативно — дополнительная VAD-модель не нужна."
+            )
+        else:
+            self.file_stable_timestamps_check.setToolTip(
+                "Выключено по умолчанию. Улучшает разбивку фраз и таймкоды при обработке файлов."
+            )
+        # Подсказка по способу диаризации.
+        hint = ""
+        if is_cloud and provider == "openai":
+            hint = "Диаризация выполнится локально на CPU (+5–30 сек)."
+        elif is_cloud and provider == "elevenlabs":
+            hint = "Диаризация выполнится нативно на стороне ElevenLabs."
+        self.file_diarization_hint.setText(hint)
+        self.file_diarization_hint.setVisible(bool(hint))
 
     def _can_start_dictation(self) -> tuple[bool, str]:
         """TASK-065: разрешено ли запустить диктовку прямо сейчас.
@@ -1708,6 +2755,9 @@ class MainWindow(QMainWindow):
         # с 3 кнопками: «cloud+автонарезка» (default), «переключусь на локальную»,
         # «отмена». На «переключусь» — подсвечиваем file_model_combo на 1.5с.
         if is_cloud_model_key(key):
+            # US-018: предупреждение/подтверждение о передаче файла в облако.
+            if not self._confirm_cloud_model_switch(key):
+                return
             provider = cloud_provider_of(key)
             try:
                 from .cloud_stt import provider_file_size_limit_mb as _limit_mb_fn
@@ -1728,14 +2778,19 @@ class MainWindow(QMainWindow):
             # пользователь увидит уведомление и сам решит запускать ли расшифровку локально.
             if not self._cloud_internet_preflight(key):
                 return
-        if self.file_stable_timestamps_check.isChecked() and not self.models.is_installed("addon:vad"):
-            self.tabs.setCurrentIndex(2)
-            QMessageBox.information(self, "Точные таймкоды", "Сначала загрузите дополнительную модель «VAD для точных таймкодов» во вкладке «Модели».")
-            return
-        if self.file_diarization_check.isChecked() and not self.models.is_installed("addon:sortformer"):
-            self.tabs.setCurrentIndex(2)
-            QMessageBox.information(self, "Диаризация", "Сначала загрузите дополнительную модель «Sortformer Diarization v2.1» во вкладке «Модели».")
-            return
+        # TASK-061 (US-017): доп. локальные модели (VAD, Sortformer) нужны ТОЛЬКО
+        # для локальной расшифровки. Cloud-модели отдают таймкоды нативно, а
+        # диаризация для cloud выполняется иначе (OpenAI — локальный пост-процесс
+        # через diarization.py без Sortformer; ElevenLabs — нативно diarize=true).
+        if not is_cloud_model_key(key):
+            if self.file_stable_timestamps_check.isChecked() and not self.models.is_installed("addon:vad"):
+                self.tabs.setCurrentIndex(2)
+                QMessageBox.information(self, "Точные таймкоды", "Сначала загрузите дополнительную модель «VAD для точных таймкодов» во вкладке «Модели».")
+                return
+            if self.file_diarization_check.isChecked() and not self.models.is_installed("addon:sortformer"):
+                self.tabs.setCurrentIndex(2)
+                QMessageBox.information(self, "Диаризация", "Сначала загрузите дополнительную модель «Sortformer Diarization v2.1» во вкладке «Модели».")
+                return
 
         self.file_cancel_requested = False
         self._file_transcript_blocks = []
@@ -1789,13 +2844,17 @@ class MainWindow(QMainWindow):
         # пользователю показывается развёрнутый результат (result_preview_active).
         # Overlay диктовки имеет приоритет — пользователь должен видеть свой
         # текст для копирования, а не «Файл · 42%».
+        self._last_file_overlay_text = f"Файл · {progress.percent}%"
         if self.cfg.overlay_enabled:
-            if self.is_dictation_busy() or getattr(self, "result_preview_active", False):
-                # Overlay сейчас обслуживает диктовку — НЕ трогаем его.
+            # TASK-126 (US-019): overlay не перезаписывается прогрессом файла, если
+            # сейчас идёт диктовка, показан результат ИЛИ открыт пикер выбора
+            # облачной модели (иначе список исчезал бы через 1-2 сек, не дав выбрать).
+            if self.is_dictation_busy() or getattr(self, "result_preview_active", False) or self.overlay.is_in_picker():
+                # Overlay обслуживает диктовку / результат / пикер — НЕ трогаем его.
                 # Прогресс файла виден на вкладке «Файлы» (file_progress + file_status_label).
                 pass
             else:
-                self.overlay.show_processing(f"Файл · {progress.percent}%")
+                self.overlay.show_processing(self._last_file_overlay_text)
 
     def on_file_transcription_block(self, block: object) -> None:
         if not isinstance(block, FileTranscriptBlock):
@@ -1826,6 +2885,31 @@ class MainWindow(QMainWindow):
             self.file_result_text.setPlainText(addition)
         self.file_result_text.moveCursor(QTextCursor.End)
         self.file_copy_btn.setEnabled(True)
+
+    def _format_file_transcript_for_history(self) -> str:
+        """US-036: собрать форматированный текст расшифровки файла (тайм-коды +
+        спикеры) из накопленных блоков — той же разметкой, что на вкладке «Файлы».
+        Используется для сохранения в историю, чтобы разметка не терялась и была
+        доступна суммаризации. Пустая строка — если блоков/разметки нет."""
+        blocks = getattr(self, "_file_transcript_blocks", None) or []
+        if not blocks:
+            return ""
+        show_ts = bool(getattr(self, "_file_show_timestamps_for_job", False))
+        has_speakers = any((b.get("speaker") or "").strip() for b in blocks)
+        if not show_ts and not has_speakers:
+            return ""
+        lines = []
+        for b in blocks:
+            prefix = ""
+            if show_ts:
+                prefix += f"[{format_duration(b.get('start', 0.0))}–{format_duration(b.get('end', 0.0))}] "
+            sp = (b.get("speaker") or "").strip()
+            if sp:
+                prefix += f"{sp}: "
+            txt = (b.get("text") or "").strip()
+            if txt:
+                lines.append(prefix + txt)
+        return "\n".join(lines)
 
     def cancel_file_transcription(self) -> None:
         if not self._file_job_running():
@@ -1870,7 +2954,10 @@ class MainWindow(QMainWindow):
         if text:
             path = Path(file_path)
             segments_json = json.dumps(self._file_transcript_blocks, ensure_ascii=False) if self._file_transcript_blocks else ""
-            self.history.add(model_key, duration, False, text, source="file", file_name=path.name, file_path=str(path), segments_json=segments_json)
+            # US-036: сохраняем в историю форматированный текст (тайм-коды/спикеры),
+            # если они были включены — иначе суммаризация из истории теряет разметку.
+            history_text = self._format_file_transcript_for_history() or text
+            self.history.add(model_key, duration, False, history_text, source="file", file_name=path.name, file_path=str(path), segments_json=segments_json)
             self.refresh_history()
             self.file_status_label.setText("Готово: файл расшифрован и сохранён в истории. Текст не скопирован в буфер автоматически.")
             self.status_label.setText("Файл расшифрован. Нажмите «Скопировать результат», если хотите поместить текст в буфер обмена.")
@@ -1887,9 +2974,11 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             log.warning("Hotkey re-register after done failed: %s", exc)
         log.info("File transcription done: model=%s path=%s chars=%s", model_key, file_path, len(text))
-        # SUM-01: Auto-summarize if checkbox is checked
+        # SUM-01: Auto-summarize if checkbox is checked.
+        # US-037: суммаризируем тот же текст, что сохранён в историю (с разметкой
+        # тайм-кодов/спикеров) — чтобы поведение совпадало с суммаризацией из «Истории».
         if text and self.file_summary_check.isChecked():
-            self._start_file_summary(text)
+            self._start_file_summary(self._format_file_transcript_for_history() or text)
 
     def on_file_transcription_failed(self, detail: str) -> None:
         if self.file_cancel_requested:
@@ -1922,11 +3011,44 @@ class MainWindow(QMainWindow):
             log.exception("Hotkey re-register failed: %s", exc)
         log.info("File transcription cancelled")
 
+    def _sync_legacy_fields_to_connections(self) -> None:
+        """US-037 (промежуточное состояние): пока старый UI настроек редактирует
+        устаревшие поля cfg.*_stt_*/postprocess_*/summary_*, переносим их в
+        соответствующие подключения реестра, чтобы новый backend (берёт
+        реквизиты из подключения) видел свежие значения. Удаляется после
+        переноса UI на выбор подключения (TASK-156/157)."""
+        from .models import is_cloud_model_key, cloud_connection_id_of
+        cfg = self.cfg
+        # Диктовка: подключение, на которое ссылается выбранная cloud-модель.
+        if is_cloud_model_key(getattr(cfg, "selected_model", "") or ""):
+            c = cfg.connection_by_id(cloud_connection_id_of(cfg.selected_model))
+            if c is not None:
+                if c.type == "openai" and cfg.openai_stt_api_key:
+                    c.api_key = cfg.openai_stt_api_key
+                    if cfg.openai_stt_base_url:
+                        c.base_url = cfg.openai_stt_base_url
+                elif c.type == "elevenlabs" and cfg.elevenlabs_stt_api_key:
+                    c.api_key = cfg.elevenlabs_stt_api_key
+        # Постобработка.
+        pc = cfg.connection_by_id(getattr(cfg, "postprocess_connection_id", "") or "")
+        if pc is not None and cfg.postprocess_api_key:
+            pc.api_key = cfg.postprocess_api_key
+            if cfg.postprocess_base_url:
+                pc.base_url = cfg.postprocess_base_url
+        # Суммаризация.
+        sc = cfg.connection_by_id(getattr(cfg, "summary_connection_id", "") or "")
+        if sc is not None and cfg.summary_api_key:
+            sc.api_key = cfg.summary_api_key
+            if cfg.summary_base_url:
+                sc.base_url = cfg.summary_base_url
+
     def save_settings(self, *, auto: bool = False) -> None:
         old_hotkey = self.cfg.hotkey
         old_model_runtime = (self.cfg.language, self.cfg.device, self.cfg.compute_type)
         seq = self.hotkey_edit.keySequence().toString(QKeySequence.NativeText)
         requested_hotkey = normalize_hotkey(seq) if seq else old_hotkey
+        old_hotkey_mode = getattr(self.cfg, "hotkey_mode", "toggle")
+        requested_hotkey_mode = str(self.hotkey_mode_combo.currentData() or "toggle")
         self.cfg.auto_paste = self.auto_paste_check.isChecked()
         self.cfg.paste_only_when_text_field_detected = self.detect_text_field_check.isChecked()
         self.cfg.audio_meeting_compatibility = self.meeting_compat_check.isChecked()
@@ -1946,8 +3068,31 @@ class MainWindow(QMainWindow):
         self.cfg.live_insert_confirmed_text = False
         if hasattr(self, "summary_prompt_edit"):
             self.cfg.summary_system_prompt = self.summary_prompt_edit.toPlainText().strip()
+        if hasattr(self, "summary_mode_combo"):
+            old_sum_key = getattr(self.cfg, "summary_api_key", "")
+            old_sum_url = getattr(self.cfg, "summary_base_url", "")
+            self.cfg.summary_mode = str(self.summary_mode_combo.currentData() or "local")
+            self.cfg.summary_api_key = self.summary_key_edit.text().strip()
+            self.cfg.summary_base_url = (self.summary_base_url_edit.text().strip() or "https://api.openai.com/v1")
+            self.cfg.summary_model_id = str(self.summary_model_combo.currentText() or "").strip()
+            if hasattr(self, "summary_conn_combo"):
+                self.cfg.summary_connection_id = str(self.summary_conn_combo.currentData() or "")
+            self.cfg.summary_reasoning = self.summary_reasoning_check.isChecked()
+            _sum_eff = str(self.summary_reasoning_effort_combo.currentData() or "low")
+            self.cfg.summary_reasoning_effort = _sum_eff if _sum_eff in ("low", "medium", "high") else "low"
+            if old_sum_key != self.cfg.summary_api_key or old_sum_url != self.cfg.summary_base_url:
+                try:
+                    from . import cloud_llm as _cl_sum
+                    _cl_sum.invalidate_discover_cache()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._cloud_warned_session = {k for k in self._cloud_warned_session if not k.startswith("summary|")}
+                self._cloud_safe_confirmed_session = {k for k in self._cloud_safe_confirmed_session if not k.startswith("summary|")}
         if hasattr(self, "api_enabled_check"):
             self.cfg.api_enabled = self.api_enabled_check.isChecked()
+        if hasattr(self, "api_host_edit"):
+            # US-030: пусто → дефолт 127.0.0.1.
+            self.cfg.api_host = self.api_host_edit.text().strip() or "127.0.0.1"
         if hasattr(self, "api_port_edit") and self.api_port_edit.text().strip():
             try:
                 self.cfg.api_port = int(self.api_port_edit.text().strip())
@@ -1963,6 +3108,22 @@ class MainWindow(QMainWindow):
             self.cfg.openai_stt_api_key = self.openai_stt_key_edit.text().strip()
             self.cfg.openai_stt_base_url = (self.openai_stt_base_url_edit.text().strip() or "https://api.openai.com/v1")
             self.cfg.openai_stt_model_id = str(self.openai_stt_model_combo.currentText() or "").strip()
+            # US-035: сохранение Initial Prompt (пустая строка означает «не передавать prompt»)
+            if hasattr(self, "openai_initial_prompt_edit"):
+                _new_prompt = self.openai_initial_prompt_edit.toPlainText().strip()
+                _old_prompt = self.cfg.openai_stt_initial_prompt
+                self.cfg.openai_stt_initial_prompt = _new_prompt
+                # US-035 diag: лог изменения prompt при save_settings
+                if _new_prompt != _old_prompt:
+                    log.info(
+                        "save_settings: openai_stt_initial_prompt CHANGED old_chars=%d new_chars=%d new_preview=%r auto=%s",
+                        len(_old_prompt or ""), len(_new_prompt), _new_prompt[:60].replace("\n", " "), auto,
+                    )
+                else:
+                    log.info(
+                        "save_settings: openai_stt_initial_prompt same chars=%d auto=%s",
+                        len(_new_prompt), auto,
+                    )
             self.cfg.elevenlabs_stt_api_key = self.elevenlabs_stt_key_edit.text().strip()
             self.cfg.elevenlabs_stt_model_id = str(self.elevenlabs_stt_model_combo.currentText() or "").strip()
             self.cfg.cloud_max_chunk_seconds = int(self.cloud_max_chunk_spin.value())
@@ -1983,6 +3144,10 @@ class MainWindow(QMainWindow):
                     _cs.invalidate_discover_cache()
                 except Exception:  # noqa: BLE001
                     pass
+                # US-018: сменились ключ/URL STT-провайдера → сбросить сессионное
+                # подавление уведомлений (смена провайдера должна показать снова).
+                self._cloud_warned_session.clear()
+                self._cloud_safe_confirmed_session.clear()
                 # При смене ключа сбрасываем сохранённую модель — иначе
                 # старая запись cfg.openai_stt_model_id будет регистрировать
                 # модель чужого провайдера в реестре.
@@ -1995,11 +3160,37 @@ class MainWindow(QMainWindow):
                     self.refresh_available_models_combo()
                 except Exception as exc:  # noqa: BLE001
                     log.warning("refresh_cloud_models after settings change failed: %s", exc)
+        # US-034: постобработка облачной LLM
+        if hasattr(self, "postprocess_enabled_check"):
+            old_pp_key = getattr(self.cfg, "postprocess_api_key", "")
+            old_pp_url = getattr(self.cfg, "postprocess_base_url", "")
+            self.cfg.postprocess_enabled = self.postprocess_enabled_check.isChecked()
+            self.cfg.postprocess_api_key = self.postprocess_key_edit.text().strip()
+            self.cfg.postprocess_base_url = (self.postprocess_base_url_edit.text().strip() or "https://api.openai.com/v1")
+            if hasattr(self, "postprocess_conn_combo"):
+                self.cfg.postprocess_connection_id = str(self.postprocess_conn_combo.currentData() or "")
+            self.cfg.postprocess_model_id = str(self.postprocess_model_combo.currentText() or "").strip()
+            self.cfg.postprocess_system_prompt = self.postprocess_prompt_edit.toPlainText().strip()
+            self.cfg.postprocess_reasoning = self.postprocess_reasoning_check.isChecked()
+            _eff = str(self.postprocess_reasoning_effort_combo.currentData() or "low")
+            self.cfg.postprocess_reasoning_effort = _eff if _eff in ("low", "medium", "high") else "low"
+            if old_pp_key != self.cfg.postprocess_api_key or old_pp_url != self.cfg.postprocess_base_url:
+                try:
+                    from . import cloud_llm as _cl
+                    _cl.invalidate_discover_cache()
+                except Exception:  # noqa: BLE001
+                    pass
+                # US-018: сменились ключ/URL LLM постобработки → сбросить её
+                # сессионные подтверждения, чтобы предупреждение показалось снова.
+                self._cloud_warned_session = {k for k in self._cloud_warned_session if not k.startswith("postprocess|")}
+                self._cloud_safe_confirmed_session = {k for k in self._cloud_safe_confirmed_session if not k.startswith("postprocess|")}
         self.cfg.language = str(self.language_combo.currentData())
         self.cfg.device = str(self.device_combo.currentData())
         self.cfg.compute_type = str(self.compute_combo.currentData())
         hotkey_error = None
-        if requested_hotkey != old_hotkey:
+        # US-026: применяем смену комбинации И/ИЛИ режима без перезапуска.
+        self.cfg.hotkey_mode = requested_hotkey_mode
+        if requested_hotkey != old_hotkey or requested_hotkey_mode != old_hotkey_mode:
             # Do not persist a broken hotkey. The HotkeyService keeps the old
             # handle active if the new combo cannot be parsed/registered.
             previous = self.cfg.hotkey
@@ -2007,6 +3198,7 @@ class MainWindow(QMainWindow):
             if not self.register_hotkey(show_errors=not auto):
                 hotkey_error = requested_hotkey
                 self.cfg.hotkey = previous
+                self.cfg.hotkey_mode = old_hotkey_mode
                 self.overlay.set_hotkey(self.cfg.hotkey)
         else:
             self.overlay.set_hotkey(self.cfg.hotkey)
@@ -2020,6 +3212,7 @@ class MainWindow(QMainWindow):
                 autostart_error = exc
                 self.autostart_check.setChecked(False)
                 self.cfg.autostart_enabled = False
+        self._sync_legacy_fields_to_connections()
         self.cfg.save()
         self._sync_overlay_visibility()
         if old_model_runtime != (self.cfg.language, self.cfg.device, self.cfg.compute_type):
@@ -2191,21 +3384,52 @@ class MainWindow(QMainWindow):
         if not ok:
             log.info("toggle_recording BLOCKED by _can_start_dictation: %s", reason)
             self.status_label.setText(reason)
-            if self.cfg.overlay_enabled:
-                # Кратко покажем плашку, чтобы пользователь увидел статус
-                try:
-                    self.overlay.show_processing()
-                    QTimer.singleShot(1200, self.overlay.show_idle)
-                except Exception:  # noqa: BLE001
-                    pass
+            # US-019 (TASK-070): вместо простой блокировки предлагаем перейти на
+            # облачную модель через overlay-пикер (локальная диктовка недоступна,
+            # т.к. идёт локальная расшифровка файла).
+            self._open_overlay_cloud_picker()
             return
         log.info("toggle_recording: starting recording")
         self.start_recording()
+
+    def on_hotkey_press(self) -> None:
+        # US-026 Push-to-Talk: нажатие комбинации — старт записи. Технические
+        # блокировки и матричная проверка — как в toggle_recording.
+        if self._mic_autodetect_running():
+            self.status_label.setText("Идёт автонастройка микрофона. Диктовка временно недоступна.")
+            return
+        if self.transcribe_worker and self.transcribe_worker.isRunning():
+            return
+        if self.recorder.is_recording:
+            return  # уже идёт запись (защита от повторного срабатывания при удержании)
+        ok, reason = self._can_start_dictation()
+        if not ok:
+            log.info("on_hotkey_press BLOCKED by _can_start_dictation: %s", reason)
+            self.status_label.setText(reason)
+            self._open_overlay_cloud_picker()
+            return
+        log.info("on_hotkey_press: starting recording (PTT)")
+        self.start_recording()
+
+    def on_hotkey_release(self) -> None:
+        # US-026 Push-to-Talk: отпускание комбинации — стоп и расшифровка.
+        if self.recorder.is_recording:
+            log.info("on_hotkey_release: stopping recording (PTT)")
+            self.stop_recording()
 
     def start_recording(self) -> None:
         # TASK-083 (US-019): логирование точки входа в start_recording
         log.info("start_recording entered. selected_model=%s overlay_enabled=%s", self.cfg.selected_model, self.cfg.overlay_enabled)
         try:
+            # US-035 FIX: останавливаем pending autosave (350мс debounce), чтобы
+            # save_settings ниже точно был последним записывающим cfg перед
+            # стартом записи. Иначе таймер мог выстрелить после нашего save
+            # и перезаписать cfg промежуточным состоянием widget.
+            try:
+                if hasattr(self, "_settings_save_timer") and self._settings_save_timer.isActive():
+                    self._settings_save_timer.stop()
+            except Exception:  # noqa: BLE001
+                pass
             self.save_settings(auto=True)
             self.cfg = AppConfig.load()
             # v3.4: keep the shipped app stable. Live transcription is disabled
@@ -2289,6 +3513,7 @@ class MainWindow(QMainWindow):
         self._begin_final_transcription(wav_path, duration, cfg)
 
     def cancel_current_action(self) -> None:
+        self._stop_dictation_progress()  # US-022
         # Special case: final transcript preview is visible because no target
         # text field was detected. Esc should close the preview, not delete the
         # already saved transcript.
@@ -2328,11 +3553,102 @@ class MainWindow(QMainWindow):
         # US-015/US-016: запоминаем исходно выбранную модель, чтобы в сообщении
         # о fallback показать что именно облако упало.
         self._last_requested_model = cfg.selected_model
+        self._dictation_used_cloud = is_cloud_model_key(cfg.selected_model)
+        # US-022: прогресс процента диктовки в overlay/статус-строке. Гейт 2с —
+        # процент показываем только если расшифровка длится дольше 2 секунд
+        # (короткие диктовки сразу отдают результат). Имеет смысл только для
+        # локальных моделей; для облачных таймер не запускаем.
+        self._dictation_progress_armed = False
+        self._dictation_seg_floor = 0          # реальный прогресс по сегментам модели
+        self._dictation_last_shown = -1        # троттлинг перерисовки overlay
+        self._dictation_progress_t0 = 0.0      # момент включения анимации (monotonic)
+        self._dictation_audio_duration = float(duration or 0.0)
+        if getattr(self, "_dictation_progress_timer", None) is None:
+            self._dictation_progress_timer = QTimer(self)
+            self._dictation_progress_timer.setSingleShot(True)
+            self._dictation_progress_timer.timeout.connect(self._arm_dictation_progress)
+        if getattr(self, "_dictation_tick_timer", None) is None:
+            self._dictation_tick_timer = QTimer(self)
+            self._dictation_tick_timer.setInterval(250)
+            self._dictation_tick_timer.timeout.connect(self._tick_dictation_progress)
+        self._dictation_progress_timer.stop()
+        self._dictation_tick_timer.stop()
+        if not self._dictation_used_cloud:
+            self._dictation_progress_timer.start(2000)
         self.transcribe_worker = TranscribeWorker(self.models, cfg.selected_model, wav_path, duration, cfg, is_live=False)
         self.transcribe_worker.finished_text.connect(lambda text, dur: self.on_transcription_done(text, dur, wav_path))
         self.transcribe_worker.fallback_applied.connect(self.on_cloud_fallback_applied)
+        self.transcribe_worker.progress.connect(self.on_dictation_progress)
         self.transcribe_worker.failed.connect(lambda detail, path=wav_path: self.on_transcription_failed(detail, path))
         self.transcribe_worker.start()
+
+    def _arm_dictation_progress(self) -> None:
+        # US-022: прошло 2 секунды — включаем показ процента и плавную анимацию.
+        # Whisper для короткой диктовки выдаёт один сегмент в самом конце, поэтому
+        # seg.end даёт прогресс лишь под занавес. Чтобы число двигалось, ведём
+        # оценку по времени (тик-таймер), а реальные сегменты поднимают «пол».
+        self._dictation_progress_armed = True
+        self._dictation_progress_t0 = time.monotonic()
+        t = getattr(self, "_dictation_tick_timer", None)
+        if t is not None:
+            t.start()
+        self._tick_dictation_progress()
+
+    def _dictation_progress_estimate(self) -> int:
+        # US-022: монотонная оценка прогресса. Асимптотически приближается к 95%,
+        # но не достигает 100% до фактического завершения. Реальный сегментный
+        # прогресс модели задаёт нижнюю границу.
+        t0 = getattr(self, "_dictation_progress_t0", 0.0) or 0.0
+        floor = int(getattr(self, "_dictation_seg_floor", 0))
+        if t0 <= 0:
+            return min(95, floor)
+        elapsed = max(0.0, time.monotonic() - t0)
+        dur = float(getattr(self, "_dictation_audio_duration", 0.0) or 0.0)
+        # Грубая оценка времени локального декода: ~0.6× длительности аудио,
+        # но не меньше 3 секунд. tau управляет скоростью приближения к потолку.
+        expected = max(3.0, dur * 0.6)
+        tau = max(2.0, expected)
+        frac = 1.0 - math.exp(-elapsed / tau)
+        est = int(min(95.0, frac * 100.0))
+        return max(est, min(95, floor))
+
+    def _render_dictation_progress(self, pct: int) -> None:
+        if self.cancel_requested or not getattr(self, "_dictation_progress_armed", False):
+            return
+        pct = max(0, min(100, int(pct)))
+        # Троттлинг: не дёргаем overlay (raise_) при неизменном проценте.
+        if pct == getattr(self, "_dictation_last_shown", -1):
+            return
+        self._dictation_last_shown = pct
+        msg = f"Распознаю: {pct}%"
+        self.status_label.setText(msg)
+        # Диктовка приоритетна в overlay; открытый пикер модели не трогаем,
+        # чтобы не схлопнуть список выбора (см. правило про «прилипчивый» пикер).
+        if self.cfg.overlay_enabled and not self.overlay.is_in_picker():
+            self.overlay.show_processing(msg)
+
+    def _tick_dictation_progress(self) -> None:
+        self._render_dictation_progress(self._dictation_progress_estimate())
+
+    def on_dictation_progress(self, pct: int) -> None:
+        # US-022: реальный сегментный прогресс модели поднимает «пол» оценки.
+        if self.cancel_requested:
+            return
+        try:
+            pct = max(0, min(100, int(pct)))
+        except Exception:  # noqa: BLE001
+            return
+        self._dictation_seg_floor = max(int(getattr(self, "_dictation_seg_floor", 0)), pct)
+        if getattr(self, "_dictation_progress_armed", False):
+            self._render_dictation_progress(self._dictation_progress_estimate())
+
+    def _stop_dictation_progress(self) -> None:
+        # US-022: погасить гейт, тик-таймер и состояние процента (завершение/ошибка/отмена).
+        self._dictation_progress_armed = False
+        for _attr in ("_dictation_progress_timer", "_dictation_tick_timer"):
+            t = getattr(self, _attr, None)
+            if t is not None:
+                t.stop()
 
     def on_cloud_fallback_applied(self, fallback_key: str, reason: str) -> None:
         """US-015/US-016: облачная модель упала → переключились на локальную.
@@ -2343,6 +3659,7 @@ class MainWindow(QMainWindow):
             self.cfg = AppConfig.load()
         except Exception:  # noqa: BLE001
             pass
+        self._dictation_used_cloud = False
         self.refresh_available_models_combo(force_current=True)
         local_name = model_display_name(fallback_key)
         # Имя облачной модели для сообщения — берём то, что было выбрано
@@ -2362,6 +3679,7 @@ class MainWindow(QMainWindow):
             pass
 
     def on_transcription_done(self, text: str, duration: float, wav_path: Path) -> None:
+        self._stop_dictation_progress()  # US-022
         if self.cancel_requested:
             self._cleanup_wav(wav_path)
             self.update_recording_badge()
@@ -2370,6 +3688,18 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Расшифровка отменена. Результат проигнорирован.")
             return
         text = text.strip()
+        # US-034: постобработка облачной диктовки через LLM (только cloud STT).
+        if (
+            text
+            and getattr(self.cfg, "postprocess_enabled", False)
+            and getattr(self, "_dictation_used_cloud", False)
+            and (getattr(self.cfg, "postprocess_api_key", "") or "").strip()
+        ):
+            self._start_dictation_postprocess(text, duration, wav_path)
+            return
+        self._deliver_dictation_result(text, duration, wav_path)
+
+    def _deliver_dictation_result(self, text: str, duration: float, wav_path: Path, *, postprocess_failed: bool = False) -> None:
         self.last_text.setPlainText(text)
         inserted = False
         show_overlay_result = False
@@ -2407,9 +3737,37 @@ class MainWindow(QMainWindow):
                 suffix = "текст показан во вкладке «Диктовка», сохранён в истории и скопирован в буфер"
             else:
                 suffix = "текст вставлен" if inserted else "текст скопирован в буфер и сохранён в истории"
-        self.status_label.setText(f"Готово: {suffix}.")
+        if postprocess_failed:
+            self.status_label.setText("Постобработка недоступна. Показан исходный текст расшифровки.")
+        else:
+            self.status_label.setText(f"Готово: {suffix}.")
+
+    def _start_dictation_postprocess(self, text: str, duration: float, wav_path: Path) -> None:
+        """US-034: запустить постобработку текста диктовки облачной LLM."""
+        if self.cfg.overlay_enabled:
+            self.overlay.show_processing("Улучшаю текст…")
+        self.status_label.setText("Улучшаю текст через облачную LLM…")
+        worker = PostProcessWorker(text, self.cfg)
+        self._postprocess_worker = worker
+        worker.finished_text.connect(
+            lambda improved, d=duration, pth=wav_path: self._on_dictation_postprocess_done(improved, d, pth)
+        )
+        worker.failed.connect(
+            lambda detail, raw=text, d=duration, pth=wav_path: self._on_dictation_postprocess_failed(detail, raw, d, pth)
+        )
+        worker.start()
+
+    def _on_dictation_postprocess_done(self, improved: str, duration: float, wav_path: Path) -> None:
+        text = (improved or "").strip()
+        self._deliver_dictation_result(text, duration, wav_path)
+
+    def _on_dictation_postprocess_failed(self, detail: str, raw_text: str, duration: float, wav_path: Path) -> None:
+        first_line = (detail or "").splitlines()[0] if detail else ""
+        log.warning("Dictation post-processing failed; delivering raw text. Detail: %s", first_line)
+        self._deliver_dictation_result(raw_text, duration, wav_path, postprocess_failed=True)
 
     def on_transcription_failed(self, detail: str, wav_path: Path) -> None:
+        self._stop_dictation_progress()  # US-022
         self._cleanup_wav(wav_path)
         if self.cancel_requested:
             log.info("Cancelled transcription failed after cancellation; suppressing user-facing error")
@@ -2540,6 +3898,134 @@ class MainWindow(QMainWindow):
         self.cfg.overlay_y = int(y)
         self.cfg.save()
 
+    # ── US-019 / US-038: выбор модели через overlay ──────────────────────
+
+    def _cloud_models_for_picker(self) -> list[tuple[str, str]]:
+        """Доступные облачные модели (key, label) для пикера US-019."""
+        out: list[tuple[str, str]] = []
+        for key in self.models.cloud_model_keys():
+            if self.models.is_available(key):
+                out.append((key, model_display_name(key)))
+        return out
+
+    def _all_models_for_picker(self) -> list[tuple[str, str]]:
+        """Все доступные модели (локальные + облачные) для быстрого выбора (US-038)."""
+        out: list[tuple[str, str]] = []
+        for key in self.models.available_model_keys():
+            if not is_cloud_model_key(key):
+                out.append((key, model_display_name(key)))
+        for key in self.models.cloud_model_keys():
+            if self.models.is_available(key):
+                out.append((key, model_display_name(key)))
+        return out
+
+    def _open_overlay_cloud_picker(self) -> None:
+        """TASK-070/073 (US-019): overlay-пикер облачных моделей при попытке
+        локальной диктовки во время локальной расшифровки файла.
+
+        Если облачные модели настроены — показываем их выбор; иначе — пустое
+        состояние с кнопкой «Открыть настройки».
+        """
+        if not self.cfg.overlay_enabled:
+            return
+        self._overlay_picker_context = "parallel"
+        cloud_models = self._cloud_models_for_picker()
+        if cloud_models:
+            self.overlay.show_model_picker(
+                cloud_models,
+                title="Идёт локальная расшифровка файла",
+                current_key="",
+                warning="Выберите облачную модель для параллельной диктовки. Данные уйдут провайдеру.",
+            )
+        else:
+            self.overlay.show_model_picker(
+                [],
+                title="Идёт локальная расшифровка файла",
+                show_settings_button=True,
+                hint="Облачные модели не настроены. Добавьте API-ключ в настройках либо дождитесь завершения расшифровки файла.",
+            )
+
+    def on_overlay_picker_requested(self) -> None:
+        """TASK-123 (US-038): двойной клик по overlay в Ready → быстрый выбор
+        модели диктовки из всех доступных (локальные + облачные)."""
+        if not self.cfg.overlay_enabled:
+            return
+        self._overlay_picker_context = "quick"
+        models = self._all_models_for_picker()
+        if models:
+            self.overlay.show_model_picker(
+                models,
+                title="Быстрый выбор модели диктовки",
+                current_key=str(self.cfg.selected_model or ""),
+                warning="Облачные модели отправляют данные провайдеру.",
+            )
+        else:
+            self.overlay.show_model_picker(
+                [],
+                title="Быстрый выбор модели диктовки",
+                show_settings_button=True,
+                hint="Нет доступных моделей. Загрузите модель во вкладке «Модели».",
+            )
+
+    def on_overlay_model_chosen(self, key: str) -> None:
+        """TASK-071/124: применить выбор модели из overlay-пикера.
+
+        Для облачных моделей — единый привратник безопасности US-018
+        (_confirm_cloud_model_switch). При подтверждении: cfg.selected_model,
+        save, синхронизация model_combo (force_current=True), overlay → Ready
+        БЕЗ запуска записи.
+        """
+        key = str(key or "")
+        if not key:
+            self.overlay.show_idle()
+            return
+        # US-018: предупреждение/подтверждение при переходе на облако.
+        if is_cloud_model_key(key):
+            if not self._confirm_cloud_model_switch(key):
+                self.overlay.show_idle()
+                return
+        if not self.models.is_available(key):
+            self.status_label.setText("Выбранная модель недоступна. Выберите другую.")
+            self.overlay.show_idle()
+            return
+        self.cfg.selected_model = key
+        self.cfg.save()
+        self.refresh_available_models_combo(force_current=True)
+        self.overlay.show_idle()
+        ctx = getattr(self, "_overlay_picker_context", "quick")
+        if ctx == "parallel":
+            self.status_label.setText(
+                f"Выбрана модель «{model_display_name(key)}». Нажмите {self.cfg.hotkey} ещё раз, чтобы начать диктовку."
+            )
+        else:
+            self.status_label.setText(f"Модель диктовки: {model_display_name(key)}")
+        log.info("Overlay model picker: selected %s (context=%s)", key, ctx)
+
+    def on_overlay_settings_requested(self) -> None:
+        """TASK-073 (US-019): из пустого состояния пикера открыть вкладку «Настройки»."""
+        self.overlay.show_idle()
+        try:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+            self.tabs.setCurrentIndex(3)  # 0 Диктовка,1 Файлы,2 Модели,3 Настройки,4 История
+        except Exception:  # noqa: BLE001
+            pass
+
+    def on_overlay_picker_cancelled(self) -> None:
+        """TASK-126 (US-019/US-038): Escape в overlay-пикере. Возврат в корректное
+        состояние: для контекста 'parallel' (идёт локальная расшифровка файла) —
+        обратно к показу прогресса файла; для 'quick' — в Ready. Модель НЕ меняется,
+        поэтому при следующей попытке локальной диктовки пикер появится снова."""
+        ctx = getattr(self, "_overlay_picker_context", "quick")
+        if ctx == "parallel" and self.is_file_busy():
+            self.overlay.show_processing(getattr(self, "_last_file_overlay_text", "Файл…"))
+            self.status_label.setText("Выбор облачной модели отменён. Идёт локальная расшифровка файла.")
+        else:
+            self.overlay.show_idle()
+            self.status_label.setText("Выбор модели отменён.")
+        log.info("Overlay picker cancelled (context=%s)", ctx)
+
     def refresh_history(self) -> None:
         self.history_list.clear()
         for item in self.history.recent(limit=100):
@@ -2578,6 +4064,56 @@ class MainWindow(QMainWindow):
             self.refresh_history()
             self.history_text.clear()
 
+    def export_history_item(self, fmt: str) -> None:
+        """US-024: экспорт выбранной записи истории в TXT / MD / PDF."""
+        current = self.history_list.currentItem()
+        if not current:
+            QMessageBox.information(self, "Скачать", "Сначала выберите запись в списке.")
+            return
+        item = current.data(Qt.UserRole)
+        if not isinstance(item, HistoryItem) or not (item.text or "").strip():
+            QMessageBox.information(self, "Скачать", "Выбранная запись не содержит текста.")
+            return
+
+        fmt = fmt.lower()
+        filters = {
+            "txt": "Текстовый файл (*.txt)",
+            "md": "Markdown (*.md)",
+            "pdf": "PDF (*.pdf)",
+        }
+        suggested = history_export.suggest_filename(item, fmt)
+        target, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить расшифровку", suggested, filters.get(fmt, "Все файлы (*.*)")
+        )
+        if not target:
+            return
+
+        try:
+            if fmt == "pdf":
+                data = history_export.build_pdf(item)
+                with open(target, "wb") as fh:
+                    fh.write(data)
+            else:
+                content = history_export.build_md(item) if fmt == "md" else history_export.build_txt(item)
+                with open(target, "w", encoding="utf-8") as fh:
+                    fh.write(content)
+        except ImportError:
+            log.exception("PDF export failed: fpdf2 missing")
+            QMessageBox.warning(
+                self,
+                "Скачать",
+                "Для экспорта в PDF не установлена библиотека fpdf2.\n"
+                "Установите её командой: pip install fpdf2",
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.exception("History export failed: %s", exc)
+            QMessageBox.warning(self, "Скачать", f"Не удалось сохранить файл:\n{exc}")
+            return
+
+        self.status_label.setText(f"Расшифровка сохранена: {Path(target).name}")
+        log.info("History item %s exported as %s → %s", item.id, fmt, target)
+
     def _get_summary_model_path(self) -> str | None:
         """Resolve GGUF path for the selected summary model, or None."""
         key = self.cfg.selected_summary_model
@@ -2589,22 +4125,14 @@ class MainWindow(QMainWindow):
         return str(self.models.summary_model_gguf_path(key))
 
     def _start_file_summary(self, text: str) -> None:
-        """SUM-01: Start summarization after file transcription."""
+        """SUM-01 / US-036: суммаризация после расшифровки файла (локально/облако)."""
         if self.summarize_worker and self.summarize_worker.isRunning():
-            return
-        model_path = self._get_summary_model_path()
-        if not model_path:
-            self.status_label.setText("Модель суммаризации не загружена. Загрузите её на вкладке Модели.")
             return
         self.file_summary_label.setVisible(True)
         self.file_summary_text.setVisible(True)
         self.file_summary_text.setPlainText("Суммаризирую…")
         self.status_label.setText("Формирую краткое резюме…")
-        prompt = self.cfg.summary_system_prompt
-        self.summarize_worker = SummarizeWorker(text, model_path, prompt)
-        self.summarize_worker.finished_text.connect(self._on_file_summary_done)
-        self.summarize_worker.failed.connect(self._on_summary_failed)
-        self.summarize_worker.start()
+        self._dispatch_summary(text, kind="file")
 
     def _on_file_summary_done(self, summary: str) -> None:
         if summary.strip():
@@ -2615,7 +4143,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Файл расшифрован, но суммаризация пуста.")
 
     def summarize_history_item(self) -> None:
-        """SUM-02: Summarize an existing history item without re-transcribing."""
+        """SUM-02 / US-036: суммаризация записи истории (локально/облако)."""
         current = self.history_list.currentItem()
         if not current:
             QMessageBox.information(self, "Суммаризация", "Сначала выберите запись в списке.")
@@ -2627,17 +4155,9 @@ class MainWindow(QMainWindow):
         if self.summarize_worker and self.summarize_worker.isRunning():
             self.status_label.setText("Суммаризация уже выполняется, дождитесь завершения.")
             return
-        model_path = self._get_summary_model_path()
-        if not model_path:
-            QMessageBox.information(self, "Суммаризация", "Модель суммаризации не загружена. Загрузите её на вкладке Модели.")
-            return
         self.summarize_history_btn.setEnabled(False)
         self.status_label.setText("Суммаризирую…")
-        prompt = self.cfg.summary_system_prompt
-        self.summarize_worker = SummarizeWorker(item.text, model_path, prompt)
-        self.summarize_worker.finished_text.connect(lambda text, item_id=item.id: self._on_history_summary_done(text, item_id))
-        self.summarize_worker.failed.connect(self._on_summary_failed)
-        self.summarize_worker.start()
+        self._dispatch_summary(item.text, kind="history", item_id=item.id)
 
     def _on_history_summary_done(self, summary: str, item_id: int) -> None:
         self.summarize_history_btn.setEnabled(True)
@@ -2657,6 +4177,179 @@ class MainWindow(QMainWindow):
         log.error("Summarization failed: %s", detail)
         self.status_label.setText("Суммаризация не удалась. Подробности в логах.")
         QMessageBox.warning(self, "Суммаризация", detail)
+
+    def _dispatch_summary(self, text: str, *, kind: str, item_id=None) -> None:
+        """US-036: запустить суммаризацию выбранным способом (local/cloud)."""
+        self._summary_kind = kind
+        self._summary_text = text
+        self._summary_item_id = item_id
+        mode = getattr(self.cfg, "summary_mode", "local") or "local"
+        cloud_key = (getattr(self.cfg, "summary_api_key", "") or "").strip()
+        if mode == "cloud" and cloud_key:
+            self.status_label.setText("Облачная суммаризация…")
+            worker = SummarizeWorker(
+                text,
+                system_prompt=getattr(self.cfg, "summary_system_prompt", "") or "",
+                mode="cloud",
+                cloud_api_key=cloud_key,
+                cloud_base_url=getattr(self.cfg, "summary_base_url", "") or "https://api.openai.com/v1",
+                cloud_model_id=getattr(self.cfg, "summary_model_id", "") or "",
+                reasoning=bool(getattr(self.cfg, "summary_reasoning", False)),
+                reasoning_effort=getattr(self.cfg, "summary_reasoning_effort", "low") or "low",
+            )
+            worker.finished_text.connect(self._on_summary_success)
+            worker.cloud_failed.connect(self._on_cloud_summary_failed)
+            self.summarize_worker = worker
+            worker.start()
+            return
+        self._start_local_summary(text)
+
+    def _start_local_summary(self, text: str) -> None:
+        """US-036: локальная суммаризация (с проверкой наличия GGUF-модели)."""
+        model_path = self._get_summary_model_path()
+        if not model_path:
+            if getattr(self, "_summary_kind", "") == "history":
+                self.summarize_history_btn.setEnabled(True)
+                QMessageBox.information(self, "Суммаризация", "Модель суммаризации не загружена. Загрузите её на вкладке Модели.")
+            else:
+                self.file_summary_label.setVisible(False)
+                self.file_summary_text.setVisible(False)
+                self.status_label.setText("Модель суммаризации не загружена. Загрузите её на вкладке Модели.")
+            return
+        if (getattr(self.cfg, "summary_mode", "local") or "local") == "local":
+            self.status_label.setText(
+                "Суммаризация выполняется локально — это займёт некоторое время. "
+                "Для ускорения подключите облачную модель в Настройках → Суммаризация "
+                "(текст передаётся на внешние серверы)."
+            )
+        worker = SummarizeWorker(
+            text, model_path, getattr(self.cfg, "summary_system_prompt", "") or "",
+            reasoning=bool(getattr(self.cfg, "summary_reasoning", False)),
+            reasoning_effort=getattr(self.cfg, "summary_reasoning_effort", "low") or "low",
+        )
+        worker.finished_text.connect(self._on_summary_success)
+        worker.failed.connect(self._on_summary_failed)
+        self.summarize_worker = worker
+        worker.start()
+
+    def _on_summary_success(self, summary: str) -> None:
+        """US-036: единая точка успеха — диспатч к file/history обработчику."""
+        if getattr(self, "_summary_kind", "") == "history":
+            self._on_history_summary_done(summary, getattr(self, "_summary_item_id", None))
+        else:
+            self._on_file_summary_done(summary)
+
+    def _on_cloud_summary_failed(self, reason: str) -> None:
+        """US-036: облако недоступно перед/во время суммаризации — выбор пользователя."""
+        log.warning("Cloud summarization unavailable: %s", reason)
+        text = getattr(self, "_summary_text", "") or ""
+        if self._get_summary_model_path():
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("Облачная суммаризация недоступна")
+            box.setText("Облачная суммаризация недоступна.")
+            box.setInformativeText(f"Причина: {reason}\n\nВыполнить суммаризацию локальной моделью или отменить?")
+            local_btn = box.addButton("Выполнить локально", QMessageBox.AcceptRole)
+            box.addButton("Отменить", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is local_btn:
+                self._start_local_summary(text)
+            else:
+                self._cancel_summary_ui()
+        else:
+            QMessageBox.information(
+                self, "Суммаризация невозможна",
+                "Облачная суммаризация недоступна, а локальная модель не загружена.\n\n"
+                "Пожалуйста, скачайте локальную модель суммаризации на вкладке «Модели».",
+            )
+            self._cancel_summary_ui()
+
+    def _cancel_summary_ui(self) -> None:
+        """US-036: вернуть UI в исходное состояние после отказа от суммаризации."""
+        if getattr(self, "_summary_kind", "") == "history":
+            self.summarize_history_btn.setEnabled(True)
+        else:
+            self.file_summary_label.setVisible(False)
+            self.file_summary_text.setVisible(False)
+        self.status_label.setText("Суммаризация отменена.")
+
+    def _on_summary_mode_changed(self) -> None:
+        """US-036: смена способа суммаризации. Переход на облако — привратник US-018."""
+        mode = str(self.summary_mode_combo.currentData() or "local")
+        if mode == "cloud" and not getattr(self, "_settings_loading", False):
+            if not self._confirm_cloud_switch("summary"):
+                self.summary_mode_combo.blockSignals(True)
+                _idx = self.summary_mode_combo.findData("local")
+                self.summary_mode_combo.setCurrentIndex(_idx if _idx >= 0 else 0)
+                self.summary_mode_combo.blockSignals(False)
+                self._update_summary_cloud_group_visibility()
+                return
+        self._update_summary_cloud_group_visibility()
+        if not getattr(self, "_settings_loading", False):
+            self.schedule_settings_autosave()
+
+    def _update_summary_cloud_group_visibility(self) -> None:
+        if hasattr(self, "summary_cloud_group"):
+            mode = str(self.summary_mode_combo.currentData() or "local")
+            self.summary_cloud_group.setVisible(mode == "cloud")
+
+    def _on_summary_reasoning_toggled(self, checked: bool) -> None:
+        """US-036: показать/скрыть выбор уровня рассуждения."""
+        if hasattr(self, "summary_effort_row"):
+            self.summary_effort_row.setVisible(bool(checked))
+
+    def check_summary_connection(self) -> None:
+        """US-036: «Проверить соединение» для облачной суммаризации."""
+        api_key = self.summary_key_edit.text().strip()
+        base_url = (self.summary_base_url_edit.text().strip() or "https://api.openai.com/v1")
+        if not api_key:
+            self.status_label.setText("Заполните API Key для облачной суммаризации.")
+            return
+        try:
+            import requests  # noqa: F401
+        except ImportError:
+            self.status_label.setText("Не установлена библиотека requests. Выполните: .venv\\Scripts\\pip install requests")
+            return
+        self.save_settings(auto=True)
+        self.summary_check_btn.setEnabled(False)
+        self.summary_check_btn.setText("Проверяю…")
+        self.status_label.setText("Проверка соединения с LLM-провайдером суммаризации…")
+        worker = LlmConnectionCheckWorker(api_key, base_url)
+        self._summary_check_worker = worker
+        worker.result.connect(self._on_summary_check_done)
+        worker.start()
+
+    def _on_summary_check_done(self, ok: bool, message: str, models: list) -> None:
+        self.summary_check_btn.setEnabled(True)
+        self.summary_check_btn.setText("Проверить соединение и обновить список моделей")
+        log.info("Summary LLM verify: ok=%s msg=%s models=%d", ok, message, len(models))
+        if ok:
+            combo = self.summary_model_combo
+            current = combo.currentText().strip()
+            combo.blockSignals(True)
+            combo.clear()
+            for mid in models:
+                combo.addItem(mid, mid)
+            if models:
+                if current and current in models:
+                    combo.setCurrentIndex(combo.findData(current))
+                else:
+                    combo.setCurrentIndex(0)
+            elif current:
+                combo.addItem(current, current)
+                combo.setCurrentIndex(combo.count() - 1)
+            combo.blockSignals(False)
+            chosen = combo.currentText().strip()
+            if chosen and getattr(self.cfg, "summary_model_id", "") != chosen:
+                self.cfg.summary_model_id = chosen
+                self.cfg.save()
+            self.status_label.setText(f"LLM суммаризации: {message} (моделей: {len(models)})")
+        else:
+            self.status_label.setText(f"LLM суммаризации: {message}")
+            try:
+                self.tray.showMessage("Voice Input Local", f"Суммаризация: {message}", QSystemTrayIcon.Warning, 5000)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _start_api_server(self) -> None:
         """Start the REST API server if enabled (API-01..04)."""
@@ -2681,9 +4374,9 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"API-сервер не запустился: {exc}")
 
     def reset_summary_prompt(self) -> None:
-        """SUM-03: Reset summary prompt to default."""
-        self.summary_prompt_edit.setPlainText("")
-        self.cfg.summary_system_prompt = ""
+        """SUM-03 / US-036: сбросить промпт суммаризации к дефолтному значению."""
+        self.summary_prompt_edit.setPlainText(DEFAULT_SUMMARY_SYSTEM_PROMPT)
+        self.cfg.summary_system_prompt = DEFAULT_SUMMARY_SYSTEM_PROMPT
         self.cfg.save()
         self.status_label.setText("Промпт суммаризации сброшен к значению по умолчанию.")
 
@@ -2723,6 +4416,86 @@ class MainWindow(QMainWindow):
             self._initial_cloud_check_workers.append(w)
             w.start()
             log.info("Initial cloud discover: started for elevenlabs")
+        # US-034: стартовая проверка LLM постобработки, если включено «Улучшение расшифровки».
+        if getattr(self.cfg, "postprocess_enabled", False) and getattr(self.cfg, "postprocess_api_key", ""):
+            wp = LlmConnectionCheckWorker(
+                self.cfg.postprocess_api_key,
+                self.cfg.postprocess_base_url or "https://api.openai.com/v1",
+            )
+            wp.result.connect(self._on_initial_postprocess_check_done)
+            self._initial_cloud_check_workers.append(wp)
+            wp.start()
+            log.info("Initial cloud discover: started for postprocess LLM")
+        # US-036: стартовая проверка LLM суммаризации (способ — облако и задан ключ).
+        if (getattr(self.cfg, "summary_mode", "local") or "local") == "cloud" and getattr(self.cfg, "summary_api_key", ""):
+            ws = LlmConnectionCheckWorker(
+                self.cfg.summary_api_key,
+                self.cfg.summary_base_url or "https://api.openai.com/v1",
+            )
+            ws.result.connect(self._on_initial_summary_check_done)
+            self._initial_cloud_check_workers.append(ws)
+            ws.start()
+            log.info("Initial cloud discover: started for summary LLM")
+
+    def _on_initial_postprocess_check_done(self, ok: bool, message: str, models: list) -> None:
+        """US-034: результат стартовой проверки LLM постобработки. Тихо обновляет
+        список моделей при успехе; при сбое — статус + трей-уведомление (постобработка
+        при диктовке просто не сработает, доставится сырой текст расшифровки)."""
+        log.info("Initial postprocess LLM check: ok=%s msg=%s models=%d", ok, message, len(models))
+        if ok:
+            if hasattr(self, "postprocess_model_combo"):
+                combo = self.postprocess_model_combo
+                current = combo.currentText().strip()
+                combo.blockSignals(True)
+                combo.clear()
+                for mid in models:
+                    combo.addItem(mid, mid)
+                if models:
+                    if current and current in models:
+                        combo.setCurrentIndex(combo.findData(current))
+                    else:
+                        combo.setCurrentIndex(0)
+                elif current:
+                    combo.addItem(current, current)
+                    combo.setCurrentIndex(combo.count() - 1)
+                combo.blockSignals(False)
+            return
+        msg = f"Постобработка: LLM недоступна ({message}). При диктовке будет показан исходный текст расшифровки."
+        self.status_label.setText(msg)
+        try:
+            self.tray.showMessage("Voice Input Local", msg, QSystemTrayIcon.Warning, 5000)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_initial_summary_check_done(self, ok: bool, message: str, models: list) -> None:
+        """US-036: результат стартовой проверки LLM суммаризации. Тихо обновляет
+        список моделей при успехе; при сбое — статус + трей (в момент
+        использования суммаризация предложит локальный fallback)."""
+        log.info("Initial summary LLM check: ok=%s msg=%s models=%d", ok, message, len(models))
+        if ok:
+            if hasattr(self, "summary_model_combo"):
+                combo = self.summary_model_combo
+                current = combo.currentText().strip()
+                combo.blockSignals(True)
+                combo.clear()
+                for mid in models:
+                    combo.addItem(mid, mid)
+                if models:
+                    if current and current in models:
+                        combo.setCurrentIndex(combo.findData(current))
+                    else:
+                        combo.setCurrentIndex(0)
+                elif current:
+                    combo.addItem(current, current)
+                    combo.setCurrentIndex(combo.count() - 1)
+                combo.blockSignals(False)
+            return
+        msg = f"Суммаризация: облачная LLM недоступна ({message}). Будет предложено выполнить локально."
+        self.status_label.setText(msg)
+        try:
+            self.tray.showMessage("Voice Input Local", msg, QSystemTrayIcon.Warning, 5000)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _apply_cloud_models_to_settings_combo(self, provider: str, models: list) -> None:
         """TASK-049: общая логика обновления combo моделей в настройках после
@@ -2778,6 +4551,89 @@ class MainWindow(QMainWindow):
                 pass
             log.warning("Initial cloud discover failed for selected model %s → switched to fallback %s", old, fallback_key)
             self.refresh_available_models_combo(force_current=True)
+
+    def on_reset_postprocess_prompt(self) -> None:
+        """US-034: сбросить системный промпт постобработки к дефолту."""
+        if not hasattr(self, "postprocess_prompt_edit"):
+            return
+        self.postprocess_prompt_edit.setPlainText(DEFAULT_POSTPROCESS_SYSTEM_PROMPT)
+        self.save_settings(auto=True)
+        self.status_label.setText("Системный промпт постобработки сброшен к дефолту.")
+
+    def _on_postprocess_enabled_toggled(self, checked: bool) -> None:
+        """US-034: показать/скрыть блок настроек постобработки."""
+        # US-018: постобработка работает ТОЛЬКО через облако — при включении
+        # показываем то же уведомление о передаче данных на внешние серверы.
+        if checked and not getattr(self, "_settings_loading", False):
+            if not self._confirm_cloud_switch("postprocess"):
+                self.postprocess_enabled_check.blockSignals(True)
+                self.postprocess_enabled_check.setChecked(False)
+                self.postprocess_enabled_check.blockSignals(False)
+                if hasattr(self, "postprocess_group"):
+                    self.postprocess_group.setVisible(False)
+                return
+        if hasattr(self, "postprocess_group"):
+            self.postprocess_group.setVisible(bool(checked))
+
+    def _on_postprocess_reasoning_toggled(self, checked: bool) -> None:
+        """US-034: показать/скрыть выбор уровня рассуждения."""
+        if hasattr(self, "postprocess_effort_row"):
+            self.postprocess_effort_row.setVisible(bool(checked))
+
+    def check_llm_connection(self) -> None:
+        """US-034: кнопка «Проверить соединение» для LLM-провайдера постобработки."""
+        api_key = self.postprocess_key_edit.text().strip()
+        base_url = (self.postprocess_base_url_edit.text().strip() or "https://api.openai.com/v1")
+        if not api_key:
+            self.status_label.setText("Заполните API Key для постобработки.")
+            return
+        try:
+            import requests  # noqa: F401
+        except ImportError:
+            self.status_label.setText(
+                "Не установлена библиотека requests. Выполните: .venv\\Scripts\\pip install requests"
+            )
+            return
+        self.save_settings(auto=True)
+        self.postprocess_check_btn.setEnabled(False)
+        self.postprocess_check_btn.setText("Проверяю…")
+        self.status_label.setText("Проверка соединения с LLM-провайдером постобработки…")
+        worker = LlmConnectionCheckWorker(api_key, base_url)
+        self._llm_check_worker = worker
+        worker.result.connect(self._on_llm_check_done)
+        worker.start()
+
+    def _on_llm_check_done(self, ok: bool, message: str, models: list) -> None:
+        self.postprocess_check_btn.setEnabled(True)
+        self.postprocess_check_btn.setText("Проверить соединение и обновить список моделей")
+        log.info("LLM verify result: ok=%s msg=%s models=%d", ok, message, len(models))
+        if ok:
+            combo = self.postprocess_model_combo
+            current = combo.currentText().strip()
+            combo.blockSignals(True)
+            combo.clear()
+            for mid in models:
+                combo.addItem(mid, mid)
+            if models:
+                if current and current in models:
+                    combo.setCurrentIndex(combo.findData(current))
+                else:
+                    combo.setCurrentIndex(0)
+            elif current:
+                combo.addItem(current, current)
+                combo.setCurrentIndex(combo.count() - 1)
+            combo.blockSignals(False)
+            chosen = combo.currentText().strip()
+            if chosen and self.cfg.postprocess_model_id != chosen:
+                self.cfg.postprocess_model_id = chosen
+                self.cfg.save()
+            self.status_label.setText(f"LLM постобработки: {message} (моделей: {len(models)})")
+        else:
+            self.status_label.setText(f"LLM постобработки: {message}")
+            try:
+                self.tray.showMessage("Voice Input Local", f"Постобработка: {message}", QSystemTrayIcon.Warning, 5000)
+            except Exception:  # noqa: BLE001
+                pass
 
     def check_cloud_connection(self, provider: str) -> None:
         """Кнопка «Проверить соединение» — асинхронно проверяет ключ

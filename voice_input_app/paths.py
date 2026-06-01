@@ -28,6 +28,11 @@ def app_icon_path() -> Path:
     return resource_path("voice_input_app/assets/icon.ico")
 
 
+def export_font_path() -> Path:
+    """US-024: путь к встроенному кириллическому TTF для генерации PDF."""
+    return resource_path("voice_input_app/assets/DejaVuSans.ttf")
+
+
 def app_data_dir() -> Path:
     base = os.environ.get("LOCALAPPDATA")
     if base:

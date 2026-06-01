@@ -275,11 +275,12 @@ def run_api_server(manager: ModelManager, cfg: AppConfig) -> None:
 
     app = create_app(manager, cfg)
     port = cfg.api_port or 8672
-    log.info("Starting API server on port %d", port)
+    host = (getattr(cfg, "api_host", "") or "127.0.0.1").strip() or "127.0.0.1"
+    log.info("Starting API server on %s:%d", host, port)
 
     def _serve():
-        uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+        uvicorn.run(app, host=host, port=port, log_level="warning")
 
     thread = threading.Thread(target=_serve, name="api-server", daemon=True)
     thread.start()
-    log.info("API server thread started on port %d", port)
+    log.info("API server thread started on %s:%d", host, port)

@@ -19,7 +19,7 @@ if not exist "%VENV_PY%" (
   exit /b 1
 )
 
-"%VENV_PY%" -m PyInstaller --noconfirm --clean --windowed --name VoiceInputLocal --icon "voice_input_app\assets\icon.ico" --add-data "voice_input_app\assets;voice_input_app\assets" --collect-all PySide6 --collect-all faster_whisper --collect-all onnx_asr --hidden-import keyboard --hidden-import pyperclip --hidden-import pyautogui --hidden-import uiautomation --hidden-import sounddevice --hidden-import soundfile --hidden-import requests --collect-all llama_cpp main.py
+"%VENV_PY%" -m PyInstaller --noconfirm --clean --windowed --name VoiceInputLocal --icon "voice_input_app\assets\icon.ico" --add-data "voice_input_app\assets;voice_input_app\assets" --collect-all PySide6 --collect-all faster_whisper --collect-all onnx_asr --hidden-import keyboard --hidden-import pyperclip --hidden-import pyautogui --hidden-import uiautomation --hidden-import sounddevice --hidden-import soundfile --hidden-import requests --collect-submodules fpdf --collect-all llama_cpp main.py
 if errorlevel 1 (
   echo ERROR: EXE build failed.
   pause

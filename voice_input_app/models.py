@@ -312,11 +312,29 @@ def cloud_provider_of(key: str) -> str:
 
 
 def cloud_model_id_of(key: str) -> str:
-    """Извлечь model_id из cloud-ключа: cloud:openai:whisper-1 → "whisper-1"."""
+    """Извлечь model_id из cloud-ключа: cloud:<connection_id>:whisper-1 → "whisper-1"."""
     parts = key.split(":", 2)
     if len(parts) >= 3 and parts[0] == "cloud":
         return parts[2]
     return ""
+
+
+def cloud_connection_id_of(key: str) -> str:
+    """US-037: средний сегмент cloud-ключа — id подключения.
+    cloud:<connection_id>:<model_id> → <connection_id>. Совпадает со средним
+    сегментом, который раньше был именем провайдера (cloud_provider_of)."""
+    return cloud_provider_of(key)
+
+
+def resolve_cloud_connection(cfg, key: str):
+    """US-037: вернуть CloudConnection для cloud-ключа или None (подключение
+    удалено / cfg отсутствует). Вызывающий обязан обработать None."""
+    if cfg is None:
+        return None
+    try:
+        return cfg.connection_by_id(cloud_connection_id_of(key))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _make_cloud_spec(engine: str, display_provider: str, model_id: str) -> ModelSpec:
@@ -502,36 +520,73 @@ class ModelManager:
         self._last_cfg = cfg
         _CLOUD_MODELS_REGISTRY.clear()
 
-        if cfg.openai_stt_api_key and cfg.openai_stt_model_id:
-            self._register_cloud_model("openai", cfg.openai_stt_model_id)
-        if cfg.elevenlabs_stt_api_key and cfg.elevenlabs_stt_model_id:
-            self._register_cloud_model("elevenlabs", cfg.elevenlabs_stt_model_id)
+        # US-037: реестр строится из подключений и их кэша discovered_models
+        # (без HTTP). Ключи — cloud:<connection_id>:<model_id>.
+        # STT-фильтр: список диктовки/файлов должен содержать ТОЛЬКО модели с
+        # аудио-входом. Одно openai-подключение может использоваться и для LLM
+        # (постобработка/суммаризация) — их chat-модели не должны попадать в
+        # реестр STT. Для openai фильтруем по именам, ElevenLabs — всегда STT.
+        try:
+            from . import cloud_stt as _cs
+            _stt_ok = _cs._looks_like_stt_model
+        except Exception:  # noqa: BLE001
+            _stt_ok = lambda _m: True
+        for conn in (getattr(cfg, "cloud_connections", None) or []):
+            for mid in (getattr(conn, "discovered_models", None) or []):
+                if conn.type == "openai" and not _stt_ok(mid):
+                    continue
+                self._register_cloud_model(conn.id, conn.type, mid)
 
-    def set_cloud_models(self, provider: str, model_ids: list[str]) -> None:
-        """Зарегистрировать обнаруженные cloud-модели одного провайдера.
-        Вызывается из UI после успешного CloudConnectionCheckWorker.
-        Не делает HTTP — model_ids получены воркером.
+    def set_cloud_models(self, a, b, c=None) -> None:
+        """US-037: зарегистрировать обнаруженные модели ОДНОГО подключения.
+
+        Новый вызов: set_cloud_models(connection_id, conn_type, model_ids).
+        Обратная совместимость (старый UI до рефакторинга US-037):
+        set_cloud_models(provider, model_ids) — провайдер маппится на первое
+        подключение этого типа. Не делает HTTP — model_ids получены воркером.
         """
-        # Очищаем модели этого провайдера, но не трогаем другого
+        if c is None:
+            # Старый стиль: (provider, model_ids)
+            provider, model_ids = a, list(b or [])
+            conn = None
+            cfg = self._last_cfg
+            if cfg is not None:
+                for cc in (getattr(cfg, "cloud_connections", None) or []):
+                    if cc.type == provider:
+                        conn = cc
+                        break
+            if conn is None:
+                return
+            connection_id, conn_type = conn.id, conn.type
+        else:
+            connection_id, conn_type, model_ids = a, b, list(c or [])
         for key in list(_CLOUD_MODELS_REGISTRY.keys()):
-            if cloud_provider_of(key) == provider:
+            if cloud_connection_id_of(key) == connection_id:
                 _CLOUD_MODELS_REGISTRY.pop(key, None)
         for mid in model_ids:
-            self._register_cloud_model(provider, mid)
+            self._register_cloud_model(connection_id, conn_type, mid)
+        # US-037 ВАЖНО: НЕ перезаписываем cc.discovered_models здесь. Это кэш
+        # ПОЛНОГО списка моделей подключения (его ведёт диалог подключения через
+        # discover_all_models). Старый стартовый STT-discover вызывает
+        # set_cloud_models с отфильтрованным STT-подмножеством — если бы мы
+        # писали его в discovered_models, полный список затирался бы 2 моделями
+        # после каждого перезапуска. set_cloud_models только обновляет живой
+        # реестр _CLOUD_MODELS_REGISTRY.
 
-    def _register_cloud_model(self, provider: str, model_id: str) -> None:
-        """Добавить одну cloud-модель в _CLOUD_MODELS_REGISTRY."""
-        if not model_id:
+    def _register_cloud_model(self, connection_id: str, conn_type: str, model_id: str) -> None:
+        """US-037: добавить одну cloud-модель в _CLOUD_MODELS_REGISTRY.
+        Ключ формата cloud:<connection_id>:<model_id>."""
+        if not model_id or not connection_id:
             return
-        if provider == "openai":
+        if conn_type == "openai":
             engine = CLOUD_OPENAI_ENGINE
             display = "OpenAI"
-        elif provider == "elevenlabs":
+        elif conn_type == "elevenlabs":
             engine = CLOUD_ELEVENLABS_ENGINE
             display = "ElevenLabs"
         else:
             return
-        key = f"cloud:{provider}:{model_id}"
+        key = f"cloud:{connection_id}:{model_id}"
         spec_obj = _make_cloud_spec(engine, display, model_id)
         _CLOUD_MODELS_REGISTRY[key] = ModelSpec(
             key=key,
@@ -584,12 +639,9 @@ class ModelManager:
                 return False
             if self._last_cfg is None:
                 return False
-            provider = cloud_provider_of(key)
-            if provider == "openai":
-                return bool(self._last_cfg.openai_stt_api_key)
-            if provider == "elevenlabs":
-                return bool(self._last_cfg.elevenlabs_stt_api_key)
-            return False
+            # US-037: доступна, если подключение существует и имеет ключ.
+            conn = resolve_cloud_connection(self._last_cfg, key)
+            return bool(conn and conn.api_key)
         if key == DEFAULT_MODEL_KEY:
             return True
         if key in SUMMARY_MODELS:
@@ -762,20 +814,22 @@ class ModelManager:
             elif spec.engine == "Parakeet":
                 self._load_parakeet(spec)
 
-    def transcribe(self, key: str, wav_path: Path, cfg: AppConfig, *, is_live: bool = False) -> str:
+    def transcribe(self, key: str, wav_path: Path, cfg: AppConfig, *, is_live: bool = False, progress_callback=None, duration_seconds: float = 0.0) -> str:
         spec = self.spec(key)
         if not self.is_available(key):
             raise RuntimeError(f"Модель {model_display_name(key)} не загружена. Сначала загрузите её во вкладке «Модели».")
         # Cloud-модели (US-015, US-016, US-032) — отдельная ветка, без блокировки
         # (несколько cloud-запросов могут идти параллельно — это нормально).
+        # US-022: прогресс процента применяется ТОЛЬКО к локальным движкам
+        # (Whisper/Parakeet); cloud-путь его игнорирует.
         if is_cloud_model_key(key):
             return self._transcribe_cloud(key, wav_path, cfg)
         with self._lock_for(key):
             transcription_log.info("Transcription start: key=%s engine=%s live=%s language=%s path=%s", key, spec.engine, is_live, _normalize_language(cfg.language), wav_path)
             if spec.engine == "Whisper":
-                text = self._transcribe_whisper(spec, wav_path, cfg, is_live=is_live)
+                text = self._transcribe_whisper(spec, wav_path, cfg, is_live=is_live, progress_callback=progress_callback, duration_seconds=duration_seconds)
             elif spec.engine == "Parakeet":
-                text = self._transcribe_parakeet(spec, wav_path, is_live=is_live)
+                text = self._transcribe_parakeet(spec, wav_path, is_live=is_live, progress_callback=progress_callback)
             else:
                 raise RuntimeError(f"Неподдерживаемый движок: {spec.engine}")
             transcription_log.info("Transcription done: key=%s live=%s chars=%s", key, is_live, len(text))
@@ -790,6 +844,11 @@ class ModelManager:
         on_chunk_done=None,
         cancel_check=None,
         chunk_local_fallback=None,
+        openai_prompt: "str | None" = None,
+        with_timestamps: bool = False,
+        with_diarization: bool = False,
+        speaker_count: str = "auto",
+        on_segments_final=None,
     ) -> str:
         """Расшифровка через облачный STT (US-015, US-016) с автонарезкой (US-032).
 
@@ -800,31 +859,48 @@ class ModelManager:
 
         TASK-078/TASK-079 (US-017): on_chunk_done и cancel_check пробрасываются
         в split_and_transcribe для прогрессивных block_ready и отзывчивой отмены.
+
+        TASK-057..060 (US-017): при with_timestamps cloud-функции возвращают
+        (text, segments). Для OpenAI диаризация выполняется пост-процессом
+        локально (assign_speakers), для ElevenLabs — нативно (diarize=true).
+        Итоговые сегменты прогоняются через merge-функции (как локальный путь),
+        чтобы текст был фразового уровня, и отдаются через on_segments_final.
+        Возвращается всегда str (полный текст) — сегменты идут через колбэк.
         """
         from . import cloud_stt
 
-        provider = cloud_provider_of(key)
+        # US-037: реквизиты берутся из подключения, на которое ссылается ключ
+        # (cloud:<connection_id>:<model_id>), а не из устаревших cfg.*_stt_*.
+        conn = resolve_cloud_connection(cfg, key)
+        if conn is None:
+            raise RuntimeError(
+                "Облачное подключение для выбранной модели не найдено "
+                "(возможно, удалено). Выберите подключение на вкладке «Модели»."
+            )
+        provider = conn.type
         model_id = cloud_model_id_of(key)
         language = _normalize_language(cfg.language)
         max_chunk = max(10, int(getattr(cfg, "cloud_max_chunk_seconds", 60) or 60))
         transcription_log.info(
-            "Cloud STT start: key=%s provider=%s model=%s language=%s path=%s max_chunk=%ds",
-            key, provider, model_id, language or "auto", wav_path, max_chunk,
+            "Cloud STT start: key=%s provider=%s model=%s language=%s path=%s max_chunk=%ds timestamps=%s diarization=%s",
+            key, provider, model_id, language or "auto", wav_path, max_chunk, with_timestamps, with_diarization,
         )
 
         if provider == "openai":
-            host = cloud_stt._host_from_url(cfg.openai_stt_base_url)
+            host = cloud_stt._host_from_url(conn.base_url)
 
-            def _one(chunk_path: Path) -> str:
+            def _one(chunk_path: Path):
                 return cloud_stt.transcribe_openai_compatible(
                     chunk_path,
-                    api_key=cfg.openai_stt_api_key,
-                    base_url=cfg.openai_stt_base_url,
+                    api_key=conn.api_key,
+                    base_url=conn.base_url,
                     model_id=model_id or "whisper-1",
                     language=language,
+                    prompt=openai_prompt,  # US-035: только для диктовки
+                    with_timestamps=with_timestamps,
                 )
 
-            text = cloud_stt.split_and_transcribe(
+            result = cloud_stt.split_and_transcribe(
                 wav_path,
                 _one,
                 max_chunk_seconds=max_chunk,
@@ -832,17 +908,20 @@ class ModelManager:
                 on_chunk_done=on_chunk_done,
                 cancel_check=cancel_check,
                 chunk_local_fallback=chunk_local_fallback,
+                with_timestamps=with_timestamps,
             )
         elif provider == "elevenlabs":
-            def _one(chunk_path: Path) -> str:
+            def _one(chunk_path: Path):
                 return cloud_stt.transcribe_elevenlabs(
                     chunk_path,
-                    api_key=cfg.elevenlabs_stt_api_key,
+                    api_key=conn.api_key,
                     model_id=model_id or "scribe_v1",
                     language=language,
+                    with_timestamps=with_timestamps,
+                    with_diarization=with_diarization,  # ElevenLabs: нативная диаризация
                 )
 
-            text = cloud_stt.split_and_transcribe(
+            result = cloud_stt.split_and_transcribe(
                 wav_path,
                 _one,
                 max_chunk_seconds=max_chunk,
@@ -850,11 +929,76 @@ class ModelManager:
                 on_chunk_done=on_chunk_done,
                 cancel_check=cancel_check,
                 chunk_local_fallback=chunk_local_fallback,
+                with_timestamps=with_timestamps,
             )
         else:
             raise RuntimeError(f"Неподдерживаемый cloud-провайдер: {provider}")
+
+        if with_timestamps and isinstance(result, tuple):
+            text, segments = result
+            segments = self._postprocess_cloud_segments(
+                wav_path, segments, provider=provider,
+                with_diarization=with_diarization, speaker_count=speaker_count,
+            )
+            if on_segments_final is not None and segments:
+                try:
+                    on_segments_final(segments)
+                except Exception:  # noqa: BLE001
+                    log.exception("on_segments_final callback failed")
+        else:
+            text = result if isinstance(result, str) else (result[0] if result else "")
         transcription_log.info("Cloud STT done: key=%s chars=%s", key, len(text))
         return text
+
+    def _postprocess_cloud_segments(
+        self,
+        wav_path: Path,
+        segments: list,
+        *,
+        provider: str,
+        with_diarization: bool,
+        speaker_count: str = "auto",
+    ) -> list:
+        """TASK-060 (US-017): пост-обработка cloud-сегментов с таймкодами.
+
+        1) Для OpenAI при with_diarization — локальная диаризация поверх
+           cloud-результата с таймкодами (assign_speakers). ElevenLabs метки
+           спикеров уже проставил нативно.
+        2) Склейка коротких сегментов в фразы (merge_whisper_blocks_into_utterances),
+           как на локальном пути — чтобы не было «по 2-3 слова на строку».
+        3) При диаризации — дополнительная склейка соседних реплик одного спикера.
+
+        Возвращает список dict {start, end, text, speaker}.
+        """
+        if not segments:
+            return segments
+        segs: list[TranscriptSegment] = [
+            TranscriptSegment(
+                float(s.get("start", 0.0)), float(s.get("end", 0.0)),
+                (s.get("text") or "").strip(), (s.get("speaker") or ""),
+            )
+            for s in segments
+            if (s.get("text") or "").strip()
+        ]
+        if not segs:
+            return []
+        # OpenAI: диаризация — локальный пост-процесс поверх cloud-таймкодов.
+        if with_diarization and provider == "openai":
+            try:
+                from .diarization import assign_speakers
+
+                segs = assign_speakers(wav_path, segs, speaker_count=str(speaker_count or "auto"))
+                transcription_log.info("Cloud OpenAI post-process diarization: %d segments", len(segs))
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Cloud post-process diarization failed: %s", exc)
+        # Склейка в фразы (как локальный путь).
+        merged = merge_whisper_blocks_into_utterances(segs)
+        if with_diarization and len(merged) > 1:
+            merged = merge_speaker_segments(merged)
+        return [
+            {"start": m.start_seconds, "end": m.end_seconds, "text": m.text, "speaker": m.speaker or ""}
+            for m in merged
+        ]
 
     def transcribe_with_fallback(
         self,
@@ -866,6 +1010,13 @@ class ModelManager:
         on_cloud_chunk=None,
         cancel_check=None,
         chunk_local_fallback=None,
+        openai_prompt: "str | None" = None,
+        with_timestamps: bool = False,
+        with_diarization: bool = False,
+        speaker_count: str = "auto",
+        on_segments_final=None,
+        progress_callback=None,
+        duration_seconds: float = 0.0,
     ) -> tuple[str, bool, str, str]:
         """Обёртка над transcribe() с автоматическим fallback на локальную модель.
 
@@ -873,11 +1024,20 @@ class ModelManager:
         Если used_fallback=True, cfg.selected_model уже переключён на
         cfg.cloud_fallback_model_key и сохранён в config.json
         (US-015/US-016 решение G).
+
+        TASK-057..060 (US-017): with_timestamps/with_diarization/speaker_count и
+        on_segments_final пробрасываются в _transcribe_cloud для cloud-расшифровки
+        файлов с таймкодами и диаризацией. Итоговые сегменты доставляются через
+        on_segments_final (текст по-прежнему возвращается строкой в кортеже).
         """
         # Не cloud → как обычно (колбэки игнорируются — локальные модели
         # обрабатываются через transcribe_file_progressive со своим прогрессом)
         if not is_cloud_model_key(key):
-            text = self.transcribe(key, wav_path, cfg, is_live=is_live)
+            # US-022: прогресс процента диктовки (overlay/статус) для локальных моделей.
+            text = self.transcribe(
+                key, wav_path, cfg, is_live=is_live,
+                progress_callback=progress_callback, duration_seconds=duration_seconds,
+            )
             return text, False, key, ""
 
         # Cloud → пробуем напрямую через _transcribe_cloud с колбэками,
@@ -890,6 +1050,11 @@ class ModelManager:
                 on_chunk_done=on_cloud_chunk,
                 cancel_check=cancel_check,
                 chunk_local_fallback=chunk_local_fallback,
+                openai_prompt=openai_prompt,  # US-035
+                with_timestamps=with_timestamps,
+                with_diarization=with_diarization,
+                speaker_count=speaker_count,
+                on_segments_final=on_segments_final,
             )
             return text, False, key, ""
         except _cs.CloudSttError as exc:
@@ -902,8 +1067,11 @@ class ModelManager:
                 cfg.save()
             except Exception as save_exc:  # noqa: BLE001
                 log.warning("Failed to save cfg after fallback: %s", save_exc)
-            # Делаем fallback-расшифровку локальной моделью
-            text = self.transcribe(fallback_key, wav_path, cfg, is_live=is_live)
+            # Делаем fallback-расшифровку локальной моделью (US-022: с прогрессом)
+            text = self.transcribe(
+                fallback_key, wav_path, cfg, is_live=is_live,
+                progress_callback=progress_callback, duration_seconds=duration_seconds,
+            )
             return text, True, fallback_key, reason
 
     @staticmethod
@@ -980,7 +1148,7 @@ class ModelManager:
         self._loaded[spec.key] = model_obj
         return model_obj
 
-    def _transcribe_whisper(self, spec: ModelSpec, wav_path: Path, cfg: AppConfig, *, is_live: bool = False) -> str:
+    def _transcribe_whisper(self, spec: ModelSpec, wav_path: Path, cfg: AppConfig, *, is_live: bool = False, progress_callback=None, duration_seconds: float = 0.0) -> str:
         model = self._load_whisper(spec, cfg)
         language = _normalize_language(cfg.language)
         transcription_log.info("Whisper transcribe args: key=%s language=%s live=%s vad=%s", spec.key, language or "auto", is_live, False if is_live else True)
@@ -993,7 +1161,23 @@ class ModelManager:
             temperature=0.0,
             word_timestamps=False,
         )
-        return "".join(seg.text for seg in segments).strip()
+        # US-022: faster-whisper отдаёт сегменты ленивым генератором — реальная
+        # работа идёт при итерации. Прогресс = seg.end / total. total берём из
+        # переданной длительности диктовки, а если её нет — из _info.duration.
+        total = float(duration_seconds) if duration_seconds and duration_seconds > 0 else float(getattr(_info, "duration", 0.0) or 0.0)
+        parts: list[str] = []
+        last_pct = -1
+        for seg in segments:
+            parts.append(seg.text)
+            if progress_callback is not None and total > 0:
+                pct = int(max(0.0, min(100.0, float(seg.end) * 100.0 / total)))
+                if pct != last_pct:
+                    last_pct = pct
+                    try:
+                        progress_callback(float(pct))
+                    except Exception:  # noqa: BLE001
+                        pass
+        return "".join(parts).strip()
 
     def _transcribe_whisper_progressive(
         self,
@@ -1301,16 +1485,26 @@ class ModelManager:
             errors.append(f"soundfile fallback: {exc}")
         raise RuntimeError("Parakeet не смог распознать WAV. Варианты вызова не подошли: " + " | ".join(errors))
 
-    def _transcribe_parakeet(self, spec: ModelSpec, wav_path: Path, *, is_live: bool = False) -> str:
+    def _transcribe_parakeet(self, spec: ModelSpec, wav_path: Path, *, is_live: bool = False, progress_callback=None) -> str:
         if is_live:
             # Keep final Parakeet reliable; Whisper remains the preferred live engine.
             return ""
         model = self._load_parakeet(spec)
         chunks = split_wav_if_needed(wav_path, max_seconds=24.0, overlap_seconds=2.0)
         parts: list[str] = []
+        # US-022: у Parakeet нет посегментного генератора — прогресс возможен
+        # только по границам чанков (по 24 с). Для коротких диктовок (1 чанк)
+        # промежуточных обновлений нет: они попадут под порог 2 с и % не покажут.
+        total_chunks = len(chunks)
         try:
-            for chunk in chunks:
+            for i, chunk in enumerate(chunks):
                 parts.append(self._recognize_parakeet_chunk(model, chunk))
+                if progress_callback is not None and total_chunks > 0:
+                    pct = int(max(0.0, min(100.0, (i + 1) * 100.0 / total_chunks)))
+                    try:
+                        progress_callback(float(pct))
+                    except Exception:  # noqa: BLE001
+                        pass
         finally:
             for chunk in chunks:
                 if chunk != wav_path:

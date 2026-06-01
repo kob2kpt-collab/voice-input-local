@@ -3,7 +3,32 @@ from __future__ import annotations
 import math
 
 from PySide6.QtCore import QPoint, QSize, Qt, QTimer, Signal
-from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+class HotkeySafeComboBox(QComboBox):
+    """QComboBox, который не открывает выпадающий список по клавише Space.
+
+    Space — часть глобального хоткея (например Ctrl+Space). Без этого фокусный
+    combo (на вкладке «Диктовка» или в overlay-пикере) перехватывал бы Space и
+    самопроизвольно открывал список при нажатии хоткея. Остальные клавиши
+    (стрелки, Enter) работают штатно.
+    """
+
+    def keyPressEvent(self, event) -> None:  # noqa: ANN001
+        if event.key() == Qt.Key_Space:
+            event.ignore()
+            return
+        super().keyPressEvent(event)
 
 
 class RecordingOverlay(QWidget):
@@ -16,6 +41,11 @@ class RecordingOverlay(QWidget):
 
     copy_requested = Signal(str)
     position_changed = Signal(int, int)
+    # US-019 / US-038: выбор модели через overlay.
+    model_selected = Signal(str)      # пользователь выбрал модель (ключ)
+    settings_requested = Signal()     # из пустого состояния пикера — «Открыть настройки»
+    picker_requested = Signal()       # двойной клик по плашке в состоянии Ready
+    picker_cancelled = Signal()       # Escape в режиме пикера
 
     COMPACT_MIN_WIDTH = 70
     COMPACT_MAX_WIDTH = 112
@@ -37,6 +67,12 @@ class RecordingOverlay(QWidget):
         self._drag_start: QPoint | None = None
         self._hotkey = "Ctrl+Alt+Space"
         self._result_text = ""
+        # US-019 / US-038: состояние плашки. _idle=True только в Ready; двойной
+        # клик открывает пикер моделей лишь из этого состояния. _in_picker=True
+        # пока показан выбор модели (на это время снимаем WA_ShowWithoutActivating,
+        # чтобы popup QComboBox получал фокус; восстанавливаем при выходе).
+        self._idle = False
+        self._in_picker = False
         self._return_timer = QTimer(self)
         self._return_timer.setSingleShot(True)
         self._return_timer.timeout.connect(self.show_idle)
@@ -76,6 +112,25 @@ class RecordingOverlay(QWidget):
             }
             QPushButton:hover { background: #ffffff; }
             QPushButton:pressed { background: #d4d4d8; padding-top: 7px; padding-bottom: 5px; }
+            QLabel#PickerInfo { color: #f4f4f5; font-size: 11px; font-weight: 600; }
+            QLabel#PickerHint { color: #fbbf24; font-size: 10px; font-weight: 600; }
+            QComboBox {
+                background: rgba(39, 39, 42, 240);
+                color: #f4f4f5;
+                border: 1px solid #3f3f46;
+                border-radius: 8px;
+                padding: 5px 8px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QComboBox:hover { border-color: #52525b; }
+            QComboBox QAbstractItemView {
+                background: #18181b;
+                color: #f4f4f5;
+                selection-background-color: #2563eb;
+                border: 1px solid #3f3f46;
+                outline: none;
+            }
             """
         )
         self.card_layout = QVBoxLayout(self.card)
@@ -103,6 +158,33 @@ class RecordingOverlay(QWidget):
         self.copy_btn.setVisible(False)
         self.copy_btn.clicked.connect(self._copy_clicked)
         self.card_layout.addWidget(self.copy_btn)
+
+        # US-019 / US-038: виджеты режима выбора модели (по умолчанию скрыты).
+        self.picker_info = QLabel("")
+        self.picker_info.setObjectName("PickerInfo")
+        self.picker_info.setWordWrap(True)
+        self.picker_info.setMinimumWidth(self.PREVIEW_MIN_WIDTH)
+        self.picker_info.setMaximumWidth(self.PREVIEW_MAX_WIDTH)
+        self.picker_info.setVisible(False)
+        self.card_layout.addWidget(self.picker_info)
+
+        self.picker_combo = HotkeySafeComboBox()
+        self.picker_combo.setVisible(False)
+        self.picker_combo.activated.connect(self._picker_combo_activated)
+        self.card_layout.addWidget(self.picker_combo)
+
+        self.picker_settings_btn = QPushButton("Открыть настройки")
+        self.picker_settings_btn.setVisible(False)
+        self.picker_settings_btn.clicked.connect(self._settings_clicked)
+        self.card_layout.addWidget(self.picker_settings_btn)
+
+        self.picker_hint = QLabel("")
+        self.picker_hint.setObjectName("PickerHint")
+        self.picker_hint.setWordWrap(True)
+        self.picker_hint.setMinimumWidth(self.PREVIEW_MIN_WIDTH)
+        self.picker_hint.setMaximumWidth(self.PREVIEW_MAX_WIDTH)
+        self.picker_hint.setVisible(False)
+        self.card_layout.addWidget(self.picker_hint)
 
         outer.addWidget(self.card)
         self._place_default()
@@ -182,6 +264,11 @@ class RecordingOverlay(QWidget):
 
     def _set_state(self, status: str, dot_color: str, *, compact: bool, auto_ready_ms: int | None = None) -> None:
         self._return_timer.stop()
+        # Любой обычный статус выводит плашку из режима пикера.
+        if self._in_picker:
+            self._exit_picker_mode()
+        self._idle = False
+        self._hide_picker_widgets()
         self.status_label.setText(status)
         self.dot_label.setText("●")
         self.dot_label.setStyleSheet(f"color: {dot_color};")
@@ -204,6 +291,8 @@ class RecordingOverlay(QWidget):
 
     def show_idle(self, message: str = "Ready") -> None:
         self._set_state(message, "#22c55e", compact=True)
+        # Только из Ready доступен быстрый выбор модели по двойному клику.
+        self._idle = True
 
     def hide_overlay(self) -> None:
         self._return_timer.stop()
@@ -211,6 +300,10 @@ class RecordingOverlay(QWidget):
         self.preview_label.setText("")
         self.preview_label.setVisible(False)
         self.copy_btn.setVisible(False)
+        if self._in_picker:
+            self._exit_picker_mode()
+        self._hide_picker_widgets()
+        self._idle = False
         self.hide()
 
     def reset_for_new_recording(self, *, live_enabled: bool = False) -> None:
@@ -269,6 +362,120 @@ class RecordingOverlay(QWidget):
         if self._result_text:
             self.copy_requested.emit(self._result_text)
 
+    # ── US-019 / US-038: режим выбора модели ──────────────────────────────
+
+    def _set_show_without_activating(self, value: bool) -> None:
+        try:
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, value)
+        except AttributeError:
+            self.setAttribute(Qt.WA_ShowWithoutActivating, value)
+
+    def _hide_picker_widgets(self) -> None:
+        self.picker_info.setVisible(False)
+        self.picker_combo.setVisible(False)
+        self.picker_settings_btn.setVisible(False)
+        self.picker_hint.setVisible(False)
+
+    def _exit_picker_mode(self) -> None:
+        """Выйти из режима пикера и вернуть non-activating поведение плашки.
+
+        WA_ShowWithoutActivating восстанавливается обязательно — иначе при
+        последующей диктовке overlay мог бы перехватывать фокус и ломать
+        вставку текста в активное окно (см. CLAUDE.md, раздел про overlay).
+        """
+        self._in_picker = False
+        self._set_show_without_activating(True)
+        self._hide_picker_widgets()
+
+    def show_model_picker(
+        self,
+        models: list[tuple[str, str]],
+        *,
+        title: str = "Выбор модели",
+        current_key: str = "",
+        warning: str = "",
+        show_settings_button: bool = False,
+        hint: str = "",
+    ) -> None:
+        """Показать выбор модели прямо в плашке overlay.
+
+        models — список (key, label). Если он пуст или show_settings_button=True,
+        показывается пустое состояние с кнопкой «Открыть настройки» и подсказкой.
+        Выбор модели через QComboBox без отдельной кнопки подтверждения —
+        сигнал model_selected эмитится по activated.
+        """
+        self._return_timer.stop()
+        self._idle = False
+        self._in_picker = True
+        self._result_text = ""
+        self.preview_label.setText("")
+        self.preview_label.setVisible(False)
+        self.copy_btn.setVisible(False)
+
+        self.status_label.setText("Выбор модели")
+        self.dot_label.setText("●")
+        self.dot_label.setStyleSheet("color: #38bdf8;")
+
+        self.picker_info.setText(title)
+        self.picker_info.setVisible(bool(title))
+
+        empty = show_settings_button or not models
+        if empty:
+            self.picker_combo.setVisible(False)
+            self.picker_settings_btn.setVisible(True)
+            self.picker_hint.setText(hint or "Либо дождитесь завершения расшифровки файла")
+            self.picker_hint.setVisible(True)
+        else:
+            self.picker_combo.blockSignals(True)
+            self.picker_combo.clear()
+            for key, label in models:
+                self.picker_combo.addItem(label, key)
+            if current_key:
+                idx = self.picker_combo.findData(current_key)
+                if idx >= 0:
+                    self.picker_combo.setCurrentIndex(idx)
+            self.picker_combo.blockSignals(False)
+            self.picker_combo.setVisible(True)
+            self.picker_settings_btn.setVisible(False)
+            if warning:
+                self.picker_hint.setText(warning)
+                self.picker_hint.setVisible(True)
+            else:
+                self.picker_hint.setVisible(False)
+
+        # На время пикера разрешаем плашке активироваться, иначе popup combo
+        # не получит фокус и выбор будет невозможен.
+        self._set_show_without_activating(False)
+        if not self.isVisible():
+            self.show()
+        self._resize_to_content(compact=False)
+        self._ensure_visible_on_screen()
+        self.raise_()
+        self.activateWindow()
+        if self.picker_combo.isVisible():
+            self.picker_combo.setFocus()
+
+    def _picker_combo_activated(self, index: int) -> None:
+        key = self.picker_combo.itemData(index)
+        if key:
+            self.model_selected.emit(str(key))
+
+    def _settings_clicked(self) -> None:
+        self.settings_requested.emit()
+
+    def is_in_picker(self) -> bool:
+        return self._in_picker
+
+    def keyPressEvent(self, event) -> None:  # noqa: ANN001
+        # US-019/US-038: Escape в режиме пикера закрывает список; в какое
+        # состояние вернуть overlay (Ready или прогресс файла) решает MainWindow
+        # по контексту пикера через сигнал picker_cancelled.
+        if self._in_picker and event.key() == Qt.Key_Escape:
+            self.picker_cancelled.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def mousePressEvent(self, event) -> None:  # noqa: ANN001
         if event.button() == Qt.LeftButton:
             self._drag_start = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -283,4 +490,13 @@ class RecordingOverlay(QWidget):
         self._drag_start = None
         self._ensure_visible_on_screen()
         self.position_changed.emit(self.pos().x(), self.pos().y())
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: ANN001
+        # US-038: быстрый выбор модели по двойному клику — только из Ready.
+        if event.button() == Qt.LeftButton and self._idle and not self._in_picker:
+            self._drag_start = None
+            self.picker_requested.emit()
+            event.accept()
+            return
         event.accept()

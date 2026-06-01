@@ -29,3 +29,6 @@ python-multipart>=0.0.9
 
 # Cloud STT (US-015, US-016, US-032): OpenAI-compatible API + ElevenLabs
 requests>=2.31
+
+# Экспорт расшифровок из истории в PDF (US-024)
+fpdf2>=2.7
