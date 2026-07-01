@@ -89,6 +89,10 @@ class TranscribeWorker(QThread):
     # Эмитится только при is_live=False (для cloud-моделей не эмитится — там нет
     # посегментного прогресса).
     progress = Signal(int)
+    # EPIC-10/US-039: VAD не нашёл речи в облачной диктовке (тишина). Облако не
+    # вызывается; UI показывает overlay-статус «Речь не найдена». Эмитится
+    # вместо finished_text/fallback_applied.
+    no_speech = Signal()
 
     def __init__(self, manager: ModelManager, model_key: str, wav_path: Path, duration: float, cfg: AppConfig, *, is_live: bool = False) -> None:
         super().__init__()
@@ -114,12 +118,49 @@ class TranscribeWorker(QThread):
             )
             # US-022: прогресс процента — только для финальной (не live) диктовки.
             _progress_cb = None if self.is_live else (lambda p: self.progress.emit(int(p)))
-            text, used_fallback, fallback_key, reason = self.manager.transcribe_with_fallback(
-                self.model_key, self.wav_path, self.cfg, is_live=self.is_live,
-                openai_prompt=_prompt_val,
-                progress_callback=_progress_cb,
-                duration_seconds=float(self.duration or 0.0),
-            )
+            # EPIC-10/US-039: для ОБЛАЧНОЙ диктовки вырезаем тишину локальным VAD
+            # ДО отправки в облако — иначе Whisper галлюцинирует на паузах.
+            # Три случая (TASK-203): речь → шлём обрезанный WAV; тишина → сигнал
+            # no_speech и выход без обращения к облаку; сбой VAD → fail-open
+            # (шлём оригинал). Локальную диктовку не трогаем — там vad_filter.
+            send_path = self.wav_path
+            trim_artifact: Path | None = None
+            if (
+                not self.is_live
+                and is_cloud_model_key(self.model_key)
+                and bool(getattr(self.cfg, "cloud_trim_silence_enabled", True))
+            ):
+                try:
+                    from .vad import trim_silence_for_cloud
+                    trim = trim_silence_for_cloud(
+                        self.wav_path,
+                        aggressiveness=getattr(self.cfg, "cloud_trim_aggressiveness", "medium"),
+                    )
+                    if trim.no_speech:
+                        log.info("VAD: речь не найдена (%.3fс) — облако не вызываем", trim.speech_seconds)
+                        self.no_speech.emit()
+                        return
+                    if trim.trimmed and trim.wav_path is not None:
+                        send_path = trim.wav_path
+                        trim_artifact = trim.wav_path
+                        log.info("VAD: отправляю в облако обрезанный WAV (%.3fс речи)", trim.speech_seconds)
+                except Exception as vad_exc:  # noqa: BLE001
+                    log.exception("VAD pre-trim failed, sending original audio (fail-open): %s", vad_exc)
+                    send_path = self.wav_path
+            try:
+                text, used_fallback, fallback_key, reason = self.manager.transcribe_with_fallback(
+                    self.model_key, send_path, self.cfg, is_live=self.is_live,
+                    openai_prompt=_prompt_val,
+                    progress_callback=_progress_cb,
+                    duration_seconds=float(self.duration or 0.0),
+                )
+            finally:
+                if trim_artifact is not None:
+                    try:
+                        from .vad import cleanup_trim_artifact
+                        cleanup_trim_artifact(trim_artifact)
+                    except Exception:  # noqa: BLE001
+                        pass
             if used_fallback:
                 self.fallback_applied.emit(fallback_key, reason)
             self.finished_text.emit(text, self.duration)

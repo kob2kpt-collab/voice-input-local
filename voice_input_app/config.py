@@ -209,6 +209,11 @@ class AppConfig:
     # Поведение fallback и нарезки
     cloud_fallback_model_key: str = "whisper:small"
     cloud_max_chunk_seconds: int = 60
+    # EPIC-10 / US-039: вырезание тишины локальным VAD (Silero из faster-whisper)
+    # ПЕРЕД отправкой звука в облачный STT. Применяется ТОЛЬКО к диктовке —
+    # убирает галлюцинации Whisper на паузах/тишине. Файловый путь не затронут.
+    cloud_trim_silence_enabled: bool = True
+    cloud_trim_aggressiveness: str = "medium"  # low | medium | high
     # US-018: устарело. Раньше хранило провайдеров, для которых предупреждение
     # подавлено «между перезапусками». По решению владельца продукта подавление
     # стало СЕССИОННЫМ (в памяти MainWindow), поэтому поле больше не используется

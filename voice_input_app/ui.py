@@ -830,6 +830,27 @@ class MainWindow(QMainWindow):
         self.openai_prompt_reset_btn.clicked.connect(self.on_reset_openai_initial_prompt)
         dgl.addRow("", self.openai_prompt_reset_btn)
 
+        # EPIC-10/US-039: вырезание тишины перед отправкой в облако (диктовка)
+        self.cloud_trim_silence_check = QCheckBox("Вырезать тишину перед отправкой в облако")
+        self.cloud_trim_silence_check.setToolTip("Локальный VAD (Silero) убирает тишину и паузы ДО отправки — это устраняет галлюцинации облачных моделей на тишине. Только диктовка через облако; файлы и локальные модели не затрагиваются.")
+        _trim_note = QLabel("Перед отправкой диктовки в облако тишина и паузы вырезаются локально (Silero VAD). Убирает «фантомные» фразы, которые облачный Whisper выдаёт на тишине. Если речь не найдена — запрос в облако не отправляется, плашка покажет «Речь не найдена».")
+        _trim_note.setWordWrap(True)
+        _trim_note.setObjectName("Subtitle")
+        _trim_cell = QWidget()
+        _tv = QVBoxLayout(_trim_cell)
+        _tv.setContentsMargins(0, 0, 0, 0)
+        _tv.setSpacing(2)
+        _tv.addWidget(self.cloud_trim_silence_check)
+        _tv.addWidget(_trim_note)
+        dgl.addRow("Тишина (облако)", _trim_cell)
+
+        self.cloud_trim_aggressiveness_combo = NoScrollComboBox()
+        self.cloud_trim_aggressiveness_combo.addItem("Низкая (бережно к тихой речи)", "low")
+        self.cloud_trim_aggressiveness_combo.addItem("Средняя (рекомендуется)", "medium")
+        self.cloud_trim_aggressiveness_combo.addItem("Высокая (агрессивно резать паузы)", "high")
+        self.cloud_trim_aggressiveness_combo.setToolTip("Насколько агрессивно вырезать тишину. Выше — под нож попадают более короткие паузы, но растёт риск срезать очень тихую речь.")
+        dgl.addRow("Агрессивность вырезания", self.cloud_trim_aggressiveness_combo)
+
         self.cloud_max_chunk_spin = NoScrollSpinBox()
         self.cloud_max_chunk_spin.setRange(30, 300)
         self.cloud_max_chunk_spin.setSuffix(" сек")
@@ -1692,6 +1713,13 @@ class MainWindow(QMainWindow):
             self.elevenlabs_stt_key_edit.setText(self.cfg.elevenlabs_stt_api_key)
             self._fill_cloud_model_combo(self.elevenlabs_stt_model_combo, "elevenlabs", self.cfg.elevenlabs_stt_model_id)
             self.cloud_max_chunk_spin.setValue(max(30, min(300, int(self.cfg.cloud_max_chunk_seconds or 60))))
+            # EPIC-10/US-039: вырезание тишины перед облаком
+            if hasattr(self, "cloud_trim_silence_check"):
+                self.cloud_trim_silence_check.setChecked(bool(getattr(self.cfg, "cloud_trim_silence_enabled", True)))
+            if hasattr(self, "cloud_trim_aggressiveness_combo"):
+                _agg = str(getattr(self.cfg, "cloud_trim_aggressiveness", "medium") or "medium")
+                _agg_idx = self.cloud_trim_aggressiveness_combo.findData(_agg)
+                self.cloud_trim_aggressiveness_combo.setCurrentIndex(_agg_idx if _agg_idx >= 0 else 1)
             self._fill_cloud_fallback_combo()
         # US-034: постобработка
         if hasattr(self, "postprocess_enabled_check"):
@@ -1797,6 +1825,11 @@ class MainWindow(QMainWindow):
             self.elevenlabs_stt_model_combo.currentIndexChanged.connect(self.schedule_settings_autosave)
             self.cloud_max_chunk_spin.valueChanged.connect(self.schedule_settings_autosave)
             self.cloud_fallback_combo.currentIndexChanged.connect(self.schedule_settings_autosave)
+            # EPIC-10/US-039: автосейв вырезания тишины
+            if hasattr(self, "cloud_trim_silence_check"):
+                self.cloud_trim_silence_check.toggled.connect(self.schedule_settings_autosave)
+            if hasattr(self, "cloud_trim_aggressiveness_combo"):
+                self.cloud_trim_aggressiveness_combo.currentIndexChanged.connect(self.schedule_settings_autosave)
         # US-034: автосейв постобработки
         if hasattr(self, "postprocess_enabled_check"):
             self.postprocess_enabled_check.stateChanged.connect(self.schedule_settings_autosave)
@@ -3127,6 +3160,11 @@ class MainWindow(QMainWindow):
             self.cfg.elevenlabs_stt_api_key = self.elevenlabs_stt_key_edit.text().strip()
             self.cfg.elevenlabs_stt_model_id = str(self.elevenlabs_stt_model_combo.currentText() or "").strip()
             self.cfg.cloud_max_chunk_seconds = int(self.cloud_max_chunk_spin.value())
+            # EPIC-10/US-039: вырезание тишины перед облаком
+            if hasattr(self, "cloud_trim_silence_check"):
+                self.cfg.cloud_trim_silence_enabled = bool(self.cloud_trim_silence_check.isChecked())
+            if hasattr(self, "cloud_trim_aggressiveness_combo"):
+                self.cfg.cloud_trim_aggressiveness = str(self.cloud_trim_aggressiveness_combo.currentData() or "medium")
             fb = str(self.cloud_fallback_combo.currentData() or DEFAULT_MODEL_KEY)
             self.cfg.cloud_fallback_model_key = fb
             # Если ключи/URL изменились — инвалидируем кэш discover и
@@ -3579,6 +3617,7 @@ class MainWindow(QMainWindow):
         self.transcribe_worker.finished_text.connect(lambda text, dur: self.on_transcription_done(text, dur, wav_path))
         self.transcribe_worker.fallback_applied.connect(self.on_cloud_fallback_applied)
         self.transcribe_worker.progress.connect(self.on_dictation_progress)
+        self.transcribe_worker.no_speech.connect(lambda path=wav_path: self.on_dictation_no_speech(path))
         self.transcribe_worker.failed.connect(lambda detail, path=wav_path: self.on_transcription_failed(detail, path))
         self.transcribe_worker.start()
 
@@ -3677,6 +3716,24 @@ class MainWindow(QMainWindow):
             self.tray.showMessage("Voice Input Local", msg, QSystemTrayIcon.Warning, 6000)
         except Exception:  # noqa: BLE001
             pass
+
+    def on_dictation_no_speech(self, wav_path: Path) -> None:
+        # EPIC-10/US-039: VAD не нашёл речи в облачной диктовке — облако не
+        # вызывалось. Ничего не вставляем/копируем; overlay показывает статус.
+        self._stop_dictation_progress()  # US-022
+        self._cleanup_wav(wav_path)
+        self.update_recording_badge()
+        self.unregister_cancel_hotkey()
+        self.toggle_btn.setEnabled(True)
+        self.toggle_btn.setText("Начать запись")
+        self.result_preview_active = False
+        self.result_preview_text = ""
+        if self.cancel_requested:
+            self.status_label.setText("Расшифровка отменена.")
+            return
+        if self.cfg.overlay_enabled and not self.overlay.is_in_picker():
+            self.overlay.show_no_speech()
+        self.status_label.setText("Речь не найдена — ничего не вставлено.")
 
     def on_transcription_done(self, text: str, duration: float, wav_path: Path) -> None:
         self._stop_dictation_progress()  # US-022

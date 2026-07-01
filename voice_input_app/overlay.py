@@ -326,6 +326,11 @@ class RecordingOverlay(QWidget):
     def show_cancelled(self, seconds: int = 4) -> None:
         self._set_state("Отменено", "#a1a1aa", compact=True, auto_ready_ms=max(1, seconds) * 1000)
 
+    def show_no_speech(self, seconds: int = 4) -> None:
+        # EPIC-10/US-039: VAD не нашёл речи в облачной диктовке — это НЕ ошибка,
+        # поэтому нейтральный серый статус с авто-возвратом в Ready.
+        self._set_state("Речь не найдена", "#a1a1aa", compact=True, auto_ready_ms=max(1, seconds) * 1000)
+
     def show_error(self, message: str = "Ошибка", seconds: int = 5) -> None:
         self._set_state(message, "#ef4444", compact=True, auto_ready_ms=max(1, seconds) * 1000)
 
