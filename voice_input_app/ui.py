@@ -3068,37 +3068,6 @@ class MainWindow(QMainWindow):
             log.exception("Hotkey re-register failed: %s", exc)
         log.info("File transcription cancelled")
 
-    def _sync_legacy_fields_to_connections(self) -> None:
-        """US-037 (промежуточное состояние): пока старый UI настроек редактирует
-        устаревшие поля cfg.*_stt_*/postprocess_*/summary_*, переносим их в
-        соответствующие подключения реестра, чтобы новый backend (берёт
-        реквизиты из подключения) видел свежие значения. Удаляется после
-        переноса UI на выбор подключения (TASK-156/157)."""
-        from .models import is_cloud_model_key, cloud_connection_id_of
-        cfg = self.cfg
-        # Диктовка: подключение, на которое ссылается выбранная cloud-модель.
-        if is_cloud_model_key(getattr(cfg, "selected_model", "") or ""):
-            c = cfg.connection_by_id(cloud_connection_id_of(cfg.selected_model))
-            if c is not None:
-                if c.type == "openai" and cfg.openai_stt_api_key:
-                    c.api_key = cfg.openai_stt_api_key
-                    if cfg.openai_stt_base_url:
-                        c.base_url = cfg.openai_stt_base_url
-                elif c.type == "elevenlabs" and cfg.elevenlabs_stt_api_key:
-                    c.api_key = cfg.elevenlabs_stt_api_key
-        # Постобработка.
-        pc = cfg.connection_by_id(getattr(cfg, "postprocess_connection_id", "") or "")
-        if pc is not None and cfg.postprocess_api_key:
-            pc.api_key = cfg.postprocess_api_key
-            if cfg.postprocess_base_url:
-                pc.base_url = cfg.postprocess_base_url
-        # Суммаризация.
-        sc = cfg.connection_by_id(getattr(cfg, "summary_connection_id", "") or "")
-        if sc is not None and cfg.summary_api_key:
-            sc.api_key = cfg.summary_api_key
-            if cfg.summary_base_url:
-                sc.base_url = cfg.summary_base_url
-
     def save_settings(self, *, auto: bool = False) -> None:
         old_hotkey = self.cfg.hotkey
         old_model_runtime = (self.cfg.language, self.cfg.device, self.cfg.compute_type)
@@ -3274,7 +3243,6 @@ class MainWindow(QMainWindow):
                 autostart_error = exc
                 self.autostart_check.setChecked(False)
                 self.cfg.autostart_enabled = False
-        self._sync_legacy_fields_to_connections()
         self.cfg.save()
         self._sync_overlay_visibility()
         if old_model_runtime != (self.cfg.language, self.cfg.device, self.cfg.compute_type):
