@@ -234,6 +234,12 @@ class AppConfig:
     postprocess_system_prompt: str = DEFAULT_POSTPROCESS_SYSTEM_PROMPT
     postprocess_reasoning: bool = False  # режим рассуждения LLM; по умолчанию выключен (скорость)
     postprocess_reasoning_effort: str = "low"  # low | medium | high (применяется при postprocess_reasoning=True)
+    # US-044: пользовательский словарь терминов для постобработки. Список записей
+    # {"term": str, "distortions": str, "context": str}. Термины вшиваются в
+    # системный промпт постобработки (без второго облачного вызова). Применяется
+    # ТОЛЬКО когда включена постобработка (postprocess_enabled); отдельного
+    # тумблера у словаря нет. Пустой список — поведение не меняется.
+    postprocess_glossary: list[dict] = field(default_factory=list)
 
     # US-037: централизованный реестр именованных облачных подключений.
     # Заполняется при миграции старых полей или вручную на вкладке «Модели».

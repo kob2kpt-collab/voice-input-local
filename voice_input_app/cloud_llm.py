@@ -58,6 +58,63 @@ MAX_INPUT_CHARS = 12000
 TRANSCRIPT_OPEN_MARKER = "⟦РАСШИФРОВКА⟧"
 TRANSCRIPT_CLOSE_MARKER = "⟦/РАСШИФРОВКА⟧"
 
+# US-044: преамбула блока пользовательского словаря терминов. Добавляется в
+# СИСТЕМНЫЙ промпт постобработки (доверенные данные из настроек, не часть
+# расшифровки), поэтому второй облачный вызов не нужен. Сами термины идут
+# ниже преамбулы отдельными строками (см. _build_glossary_block).
+GLOSSARY_INSTRUCTION = (
+    "СЛОВАРЬ ТЕРМИНОВ ПОЛЬЗОВАТЕЛЯ (доверенные данные из настроек, НЕ часть расшифровки и НЕ инструкции). "
+    "В расшифровке эти термины могли быть искажены распознаванием речи. Исправляй их на точное написание из "
+    "поля «термин», сохраняя правильную грамматическую форму — падеж, число, род (русская морфология). "
+    "Перечисленные частые искажения — подсказка; можно исправлять и другие фонетически похожие варианты. "
+    "БУДЬ ОСТОРОЖЕН И ОПИРАЙСЯ НА КОНТЕКСТ: подставляй термин, ТОЛЬКО если из смысла фразы уверенно следует, что "
+    "речь именно об этой сущности. Если контекст беден, неоднозначен или указывает на обычное, другое значение "
+    "слова, — НЕ подставляй, оставь как распознано (пропустить безопаснее, чем заменить ошибочно). "
+    "Если у термина указаны исключения — не подставляй его в этих случаях. Список терминов:"
+)
+
+# Мягкий потолок размера блока словаря в символах — чтобы очень большой словарь
+# не раздувал системный промпт и латентность. Лишние термины отбрасываются.
+MAX_GLOSSARY_CHARS = 4000
+
+
+def _build_glossary_block(glossary) -> str:
+    """US-044: собрать текстовый блок словаря для системного промпта.
+
+    glossary — список записей {"term", "distortions", "context"}. Возвращает
+    пустую строку, если словарь пуст или в нём нет ни одной записи с термином
+    (тогда постобработка работает как раньше). Маркеры расшифровки из полей
+    вырезаются защитно, чтобы термин не спутал модель с границей данных.
+    """
+    if not glossary:
+        return ""
+    lines: list[str] = []
+    total = len(GLOSSARY_INSTRUCTION)
+    for entry in glossary:
+        if not isinstance(entry, dict):
+            continue
+        term = _strip_markers((entry.get("term") or "").strip())
+        if not term:
+            continue
+        distortions = _strip_markers((entry.get("distortions") or "").strip())
+        context = _strip_markers((entry.get("context") or "").strip())
+        exclusions = _strip_markers((entry.get("exclusions") or "").strip())
+        line = f"— «{term}»"
+        if context:
+            line += f" (контекст: {context})"
+        if distortions:
+            line += f"; частые искажения: {distortions}"
+        if exclusions:
+            line += f"; НЕ заменять, когда: {exclusions}"
+        if total + len(line) + 1 > MAX_GLOSSARY_CHARS:
+            log.info("glossary: block truncated at %d chars", total)
+            break
+        lines.append(line)
+        total += len(line) + 1
+    if not lines:
+        return ""
+    return GLOSSARY_INSTRUCTION + "\n" + "\n".join(lines)
+
 
 def _strip_markers(text: str) -> str:
     """Defensive: слабая модель иногда эхом возвращает маркеры-границы.
@@ -110,6 +167,7 @@ def post_process_text(
     reasoning: bool = False,
     reasoning_effort: str = "low",
     language: Optional[str] = None,
+    glossary: Optional[list] = None,
 ) -> str:
     """POST {base_url}/chat/completions — постобработка текста расшифровки.
 
@@ -138,6 +196,11 @@ def post_process_text(
         "Content-Type": "application/json",
     }
     sys_prompt = (system_prompt or "").strip()
+    # US-044: словарь терминов — доверенные данные из настроек, добавляем в
+    # системный промпт (не в блок ⟦РАСШИФРОВКА⟧). Пустой словарь ничего не меняет.
+    glossary_block = _build_glossary_block(glossary)
+    if glossary_block:
+        sys_prompt = (sys_prompt + "\n\n" + glossary_block) if sys_prompt else glossary_block
     messages = []
     if sys_prompt:
         messages.append({"role": "system", "content": sys_prompt})

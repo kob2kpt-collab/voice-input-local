@@ -380,10 +380,88 @@ def _word_delta(previous: str, current: str) -> str:
     return " ".join(cur_words[common:]).strip()
 
 
+class TermDialog(QDialog):
+    """US-044: диалог создания/редактирования записи словаря терминов.
+
+    Поля: Термин (обязательно), Частые искажения (через запятую), Контекст/
+    описание, Исключения (когда НЕ заменять). По образцу ConnectionDialog.
+    Возвращает запись через result_entry() при принятии.
+    """
+
+    def __init__(self, parent=None, entry=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Термин словаря" if entry is None else "Редактирование термина")
+        self.setModal(True)
+        self.setMinimumWidth(460)
+        entry = entry or {}
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.term_edit = QLineEdit(str(entry.get("term", "") or ""))
+        self.term_edit.setPlaceholderText("Например: Телеофис")
+        form.addRow("Термин *", self.term_edit)
+
+        self.distortions_edit = QLineEdit(str(entry.get("distortions", "") or ""))
+        self.distortions_edit.setPlaceholderText("Через запятую: телефис, тело офис")
+        form.addRow("Частые искажения", self.distortions_edit)
+
+        self.context_edit = QTextEdit()
+        self.context_edit.setPlainText(str(entry.get("context", "") or ""))
+        self.context_edit.setPlaceholderText(
+            "Что это и когда термин уместен. Например: название нашей компании, производитель оборудования."
+        )
+        self.context_edit.setFixedHeight(64)
+        form.addRow("Контекст/описание", self.context_edit)
+
+        self.exclusions_edit = QTextEdit()
+        self.exclusions_edit.setPlainText(str(entry.get("exclusions", "") or ""))
+        self.exclusions_edit.setPlaceholderText(
+            "Когда НЕ подставлять термин. Например: когда речь об обычном телефонном офисе / колл-центре, а не о компании."
+        )
+        self.exclusions_edit.setFixedHeight(64)
+        form.addRow("Исключения", self.exclusions_edit)
+
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "Обязательно только «Термин». Остальные поля помогают ИИ решать, где замена уместна, а где нет."
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("Subtitle")
+        layout.addWidget(hint)
+
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("Subtitle")
+        layout.addWidget(self.status_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("Сохранить")
+        buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_accept(self) -> None:
+        if not self.term_edit.text().strip():
+            self.status_label.setText("Поле «Термин» обязательно.")
+            return
+        self.accept()
+
+    def result_entry(self) -> dict:
+        return {
+            "term": self.term_edit.text().strip(),
+            "distortions": self.distortions_edit.text().strip(),
+            "context": self.context_edit.toPlainText().strip(),
+            "exclusions": self.exclusions_edit.toPlainText().strip(),
+        }
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Voice Input Local")
+        # US-045: версия в заголовке окна → видна в панели задач и Alt-Tab.
+        self.setWindowTitle(f"Voice Input Local v{__version__}")
         self.resize(980, 720)
         self.setStyleSheet(APP_STYLE)
         self.app_icon = QIcon(str(app_icon_path()))
@@ -500,8 +578,18 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(24, 22, 24, 24)
         root.setSpacing(14)
 
-        title = QLabel("Voice Input Local")
+        # US-045: название + актуальная версия на одной строке. Единый QLabel
+        # с rich-text: версия — инлайн-span, поэтому сидит на той же базовой
+        # линии, что и название (QHBoxLayout+AlignBottom давал сдвиг вниз).
+        # Версия из единого источника __version__ (не хардкод) → обновляется
+        # автоматически при бампе. Видна на всех вкладках (шапка над QTabWidget).
+        title = QLabel(
+            "Voice Input Local"
+            f'&nbsp;&nbsp;<span style="font-size:14px; font-weight:400; color:#a1a1aa;">v{__version__}</span>'
+        )
         title.setObjectName("Title")
+        title.setTextFormat(Qt.RichText)
+        title.setToolTip(f"Версия установленной программы: v{__version__}")
         subtitle = QLabel("Локальный голосовой ввод для Windows: горячая клавиша, индикатор записи, модели, буфер обмена и история.")
         subtitle.setObjectName("Subtitle")
         root.addWidget(title)
@@ -528,6 +616,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._files_tab(), "Файлы")
         self.tabs.addTab(self._models_tab(), "Модели")
         self.tabs.addTab(self._settings_tab(), "Настройки")
+        self.tabs.addTab(self._dictionary_tab(), "Словарь")  # US-044
         self.tabs.addTab(self._api_tab(), "API-Сервер")
         self.tabs.addTab(self._history_tab(), "История")
         root.addWidget(self.tabs, 1)
@@ -3215,6 +3304,9 @@ class MainWindow(QMainWindow):
                 # сессионные подтверждения, чтобы предупреждение показалось снова.
                 self._cloud_warned_session = {k for k in self._cloud_warned_session if not k.startswith("postprocess|")}
                 self._cloud_safe_confirmed_session = {k for k in self._cloud_safe_confirmed_session if not k.startswith("postprocess|")}
+        # US-044: словарь терминов постобработки (данные из таблицы вкладки «Словарь»).
+        if hasattr(self, "dictionary_table"):
+            self.cfg.postprocess_glossary = self._collect_dictionary_from_table()
         self.cfg.language = str(self.language_combo.currentData())
         self.cfg.device = str(self.device_combo.currentData())
         self.cfg.compute_type = str(self.compute_combo.currentData())
@@ -4609,6 +4701,193 @@ class MainWindow(QMainWindow):
         self.save_settings(auto=True)
         self.status_label.setText("Системный промпт постобработки сброшен к дефолту.")
 
+    # ── US-044: вкладка «Словарь» — пользовательский словарь терминов ──────
+    def _dictionary_tab(self) -> QWidget:
+        """US-044: вкладка со словарём терминов для облачной постобработки.
+
+        Таблица только отображает записи; добавление/правка — через диалог
+        TermDialog (двойной клик или кнопки), по образцу окна подключения.
+        Словарь применяется, только когда включена облачная постобработка
+        (см. _refresh_dictionary_tab_state); отдельного тумблера нет — это
+        данные для постобработки.
+        """
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        title = QLabel("Словарь терминов")
+        title.setObjectName("Title")
+        title.setStyleSheet("font-size: 16px;")
+        layout.addWidget(title)
+
+        subtitle = QLabel(
+            "Специфические термины (бренды, имена, аббревиатуры, тех. лексика), которые "
+            "распознавание часто коверкает. При включённой облачной постобработке ИИ "
+            "исправляет их автоматически — с учётом контекста и правильной падежной формы. "
+            "Двойной клик по строке — редактировать. Обязателен только «Термин»."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setObjectName("Subtitle")
+        layout.addWidget(subtitle)
+
+        # Статус-строка, привязанная к состоянию постобработки (US-044 AC-5).
+        self.dictionary_status_label = QLabel("")
+        self.dictionary_status_label.setWordWrap(True)
+        layout.addWidget(self.dictionary_status_label)
+
+        self.dictionary_table = QTableWidget(0, 4)
+        self.dictionary_table.setHorizontalHeaderLabels(
+            ["Термин", "Частые искажения", "Контекст/описание", "Исключения (когда НЕ заменять)"]
+        )
+        _dhh = self.dictionary_table.horizontalHeader()
+        _dhh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        _dhh.setSectionResizeMode(1, QHeaderView.Stretch)
+        _dhh.setSectionResizeMode(2, QHeaderView.Stretch)
+        _dhh.setSectionResizeMode(3, QHeaderView.Stretch)
+        self.dictionary_table.verticalHeader().setVisible(False)
+        self.dictionary_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.dictionary_table.setSelectionMode(QTableWidget.SingleSelection)
+        # Правка — только через диалог (не inline).
+        self.dictionary_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.dictionary_table.cellDoubleClicked.connect(self._on_dictionary_edit)
+        layout.addWidget(self.dictionary_table, 1)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("Добавить термин")
+        add_btn.setFocusPolicy(Qt.NoFocus)  # TASK-047: Space (часть хоткея) не должен активировать кнопку
+        add_btn.setAutoDefault(False)
+        add_btn.clicked.connect(self._on_dictionary_add)
+        edit_btn = QPushButton("Изменить")
+        edit_btn.setFocusPolicy(Qt.NoFocus)
+        edit_btn.setAutoDefault(False)
+        edit_btn.clicked.connect(self._on_dictionary_edit)
+        del_btn = QPushButton("Удалить выбранный")
+        del_btn.setObjectName("Danger")
+        del_btn.setFocusPolicy(Qt.NoFocus)
+        del_btn.setAutoDefault(False)
+        del_btn.clicked.connect(self._on_dictionary_delete_row)
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(edit_btn)
+        btn_row.addWidget(del_btn)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+        self._populate_dictionary_table()
+        self._refresh_dictionary_tab_state()
+        return tab
+
+    def _populate_dictionary_table(self) -> None:
+        """US-044: заполнить таблицу словаря из cfg.postprocess_glossary."""
+        tbl = self.dictionary_table
+        tbl.blockSignals(True)
+        try:
+            tbl.setRowCount(0)
+            for entry in (getattr(self.cfg, "postprocess_glossary", None) or []):
+                if not isinstance(entry, dict):
+                    continue
+                r = tbl.rowCount()
+                tbl.insertRow(r)
+                self._set_dictionary_row(r, entry)
+        finally:
+            tbl.blockSignals(False)
+
+    def _set_dictionary_row(self, r: int, entry: dict) -> None:
+        """US-044: записать значения записи словаря в строку таблицы."""
+        tbl = self.dictionary_table
+        tbl.setItem(r, 0, QTableWidgetItem(str(entry.get("term", "") or "")))
+        tbl.setItem(r, 1, QTableWidgetItem(str(entry.get("distortions", "") or "")))
+        tbl.setItem(r, 2, QTableWidgetItem(str(entry.get("context", "") or "")))
+        tbl.setItem(r, 3, QTableWidgetItem(str(entry.get("exclusions", "") or "")))
+
+    def _dictionary_entry_from_row(self, r: int) -> dict:
+        """US-044: прочитать запись словаря из строки таблицы (полный текст)."""
+        tbl = self.dictionary_table
+        def _cell(c: int) -> str:
+            it = tbl.item(r, c)
+            return it.text() if it is not None else ""
+        return {
+            "term": _cell(0),
+            "distortions": _cell(1),
+            "context": _cell(2),
+            "exclusions": _cell(3),
+        }
+
+    def _collect_dictionary_from_table(self) -> list:
+        """US-044: собрать список записей словаря из таблицы. Строки без термина
+        не сохраняются."""
+        tbl = self.dictionary_table
+        out: list[dict] = []
+        for r in range(tbl.rowCount()):
+            entry = {k: (v or "").strip() for k, v in self._dictionary_entry_from_row(r).items()}
+            if not entry.get("term"):
+                continue
+            out.append(entry)
+        return out
+
+    def _on_dictionary_add(self) -> None:
+        """US-044: добавить термин через диалог TermDialog."""
+        dlg = TermDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        tbl = self.dictionary_table
+        r = tbl.rowCount()
+        tbl.blockSignals(True)
+        tbl.insertRow(r)
+        self._set_dictionary_row(r, dlg.result_entry())
+        tbl.blockSignals(False)
+        tbl.setCurrentCell(r, 0)
+        self.schedule_settings_autosave()
+
+    def _on_dictionary_edit(self, *args) -> None:
+        """US-044: редактировать выбранную запись словаря через TermDialog.
+
+        Вызывается кнопкой «Изменить» и двойным кликом (cellDoubleClicked
+        передаёт row/col — игнорируем, берём текущую строку)."""
+        r = self.dictionary_table.currentRow()
+        if r < 0:
+            return
+        dlg = TermDialog(self, entry=self._dictionary_entry_from_row(r))
+        if dlg.exec() != QDialog.Accepted:
+            return
+        tbl = self.dictionary_table
+        tbl.blockSignals(True)
+        self._set_dictionary_row(r, dlg.result_entry())
+        tbl.blockSignals(False)
+        self.schedule_settings_autosave()
+
+    def _on_dictionary_delete_row(self) -> None:
+        """US-044: удалить выбранную строку словаря и сохранить."""
+        tbl = self.dictionary_table
+        r = tbl.currentRow()
+        if r < 0:
+            return
+        tbl.removeRow(r)
+        self.schedule_settings_autosave()
+
+    def _refresh_dictionary_tab_state(self) -> None:
+        """US-044: отразить состояние постобработки. Таблица остаётся
+        редактируемой всегда; меняются только цвет статуса и вид таблицы."""
+        if not hasattr(self, "dictionary_table"):
+            return
+        enabled = bool(
+            getattr(self, "postprocess_enabled_check", None)
+            and self.postprocess_enabled_check.isChecked()
+        )
+        if enabled:
+            self.dictionary_status_label.setText(
+                "Словарь применяется: включена облачная постобработка."
+            )
+            self.dictionary_status_label.setStyleSheet("color: #4ade80;")  # зелёный — активно
+            self.dictionary_table.setStyleSheet("")
+        else:
+            self.dictionary_status_label.setText(
+                "Постобработка выключена — словарь сейчас не применяется. Термины можно "
+                "добавлять впрок; включите постобработку на вкладке «Модели» → «Облачные модели»."
+            )
+            self.dictionary_status_label.setStyleSheet("color: #71717a;")  # приглушённый серый
+            self.dictionary_table.setStyleSheet("color: #71717a;")  # приглушённый текст таблицы
+
     def _on_postprocess_enabled_toggled(self, checked: bool) -> None:
         """US-034: показать/скрыть блок настроек постобработки."""
         # US-018: постобработка работает ТОЛЬКО через облако — при включении
@@ -4620,9 +4899,11 @@ class MainWindow(QMainWindow):
                 self.postprocess_enabled_check.blockSignals(False)
                 if hasattr(self, "postprocess_group"):
                     self.postprocess_group.setVisible(False)
+                self._refresh_dictionary_tab_state()  # US-044: словарь снова не применяется
                 return
         if hasattr(self, "postprocess_group"):
             self.postprocess_group.setVisible(bool(checked))
+        self._refresh_dictionary_tab_state()  # US-044: обновить статус вкладки «Словарь»
 
     def _on_postprocess_reasoning_toggled(self, checked: bool) -> None:
         """US-034: показать/скрыть выбор уровня рассуждения."""
