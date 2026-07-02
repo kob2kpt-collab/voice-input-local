@@ -628,7 +628,12 @@ class PostProcessWorker(QThread):
                 system_prompt=getattr(self.cfg, "postprocess_system_prompt", "") or "",
                 reasoning=bool(getattr(self.cfg, "postprocess_reasoning", False)),
                 reasoning_effort=getattr(self.cfg, "postprocess_reasoning_effort", "low") or "low",
-                glossary=getattr(self.cfg, "postprocess_glossary", None),  # US-044: словарь терминов
+                # US-044/US-046: словарь терминов — только если включён мастер-тумблер
+                glossary=(
+                    getattr(self.cfg, "postprocess_glossary", None)
+                    if getattr(self.cfg, "postprocess_glossary_enabled", True)
+                    else None
+                ),
             )
             self.finished_text.emit(result or self.text)
         except Exception as exc:  # noqa: BLE001

@@ -3307,6 +3307,9 @@ class MainWindow(QMainWindow):
         # US-044: словарь терминов постобработки (данные из таблицы вкладки «Словарь»).
         if hasattr(self, "dictionary_table"):
             self.cfg.postprocess_glossary = self._collect_dictionary_from_table()
+        # US-046: мастер-тумблер словаря.
+        if hasattr(self, "postprocess_glossary_enabled_check"):
+            self.cfg.postprocess_glossary_enabled = self.postprocess_glossary_enabled_check.isChecked()
         self.cfg.language = str(self.language_combo.currentData())
         self.cfg.device = str(self.device_combo.currentData())
         self.cfg.compute_type = str(self.compute_combo.currentData())
@@ -4703,13 +4706,15 @@ class MainWindow(QMainWindow):
 
     # ── US-044: вкладка «Словарь» — пользовательский словарь терминов ──────
     def _dictionary_tab(self) -> QWidget:
-        """US-044: вкладка со словарём терминов для облачной постобработки.
+        """US-044/US-046: вкладка со словарём терминов для облачной постобработки.
 
+        Три уровня, вложенные гейтами: постобработка → словарь → термин.
+        - Мастер-чекбокс «Включить словарь» активен только при включённой
+          постобработке (US-046).
+        - Колонка «Вкл» (чекбокс у каждого термина) активна только при
+          включённом словаре (US-046).
         Таблица только отображает записи; добавление/правка — через диалог
         TermDialog (двойной клик или кнопки), по образцу окна подключения.
-        Словарь применяется, только когда включена облачная постобработка
-        (см. _refresh_dictionary_tab_state); отдельного тумблера нет — это
-        данные для постобработки.
         """
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -4725,32 +4730,48 @@ class MainWindow(QMainWindow):
             "Специфические термины (бренды, имена, аббревиатуры, тех. лексика), которые "
             "распознавание часто коверкает. При включённой облачной постобработке ИИ "
             "исправляет их автоматически — с учётом контекста и правильной падежной формы. "
-            "Двойной клик по строке — редактировать. Обязателен только «Термин»."
+            "Двойной клик по строке — редактировать. Обязателен только «Термин». "
+            "Колонка «Вкл» включает/отключает отдельные термины."
         )
         subtitle.setWordWrap(True)
         subtitle.setObjectName("Subtitle")
         layout.addWidget(subtitle)
 
-        # Статус-строка, привязанная к состоянию постобработки (US-044 AC-5).
+        # US-046: мастер-тумблер словаря. Состояние ставим ДО подключения сигнала,
+        # чтобы стартовый setChecked не дёргал автосохранение.
+        self.postprocess_glossary_enabled_check = QCheckBox("Включить словарь")
+        self.postprocess_glossary_enabled_check.setToolTip(
+            "Применять словарь терминов при облачной постобработке. Доступно только когда включена постобработка."
+        )
+        self.postprocess_glossary_enabled_check.setChecked(
+            bool(getattr(self.cfg, "postprocess_glossary_enabled", True))
+        )
+        self.postprocess_glossary_enabled_check.toggled.connect(self._on_glossary_enabled_toggled)
+        layout.addWidget(self.postprocess_glossary_enabled_check)
+
+        # Статус-строка, привязанная к состоянию постобработки/словаря.
         self.dictionary_status_label = QLabel("")
         self.dictionary_status_label.setWordWrap(True)
         layout.addWidget(self.dictionary_status_label)
 
-        self.dictionary_table = QTableWidget(0, 4)
+        self.dictionary_table = QTableWidget(0, 5)
         self.dictionary_table.setHorizontalHeaderLabels(
-            ["Термин", "Частые искажения", "Контекст/описание", "Исключения (когда НЕ заменять)"]
+            ["Вкл", "Термин", "Частые искажения", "Контекст/описание", "Исключения (когда НЕ заменять)"]
         )
         _dhh = self.dictionary_table.horizontalHeader()
         _dhh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        _dhh.setSectionResizeMode(1, QHeaderView.Stretch)
+        _dhh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         _dhh.setSectionResizeMode(2, QHeaderView.Stretch)
         _dhh.setSectionResizeMode(3, QHeaderView.Stretch)
+        _dhh.setSectionResizeMode(4, QHeaderView.Stretch)
         self.dictionary_table.verticalHeader().setVisible(False)
         self.dictionary_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.dictionary_table.setSelectionMode(QTableWidget.SingleSelection)
-        # Правка — только через диалог (не inline).
+        # Правка текста — только через диалог (не inline). Чекбокс «Вкл» работает
+        # и при NoEditTriggers (клик по индикатору), сигнал — itemChanged.
         self.dictionary_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.dictionary_table.cellDoubleClicked.connect(self._on_dictionary_edit)
+        self.dictionary_table.itemChanged.connect(self._on_dictionary_item_changed)
         layout.addWidget(self.dictionary_table, 1)
 
         btn_row = QHBoxLayout()
@@ -4793,67 +4814,94 @@ class MainWindow(QMainWindow):
             tbl.blockSignals(False)
 
     def _set_dictionary_row(self, r: int, entry: dict) -> None:
-        """US-044: записать значения записи словаря в строку таблицы."""
+        """US-044/US-046: записать запись словаря в строку. Колонка 0 — чекбокс
+        «Вкл» (enabled, дефолт True); колонки 1..4 — текстовые поля."""
         tbl = self.dictionary_table
-        tbl.setItem(r, 0, QTableWidgetItem(str(entry.get("term", "") or "")))
-        tbl.setItem(r, 1, QTableWidgetItem(str(entry.get("distortions", "") or "")))
-        tbl.setItem(r, 2, QTableWidgetItem(str(entry.get("context", "") or "")))
-        tbl.setItem(r, 3, QTableWidgetItem(str(entry.get("exclusions", "") or "")))
+        chk = QTableWidgetItem()
+        chk.setFlags(Qt.ItemIsSelectable | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+        chk.setCheckState(Qt.Checked if entry.get("enabled", True) else Qt.Unchecked)
+        chk.setTextAlignment(Qt.AlignCenter)
+        tbl.setItem(r, 0, chk)
+        tbl.setItem(r, 1, QTableWidgetItem(str(entry.get("term", "") or "")))
+        tbl.setItem(r, 2, QTableWidgetItem(str(entry.get("distortions", "") or "")))
+        tbl.setItem(r, 3, QTableWidgetItem(str(entry.get("context", "") or "")))
+        tbl.setItem(r, 4, QTableWidgetItem(str(entry.get("exclusions", "") or "")))
 
     def _dictionary_entry_from_row(self, r: int) -> dict:
-        """US-044: прочитать запись словаря из строки таблицы (полный текст)."""
+        """US-044/US-046: прочитать запись словаря из строки (полный текст +
+        флаг enabled из чекбокса колонки 0)."""
         tbl = self.dictionary_table
         def _cell(c: int) -> str:
             it = tbl.item(r, c)
             return it.text() if it is not None else ""
+        chk = tbl.item(r, 0)
+        enabled = True if chk is None else (chk.checkState() == Qt.Checked)
         return {
-            "term": _cell(0),
-            "distortions": _cell(1),
-            "context": _cell(2),
-            "exclusions": _cell(3),
+            "term": _cell(1),
+            "distortions": _cell(2),
+            "context": _cell(3),
+            "exclusions": _cell(4),
+            "enabled": enabled,
         }
 
     def _collect_dictionary_from_table(self) -> list:
-        """US-044: собрать список записей словаря из таблицы. Строки без термина
-        не сохраняются."""
+        """US-044/US-046: собрать список записей словаря из таблицы. Строки без
+        термина не сохраняются. enabled сохраняется как bool."""
         tbl = self.dictionary_table
         out: list[dict] = []
         for r in range(tbl.rowCount()):
-            entry = {k: (v or "").strip() for k, v in self._dictionary_entry_from_row(r).items()}
-            if not entry.get("term"):
+            raw = self._dictionary_entry_from_row(r)
+            term = (raw.get("term") or "").strip()
+            if not term:
                 continue
-            out.append(entry)
+            out.append({
+                "term": term,
+                "distortions": (raw.get("distortions") or "").strip(),
+                "context": (raw.get("context") or "").strip(),
+                "exclusions": (raw.get("exclusions") or "").strip(),
+                "enabled": bool(raw.get("enabled", True)),
+            })
         return out
 
     def _on_dictionary_add(self) -> None:
-        """US-044: добавить термин через диалог TermDialog."""
+        """US-044: добавить термин через диалог TermDialog (новый — включён)."""
         dlg = TermDialog(self)
         if dlg.exec() != QDialog.Accepted:
             return
+        entry = dlg.result_entry()
+        entry["enabled"] = True
         tbl = self.dictionary_table
         r = tbl.rowCount()
         tbl.blockSignals(True)
         tbl.insertRow(r)
-        self._set_dictionary_row(r, dlg.result_entry())
+        self._set_dictionary_row(r, entry)
         tbl.blockSignals(False)
-        tbl.setCurrentCell(r, 0)
+        tbl.setCurrentCell(r, 1)
+        self._refresh_dictionary_tab_state()  # гейт чекбокса новой строки
         self.schedule_settings_autosave()
 
     def _on_dictionary_edit(self, *args) -> None:
         """US-044: редактировать выбранную запись словаря через TermDialog.
 
         Вызывается кнопкой «Изменить» и двойным кликом (cellDoubleClicked
-        передаёт row/col — игнорируем, берём текущую строку)."""
+        передаёт row/col). Двойной клик по колонке «Вкл» (0) диалог не открывает.
+        Флаг enabled сохраняется (диалог его не трогает)."""
+        if len(args) >= 2 and args[1] == 0:
+            return
         r = self.dictionary_table.currentRow()
         if r < 0:
             return
-        dlg = TermDialog(self, entry=self._dictionary_entry_from_row(r))
+        prev = self._dictionary_entry_from_row(r)
+        dlg = TermDialog(self, entry=prev)
         if dlg.exec() != QDialog.Accepted:
             return
+        entry = dlg.result_entry()
+        entry["enabled"] = bool(prev.get("enabled", True))
         tbl = self.dictionary_table
         tbl.blockSignals(True)
-        self._set_dictionary_row(r, dlg.result_entry())
+        self._set_dictionary_row(r, entry)
         tbl.blockSignals(False)
+        self._refresh_dictionary_tab_state()
         self.schedule_settings_autosave()
 
     def _on_dictionary_delete_row(self) -> None:
@@ -4865,28 +4913,68 @@ class MainWindow(QMainWindow):
         tbl.removeRow(r)
         self.schedule_settings_autosave()
 
+    def _on_dictionary_item_changed(self, *args) -> None:
+        """US-046: пользователь переключил чекбокс «Вкл» термина → автосохранение.
+        Программные изменения таблицы идут с blockSignals, сюда не попадают."""
+        self.schedule_settings_autosave()
+
+    def _on_glossary_enabled_toggled(self, checked: bool) -> None:
+        """US-046: мастер-тумблер словаря → пере-гейт чекбоксов и автосохранение."""
+        self._refresh_dictionary_tab_state()
+        self.schedule_settings_autosave()
+
+    def _set_dictionary_checkboxes_enabled(self, enabled: bool) -> None:
+        """US-046: включить/заблокировать чекбоксы «Вкл» у всех терминов.
+        Меняем только флаги колонки 0; сигналы блокируем, чтобы setFlags не
+        триггерил itemChanged (ложное автосохранение)."""
+        tbl = self.dictionary_table
+        base = Qt.ItemIsSelectable
+        flags = (base | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled) if enabled else base
+        tbl.blockSignals(True)
+        try:
+            for r in range(tbl.rowCount()):
+                it = tbl.item(r, 0)
+                if it is not None:
+                    it.setFlags(flags)
+        finally:
+            tbl.blockSignals(False)
+
     def _refresh_dictionary_tab_state(self) -> None:
-        """US-044: отразить состояние постобработки. Таблица остаётся
-        редактируемой всегда; меняются только цвет статуса и вид таблицы."""
+        """US-044/US-046: отразить три состояния (постобработка → словарь →
+        термин). Таблица редактируема всегда; гейтятся только мастер-чекбокс
+        (по постобработке) и чекбоксы «Вкл» (по словарю)."""
         if not hasattr(self, "dictionary_table"):
             return
-        enabled = bool(
+        pp_on = bool(
             getattr(self, "postprocess_enabled_check", None)
             and self.postprocess_enabled_check.isChecked()
         )
-        if enabled:
+        master = getattr(self, "postprocess_glossary_enabled_check", None)
+        # Мастер-чекбокс активен только при включённой постобработке (US-046).
+        if master is not None:
+            master.setEnabled(pp_on)
+        gloss_on = pp_on and bool(master is not None and master.isChecked())
+        # Чекбоксы «Вкл» терминов — только при включённом словаре (US-046).
+        self._set_dictionary_checkboxes_enabled(gloss_on)
+        if not pp_on:
             self.dictionary_status_label.setText(
-                "Словарь применяется: включена облачная постобработка."
+                "Постобработка выключена — словарь недоступен. Термины можно добавлять впрок; "
+                "включите постобработку на вкладке «Модели» → «Облачные модели»."
+            )
+            self.dictionary_status_label.setStyleSheet("color: #71717a;")
+            self.dictionary_table.setStyleSheet("color: #71717a;")
+        elif not gloss_on:
+            self.dictionary_status_label.setText(
+                "Словарь выключен — термины к постобработке не применяются. Включите чекбокс «Включить словарь» выше."
+            )
+            self.dictionary_status_label.setStyleSheet("color: #71717a;")
+            self.dictionary_table.setStyleSheet("color: #71717a;")
+        else:
+            self.dictionary_status_label.setText(
+                "Словарь применяется: включены постобработка и словарь. Отдельные термины — чекбоксом «Вкл»."
             )
             self.dictionary_status_label.setStyleSheet("color: #4ade80;")  # зелёный — активно
             self.dictionary_table.setStyleSheet("")
-        else:
-            self.dictionary_status_label.setText(
-                "Постобработка выключена — словарь сейчас не применяется. Термины можно "
-                "добавлять впрок; включите постобработку на вкладке «Модели» → «Облачные модели»."
-            )
-            self.dictionary_status_label.setStyleSheet("color: #71717a;")  # приглушённый серый
-            self.dictionary_table.setStyleSheet("color: #71717a;")  # приглушённый текст таблицы
 
     def _on_postprocess_enabled_toggled(self, checked: bool) -> None:
         """US-034: показать/скрыть блок настроек постобработки."""

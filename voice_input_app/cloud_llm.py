@@ -93,6 +93,10 @@ def _build_glossary_block(glossary) -> str:
     for entry in glossary:
         if not isinstance(entry, dict):
             continue
+        # US-046: пропускаем отключённые термины (enabled=False). Отсутствие
+        # ключа = включён (обратная совместимость со старыми записями US-044).
+        if not entry.get("enabled", True):
+            continue
         term = _strip_markers((entry.get("term") or "").strip())
         if not term:
             continue
