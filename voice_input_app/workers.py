@@ -125,6 +125,7 @@ class TranscribeWorker(QThread):
             # (шлём оригинал). Локальную диктовку не трогаем — там vad_filter.
             send_path = self.wav_path
             trim_artifact: Path | None = None
+            precut_chunks = None
             if (
                 not self.is_live
                 and is_cloud_model_key(self.model_key)
@@ -132,9 +133,11 @@ class TranscribeWorker(QThread):
             ):
                 try:
                     from .vad import trim_silence_for_cloud
+                    _max_chunk = max(10, int(getattr(self.cfg, "cloud_max_chunk_seconds", 60) or 60))
                     trim = trim_silence_for_cloud(
                         self.wav_path,
                         aggressiveness=getattr(self.cfg, "cloud_trim_aggressiveness", "medium"),
+                        max_chunk_seconds=_max_chunk,
                     )
                     if trim.no_speech:
                         log.info("VAD: речь не найдена (%.3fс) — облако не вызываем", trim.speech_seconds)
@@ -142,17 +145,26 @@ class TranscribeWorker(QThread):
                         return
                     if trim.trimmed and trim.wav_path is not None:
                         send_path = trim.wav_path
-                        trim_artifact = trim.wav_path
-                        log.info("VAD: отправляю в облако обрезанный WAV (%.3fс речи)", trim.speech_seconds)
+                        trim_artifact = trim.temp_dir
+                        # US-040: >1 корзины → нарезка по паузам VAD, иначе одиночный запрос
+                        precut_chunks = trim.chunks if len(trim.chunks) > 1 else None
+                        log.info(
+                            "VAD: в облако %.3fс речи, чанков=%d%s",
+                            trim.speech_seconds, len(trim.chunks),
+                            " (VAD-aware нарезка)" if precut_chunks else "",
+                        )
                 except Exception as vad_exc:  # noqa: BLE001
                     log.exception("VAD pre-trim failed, sending original audio (fail-open): %s", vad_exc)
                     send_path = self.wav_path
+                    trim_artifact = None
+                    precut_chunks = None
             try:
                 text, used_fallback, fallback_key, reason = self.manager.transcribe_with_fallback(
                     self.model_key, send_path, self.cfg, is_live=self.is_live,
                     openai_prompt=_prompt_val,
                     progress_callback=_progress_cb,
                     duration_seconds=float(self.duration or 0.0),
+                    precut_chunks=precut_chunks,
                 )
             finally:
                 if trim_artifact is not None:

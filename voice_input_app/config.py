@@ -213,7 +213,7 @@ class AppConfig:
     # ПЕРЕД отправкой звука в облачный STT. Применяется ТОЛЬКО к диктовке —
     # убирает галлюцинации Whisper на паузах/тишине. Файловый путь не затронут.
     cloud_trim_silence_enabled: bool = True
-    cloud_trim_aggressiveness: str = "medium"  # low | medium | high
+    cloud_trim_aggressiveness: int = 50  # уровень 0..100 (ползунок в UI); 50 ≈ прежний «medium»
     # US-018: устарело. Раньше хранило провайдеров, для которых предупреждение
     # подавлено «между перезапусками». По решению владельца продукта подавление
     # стало СЕССИОННЫМ (в памяти MainWindow), поэтому поле больше не используется
@@ -266,6 +266,16 @@ class AppConfig:
                 if isinstance(c, dict)
             ]
             cfg = cls(**base)
+            # v4.14 (ползунок агрессивности): старое строковое значение
+            # low/medium/high (или иная строка) → целое 0..100; число — клампим.
+            _agg = cfg.cloud_trim_aggressiveness
+            if isinstance(_agg, str):
+                cfg.cloud_trim_aggressiveness = {"low": 20, "medium": 50, "high": 80}.get(_agg.strip().lower(), 50)
+            else:
+                try:
+                    cfg.cloud_trim_aggressiveness = max(0, min(100, int(_agg)))
+                except (TypeError, ValueError):
+                    cfg.cloud_trim_aggressiveness = 50
             # US-037: одноразовая миграция старых раздельных реквизитов в реестр
             # подключений. Только если реестр пуст (старый config.json).
             if not cfg.cloud_connections:

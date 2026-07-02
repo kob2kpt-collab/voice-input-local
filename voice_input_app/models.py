@@ -849,6 +849,7 @@ class ModelManager:
         with_diarization: bool = False,
         speaker_count: str = "auto",
         on_segments_final=None,
+        precut_chunks=None,
     ) -> str:
         """Расшифровка через облачный STT (US-015, US-016) с автонарезкой (US-032).
 
@@ -909,6 +910,7 @@ class ModelManager:
                 cancel_check=cancel_check,
                 chunk_local_fallback=chunk_local_fallback,
                 with_timestamps=with_timestamps,
+                precut_chunks=precut_chunks,  # US-040
             )
         elif provider == "elevenlabs":
             def _one(chunk_path: Path):
@@ -930,6 +932,7 @@ class ModelManager:
                 cancel_check=cancel_check,
                 chunk_local_fallback=chunk_local_fallback,
                 with_timestamps=with_timestamps,
+                precut_chunks=precut_chunks,  # US-040
             )
         else:
             raise RuntimeError(f"Неподдерживаемый cloud-провайдер: {provider}")
@@ -1017,6 +1020,7 @@ class ModelManager:
         on_segments_final=None,
         progress_callback=None,
         duration_seconds: float = 0.0,
+        precut_chunks=None,
     ) -> tuple[str, bool, str, str]:
         """Обёртка над transcribe() с автоматическим fallback на локальную модель.
 
@@ -1055,6 +1059,7 @@ class ModelManager:
                 with_diarization=with_diarization,
                 speaker_count=speaker_count,
                 on_segments_final=on_segments_final,
+                precut_chunks=precut_chunks,  # US-040
             )
             return text, False, key, ""
         except _cs.CloudSttError as exc:

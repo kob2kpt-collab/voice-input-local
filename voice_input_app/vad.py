@@ -1,9 +1,15 @@
 """VAD-обёртка для вырезания тишины перед отправкой звука в облачный STT.
 
-EPIC-10 / US-039. Цель — убрать галлюцинации Whisper на участках тишины и в
-паузах: облачные модели (в отличие от локального faster-whisper с vad_filter)
-получают сырой звук и «додумывают» фразы в паузах. Здесь мы локально находим
-речь и отправляем в облако только её.
+EPIC-10 / US-039 / US-040. Цель — убрать галлюцинации Whisper на участках
+тишины и в паузах: облачные модели (в отличие от локального faster-whisper с
+vad_filter) получают сырой звук и «додумывают» фразы в паузах. Здесь мы локально
+находим речь и отправляем в облако только её.
+
+US-040: VAD ещё и задаёт границы нарезки на чанки. Раньше обрезанный звук резался
+жёсткой сеткой (i × chunk), из-за чего граница падала внутри слова и на стыке
+возникал дубль (перехлёст склеивался дважды). Теперь сегменты речи группируются
+в корзины ≤ chunk, а разрез ставится ТОЛЬКО на паузе между фразами (аналог
+переноса слов по пробелам). VAD и чанкинг — одна операция, не две конкурирующие.
 
 Движок — Silero VAD, встроенный в faster-whisper (faster_whisper.vad). Он не
 требует загруженной модели Whisper и не создаёт ресурсного конфликта с
@@ -15,20 +21,21 @@ InferenceSession потокобезопасен). Ноль новых завис
 нестабильным между версиями, достаточно переписать detect_speech_segments()
 на пакет silero-vad, не трогая вызовы выше (workers.py) и UI.
 
-Применяется ТОЛЬКО к облачной диктовке (single-request, без таймкодов).
-Файловый путь (таймкоды/диаризация/нарезка на чанки) здесь не затрагивается.
+Применяется ТОЛЬКО к облачной диктовке (без таймкодов). Файловый путь
+(таймкоды/диаризация) здесь не затрагивается.
 """
 
 from __future__ import annotations
 
+import shutil
 import tempfile
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
-from .audio_files import cleanup_prepared_file, convert_media_to_wav_16k_mono
+from .audio_files import AudioChunk, cleanup_prepared_file, convert_media_to_wav_16k_mono
 from .logger import get_logger
 
 log = get_logger("vad")
@@ -41,67 +48,93 @@ VAD_SAMPLE_RATE = 16000
 # идём. Порог намеренно мал, чтобы не терять короткие реплики вроде «да»/«ок».
 MIN_SPEECH_SECONDS = 0.20
 
-# Пресеты «агрессивности» вырезания тишины. Чем агрессивнее — тем выше порог
-# вероятности речи (threshold), короче требуемая пауза для разреза
-# (min_silence_duration_ms) и меньше паддинг вокруг речи (speech_pad_ms).
-# Дефолт — "medium". На "low" VAD максимально бережный к тихой речи.
-_AGGRESSIVENESS_PRESETS: dict[str, dict[str, float]] = {
-    "low": {
-        "threshold": 0.30,
-        "min_silence_duration_ms": 700,
-        "speech_pad_ms": 400,
-        "min_speech_duration_ms": 120,
-    },
-    "medium": {
-        "threshold": 0.50,
-        "min_silence_duration_ms": 500,
-        "speech_pad_ms": 300,
-        "min_speech_duration_ms": 200,
-    },
-    "high": {
-        "threshold": 0.60,
-        "min_silence_duration_ms": 350,
-        "speech_pad_ms": 200,
-        "min_speech_duration_ms": 250,
-    },
+# US-040: перехлёст на случай жёсткого разреза ВНУТРИ непрерывного сегмента,
+# который длиннее размера чанка (пауз нет — резать больше негде). Для обычных
+# разрезов по паузам перехлёст не нужен (режем в тишине).
+HARDCUT_OVERLAP_SECONDS = 0.3
+
+# «Агрессивность» вырезания тишины — непрерывный уровень 0..100 (ползунок в UI).
+# 0 = максимально бережно к тихой речи (режем меньше), 100 = агрессивно режем
+# паузы. Уровень линейно интерполируется в параметры Silero VAD. 50 ≈ прежний
+# пресет «средняя». Чем выше уровень — тем выше порог вероятности речи
+# (threshold), короче требуемая пауза (min_silence) и меньше паддинг (speech_pad).
+AGGRESSIVENESS_MIN = 0
+AGGRESSIVENESS_MAX = 100
+DEFAULT_AGGRESSIVENESS = 50
+
+# Границы интерполяции: (значение при уровне 0 — бережно, значение при 100 — агрессивно).
+_AGG_ENDPOINTS: dict[str, tuple[float, float]] = {
+    "threshold": (0.25, 0.70),
+    "min_silence_duration_ms": (800.0, 250.0),
+    "speech_pad_ms": (500.0, 100.0),
+    "min_speech_duration_ms": (100.0, 300.0),
 }
-DEFAULT_AGGRESSIVENESS = "medium"
+# Обратная совместимость: старые строковые пресеты (config < v4.14 ползунка) → уровень.
+_LEGACY_LEVELS = {"low": 20, "medium": 50, "high": 80}
 
 
 @dataclass(frozen=True)
 class TrimResult:
     """Результат пре-обрезки тишины для облачной диктовки.
 
-    wav_path      — путь к WAV для отправки (обрезанный при trimmed=True,
-                    иначе не имеет смысла: см. no_speech).
+    wav_path      — полный speech-only WAV (склейка всей речи без тишины). Идёт
+                    в облако при одном чанке и используется локальным fallback.
+    chunks        — список AudioChunk (≥1) для параллельной отправки в облако.
+                    Границы поставлены по паузам (US-040). При >1 элементе caller
+                    прокидывает их как precut_chunks в split_and_transcribe.
     trimmed       — True, если построен speech-only WAV (нужна очистка через
-                    cleanup_trim_artifact).
+                    cleanup_trim_artifact(temp_dir)).
     no_speech     — True, если речи не найдено (или её меньше MIN_SPEECH_SECONDS):
                     вызывающий НЕ идёт в облако и показывает «Речь не найдена».
     speech_seconds — суммарная длительность найденной речи (для логов).
+    temp_dir      — папка со всеми артефактами (wav_path + chunk-файлы); очищается
+                    целиком через cleanup_trim_artifact.
     """
 
     wav_path: Path | None
-    trimmed: bool
-    no_speech: bool
-    speech_seconds: float
+    chunks: list = field(default_factory=list)
+    trimmed: bool = False
+    no_speech: bool = False
+    speech_seconds: float = 0.0
+    temp_dir: Path | None = None
 
 
-def normalize_aggressiveness(value: str | None) -> str:
-    v = (value or "").strip().lower()
-    return v if v in _AGGRESSIVENESS_PRESETS else DEFAULT_AGGRESSIVENESS
+def normalize_aggressiveness(value) -> int:  # noqa: ANN001
+    """Привести значение агрессивности к целому 0..100.
+
+    Принимает int/float, числовую строку или старые пресеты low/medium/high
+    (обратная совместимость со старым config.json).
+    """
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in _LEGACY_LEVELS:
+            return _LEGACY_LEVELS[v]
+        try:
+            value = float(v)
+        except ValueError:
+            return DEFAULT_AGGRESSIVENESS
+    try:
+        level = int(round(float(value)))
+    except (TypeError, ValueError):
+        return DEFAULT_AGGRESSIVENESS
+    return max(AGGRESSIVENESS_MIN, min(AGGRESSIVENESS_MAX, level))
 
 
-def _build_vad_options(aggressiveness: str):  # noqa: ANN001
-    """Собрать faster_whisper.vad.VadOptions из пресета агрессивности."""
+def _build_vad_options(aggressiveness):  # noqa: ANN001
+    """Собрать faster_whisper.vad.VadOptions по уровню агрессивности 0..100."""
     from faster_whisper.vad import VadOptions
 
-    preset = _AGGRESSIVENESS_PRESETS[normalize_aggressiveness(aggressiveness)]
+    t = normalize_aggressiveness(aggressiveness) / 100.0
+
+    def _lerp(pair: tuple[float, float]) -> float:
+        a, b = pair
+        return a + (b - a) * t
+
     return VadOptions(
-        threshold=float(preset["threshold"]),
-        min_speech_duration_ms=int(preset["min_speech_duration_ms"]),
-        min_silence_duration_ms=int(preset["min_silence_duration_ms"]),
-        speech_pad_ms=int(preset["speech_pad_ms"]),
+        threshold=float(_lerp(_AGG_ENDPOINTS["threshold"])),
+        min_speech_duration_ms=int(round(_lerp(_AGG_ENDPOINTS["min_speech_duration_ms"]))),
+        min_silence_duration_ms=int(round(_lerp(_AGG_ENDPOINTS["min_silence_duration_ms"]))),
+        speech_pad_ms=int(round(_lerp(_AGG_ENDPOINTS["speech_pad_ms"]))),
     )
 
 
@@ -139,7 +172,7 @@ def detect_speech_segments(
     audio_f32: np.ndarray,
     *,
     sample_rate: int = VAD_SAMPLE_RATE,
-    aggressiveness: str = DEFAULT_AGGRESSIVENESS,
+    aggressiveness: int = DEFAULT_AGGRESSIVENESS,
 ) -> list[tuple[int, int]]:
     """Найти интервалы речи (в сэмплах) через Silero VAD faster-whisper.
 
@@ -160,40 +193,91 @@ def detect_speech_segments(
     return _merge_overlapping(segments)
 
 
-def _write_speech_only_wav(samples_int16: np.ndarray, segments: list[tuple[int, int]]) -> Path:
-    """Собрать speech-only WAV (16кГц/mono/s16) из интервалов речи."""
+def _group_segments_into_buckets(
+    segments: list[tuple[int, int]],
+    *,
+    sample_rate: int,
+    max_chunk_seconds: float,
+) -> list[list[tuple[int, int]]]:
+    """US-040: сгруппировать сегменты речи в корзины ≤ max_chunk (в сэмплах).
+
+    Разрез между корзинами ставится на паузе (границе сегмента). Единственный
+    краевой случай — непрерывный сегмент длиннее размера чанка (пауз нет): режем
+    его жёстко на куски ≤ max_chunk с перехлёстом HARDCUT_OVERLAP_SECONDS.
+    Каждая корзина — список сегментов (для одиночной корзины при hard-cut это
+    один синтетический под-сегмент).
+    """
+    max_s = int(max_chunk_seconds * sample_rate)
+    if max_s <= 0:
+        return [list(segments)] if segments else []
+    overlap = int(HARDCUT_OVERLAP_SECONDS * sample_rate)
+    buckets: list[list[tuple[int, int]]] = []
+    current: list[tuple[int, int]] = []
+    current_dur = 0
+    for start, end in segments:
+        seg_dur = end - start
+        if seg_dur > max_s:
+            # Непрерывная речь длиннее чанка — резать по паузам негде.
+            if current:
+                buckets.append(current)
+                current, current_dur = [], 0
+            pos = start
+            while pos < end:
+                piece_end = min(end, pos + max_s)
+                buckets.append([(pos, piece_end)])
+                if piece_end >= end:
+                    break
+                pos = max(pos + 1, piece_end - overlap)
+            continue
+        if current and current_dur + seg_dur > max_s:
+            buckets.append(current)
+            current, current_dur = [], 0
+        current.append((start, end))
+        current_dur += seg_dur
+    if current:
+        buckets.append(current)
+    return buckets
+
+
+def _concat_segments(samples_int16: np.ndarray, bucket: list[tuple[int, int]]) -> np.ndarray:
+    """Склеить сэмплы речи по списку интервалов (в сэмплах)."""
     total = samples_int16.shape[0]
     pieces = [
         samples_int16[max(0, s):min(total, e)]
-        for s, e in segments
+        for s, e in bucket
         if min(total, e) > max(0, s)
     ]
-    speech = np.concatenate(pieces) if pieces else np.empty(0, dtype=np.int16)
-    out_dir = Path(tempfile.mkdtemp(prefix="voice-input-vad-"))
-    out_path = out_dir / "speech-only-16k-mono.wav"
+    return np.concatenate(pieces) if pieces else np.empty(0, dtype=np.int16)
+
+
+def _write_wav(out_path: Path, samples_int16: np.ndarray) -> None:
     with wave.open(str(out_path), "wb") as dst:
         dst.setnchannels(1)
         dst.setsampwidth(2)
         dst.setframerate(VAD_SAMPLE_RATE)
-        dst.writeframes(speech.tobytes())
-    return out_path
+        dst.writeframes(samples_int16.tobytes())
 
 
-def trim_silence_for_cloud(src_wav: Path, *, aggressiveness: str = DEFAULT_AGGRESSIVENESS) -> TrimResult:
+def trim_silence_for_cloud(
+    src_wav: Path,
+    *,
+    aggressiveness: int = DEFAULT_AGGRESSIVENESS,
+    max_chunk_seconds: float = 0.0,
+) -> TrimResult:
     """Вырезать тишину из записи диктовки перед отправкой в облачный STT.
 
-    Три случая (см. US-039, TASK-203):
-      1. речь найдена (≥ MIN_SPEECH_SECONDS) → построить speech-only WAV
-         (trimmed=True, no_speech=False);
+    Три случая (US-039, TASK-203):
+      1. речь найдена (≥ MIN_SPEECH_SECONDS) → построить speech-only WAV;
       2. речи нет / её меньше порога → no_speech=True (в облако не идём);
       3. любой сбой (нет faster-whisper, битый звук, исключение VAD) — НЕ
          обрабатывается здесь: исключение пробрасывается наверх, где вызывающий
-         делает fail-open (отправляет оригинал без обрезки). Это разграничение
-         намеренно: «нет речи» ≠ «VAD сломался».
+         делает fail-open (отправляет оригинал без обрезки).
+
+    US-040: при max_chunk_seconds > 0 речь дополнительно разбивается на корзины
+    ≤ max_chunk по паузам (chunks). При одном чанке chunks = [полный WAV].
 
     Исходный WAV может быть на частоте устройства (напр. 48кГц) — приводим к
-    16кГц mono через PyAV (convert_media_to_wav_16k_mono), заодно уменьшая
-    payload для облака.
+    16кГц mono через PyAV, заодно уменьшая payload для облака.
     """
     prepared_path, _duration = convert_media_to_wav_16k_mono(src_wav)
     try:
@@ -201,32 +285,62 @@ def trim_silence_for_cloud(src_wav: Path, *, aggressiveness: str = DEFAULT_AGGRE
         audio_f32 = samples.astype(np.float32) / 32768.0
         segments = detect_speech_segments(audio_f32, aggressiveness=aggressiveness)
     finally:
-        # Промежуточный 16к-WAV больше не нужен (обрезанный строим из уже
-        # прочитанных сэмплов).
         cleanup_prepared_file(prepared_path)
 
     speech_samples = sum(max(0, e - s) for s, e in segments)
     speech_seconds = speech_samples / float(VAD_SAMPLE_RATE)
     if not segments or speech_seconds < MIN_SPEECH_SECONDS:
         log.info("VAD: речь не найдена (%.3fс речи, порог %.2fс)", speech_seconds, MIN_SPEECH_SECONDS)
-        return TrimResult(wav_path=None, trimmed=False, no_speech=True, speech_seconds=speech_seconds)
+        return TrimResult(wav_path=None, chunks=[], trimmed=False, no_speech=True, speech_seconds=speech_seconds)
 
-    out_path = _write_speech_only_wav(samples, segments)
+    out_dir = Path(tempfile.mkdtemp(prefix="voice-input-vad-"))
+    # Полный speech-only WAV — для одиночного запроса и локального fallback.
+    full_samples = _concat_segments(samples, segments)
+    full_path = out_dir / "speech-full-16k-mono.wav"
+    _write_wav(full_path, full_samples)
+
+    buckets = _group_segments_into_buckets(segments, sample_rate=VAD_SAMPLE_RATE, max_chunk_seconds=max_chunk_seconds)
+    if len(buckets) <= 1:
+        # Один чанк — переиспользуем полный WAV, не плодим файлы.
+        chunks = [AudioChunk(full_path, 0.0, speech_seconds)]
+    else:
+        chunks = []
+        offset = 0.0
+        for index, bucket in enumerate(buckets, start=1):
+            piece = _concat_segments(samples, bucket)
+            piece_path = out_dir / f"speech-chunk-{index:04d}.wav"
+            _write_wav(piece_path, piece)
+            dur = piece.shape[0] / float(VAD_SAMPLE_RATE)
+            chunks.append(AudioChunk(piece_path, offset, offset + dur))
+            offset += dur
+
     log.info(
-        "VAD: оставлено %.3fс речи в %d сегментах (агрессивность=%s) → %s",
-        speech_seconds, len(segments), normalize_aggressiveness(aggressiveness), out_path,
+        "VAD: оставлено %.3fс речи в %d сегментах → %d чанк(ов) (агрессивность=%s, chunk≤%.0fс)",
+        speech_seconds, len(segments), len(chunks), normalize_aggressiveness(aggressiveness), max_chunk_seconds,
     )
-    return TrimResult(wav_path=out_path, trimmed=True, no_speech=False, speech_seconds=speech_seconds)
+    return TrimResult(
+        wav_path=full_path,
+        chunks=chunks,
+        trimmed=True,
+        no_speech=False,
+        speech_seconds=speech_seconds,
+        temp_dir=out_dir,
+    )
 
 
 def cleanup_trim_artifact(path: Path | None) -> None:
-    """Удалить обрезанный WAV и его временную папку (вызывает вызывающий)."""
+    """Удалить временную папку VAD со всеми артефактами (вызывает вызывающий).
+
+    Принимает temp_dir из TrimResult. Для обратной совместимости так же
+    корректно обрабатывает путь к файлу внутри такой папки.
+    """
     if path is None:
         return
-    cleanup_prepared_file(path)
+    target = path if path.is_dir() else path.parent
     try:
-        parent = path.parent
-        if parent.name.startswith("voice-input-vad-"):
-            parent.rmdir()
+        if target.name.startswith("voice-input-vad-"):
+            shutil.rmtree(target, ignore_errors=True)
+        elif path.is_file():
+            cleanup_prepared_file(path)
     except Exception:  # noqa: BLE001
         pass

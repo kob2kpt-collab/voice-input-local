@@ -708,6 +708,7 @@ def split_and_transcribe(
     cancel_check: Optional[Callable[[], bool]] = None,
     chunk_local_fallback: Optional[Callable[[Path], str]] = None,
     with_timestamps: bool = False,
+    precut_chunks: "Optional[list]" = None,
 ) -> "TranscribeResult":
     """Прозрачно расшифровывает длинную надиктовку через облачный API (US-032).
 
@@ -767,34 +768,57 @@ def split_and_transcribe(
     def _finish_single(text: str, segs: "list[Segment]") -> "TranscribeResult":
         return (text, segs) if with_timestamps else text
 
-    duration = _wav_duration_seconds(wav_path)
-    if duration <= 0:
-        log.info("Cloud STT: duration unknown for %s, sending as single request", wav_path)
-        if _is_cancelled():
-            raise InterruptedError("Cloud transcription cancelled by user")
-        text, segs = _coerce_transcribe_result(transcribe_fn(wav_path), fallback_start=0.0, fallback_end=0.0)
-        if text:
-            _emit_chunk(0, 1, 0.0, 0.0, text, segs)
-        return _finish_single(text, segs)
+    if precut_chunks is not None:
+        # US-040: чанки уже нарезаны по паузам VAD (границы взяты из AudioChunk).
+        # Пропускаем split_wav_by_duration — режем не по сетке, а по речи.
+        chunks = precut_chunks
+        if not chunks:
+            if _is_cancelled():
+                raise InterruptedError("Cloud transcription cancelled by user")
+            text, segs = _coerce_transcribe_result(transcribe_fn(wav_path), fallback_start=0.0, fallback_end=0.0)
+            return _finish_single(text, segs)
+        if len(chunks) == 1:
+            only = chunks[0]
+            if _is_cancelled():
+                raise InterruptedError("Cloud transcription cancelled by user")
+            text, segs = _coerce_transcribe_result(
+                transcribe_fn(only.path), fallback_start=only.start_seconds, fallback_end=only.end_seconds
+            )
+            if text:
+                _emit_chunk(0, 1, only.start_seconds, only.end_seconds, text, segs)
+            return _finish_single(text, segs)
+        duration = max((c.end_seconds for c in chunks), default=0.0)
+        total_chunks = len(chunks)
+        log.info("Cloud STT: VAD-aware split into %d speech chunks (US-040)", total_chunks)
+    else:
+        duration = _wav_duration_seconds(wav_path)
+        if duration <= 0:
+            log.info("Cloud STT: duration unknown for %s, sending as single request", wav_path)
+            if _is_cancelled():
+                raise InterruptedError("Cloud transcription cancelled by user")
+            text, segs = _coerce_transcribe_result(transcribe_fn(wav_path), fallback_start=0.0, fallback_end=0.0)
+            if text:
+                _emit_chunk(0, 1, 0.0, 0.0, text, segs)
+            return _finish_single(text, segs)
 
-    if duration <= max_chunk_seconds + 0.5:
-        log.info("Cloud STT: short audio (%.1fs), single request", duration)
-        if _is_cancelled():
-            raise InterruptedError("Cloud transcription cancelled by user")
-        text, segs = _coerce_transcribe_result(transcribe_fn(wav_path), fallback_start=0.0, fallback_end=duration)
-        if text:
-            _emit_chunk(0, 1, 0.0, duration, text, segs)
-        return _finish_single(text, segs)
+        if duration <= max_chunk_seconds + 0.5:
+            log.info("Cloud STT: short audio (%.1fs), single request", duration)
+            if _is_cancelled():
+                raise InterruptedError("Cloud transcription cancelled by user")
+            text, segs = _coerce_transcribe_result(transcribe_fn(wav_path), fallback_start=0.0, fallback_end=duration)
+            if text:
+                _emit_chunk(0, 1, 0.0, duration, text, segs)
+            return _finish_single(text, segs)
 
-    chunks = split_wav_by_duration(wav_path, chunk_seconds=max_chunk_seconds, overlap_seconds=overlap_seconds)
-    if not chunks:
-        if _is_cancelled():
-            raise InterruptedError("Cloud transcription cancelled by user")
-        text, segs = _coerce_transcribe_result(transcribe_fn(wav_path), fallback_start=0.0, fallback_end=duration)
-        return _finish_single(text, segs)
+        chunks = split_wav_by_duration(wav_path, chunk_seconds=max_chunk_seconds, overlap_seconds=overlap_seconds)
+        if not chunks:
+            if _is_cancelled():
+                raise InterruptedError("Cloud transcription cancelled by user")
+            text, segs = _coerce_transcribe_result(transcribe_fn(wav_path), fallback_start=0.0, fallback_end=duration)
+            return _finish_single(text, segs)
 
-    total_chunks = len(chunks)
-    log.info("Cloud STT: long audio (%.1fs) split into %d chunks", duration, total_chunks)
+        total_chunks = len(chunks)
+        log.info("Cloud STT: long audio (%.1fs) split into %d chunks", duration, total_chunks)
 
     # results[index] = (text, segments) — segments уже со сдвигом на offset чанка
     results: list = [None] * total_chunks
@@ -857,8 +881,13 @@ def split_and_transcribe(
     try:
         futures = []
         for i, ch in enumerate(chunks):
-            start_sec = i * max(0.0, max_chunk_seconds - overlap_seconds)
-            end_sec = min(duration, start_sec + max_chunk_seconds)
+            if precut_chunks is not None:
+                # US-040: реальные границы речевого чанка (по паузам)
+                start_sec = ch.start_seconds
+                end_sec = ch.end_seconds
+            else:
+                start_sec = i * max(0.0, max_chunk_seconds - overlap_seconds)
+                end_sec = min(duration, start_sec + max_chunk_seconds)
             futures.append(pool.submit(_do_chunk, i, ch.path, start_sec, end_sec))
         pending = set(futures)
         while pending:
@@ -880,17 +909,20 @@ def split_and_transcribe(
         if not cancelled:
             pool.shutdown(wait=False)
 
-    for ch in chunks:
+    # US-040: при precut_chunks временными файлами владеет вызывающий
+    # (worker чистит всю папку VAD через cleanup_trim_artifact). Иначе — как раньше.
+    if precut_chunks is None:
+        for ch in chunks:
+            try:
+                ch.path.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
         try:
-            ch.path.unlink(missing_ok=True)
+            tmp_dir = chunks[0].path.parent
+            if tmp_dir.exists() and not any(tmp_dir.iterdir()):
+                tmp_dir.rmdir()
         except Exception:  # noqa: BLE001
             pass
-    try:
-        tmp_dir = chunks[0].path.parent
-        if tmp_dir.exists() and not any(tmp_dir.iterdir()):
-            tmp_dir.rmdir()
-    except Exception:  # noqa: BLE001
-        pass
 
     if cancelled:
         raise InterruptedError("Cloud transcription cancelled by user")

@@ -844,12 +844,32 @@ class MainWindow(QMainWindow):
         _tv.addWidget(_trim_note)
         dgl.addRow("Тишина (облако)", _trim_cell)
 
-        self.cloud_trim_aggressiveness_combo = NoScrollComboBox()
-        self.cloud_trim_aggressiveness_combo.addItem("Низкая (бережно к тихой речи)", "low")
-        self.cloud_trim_aggressiveness_combo.addItem("Средняя (рекомендуется)", "medium")
-        self.cloud_trim_aggressiveness_combo.addItem("Высокая (агрессивно резать паузы)", "high")
-        self.cloud_trim_aggressiveness_combo.setToolTip("Насколько агрессивно вырезать тишину. Выше — под нож попадают более короткие паузы, но растёт риск срезать очень тихую речь.")
-        dgl.addRow("Агрессивность вырезания", self.cloud_trim_aggressiveness_combo)
+        # EPIC-10/US-039: непрерывный ползунок агрессивности (0..100) вместо трёх пунктов
+        from PySide6.QtWidgets import QSlider
+        self.cloud_trim_aggr_slider = QSlider(Qt.Horizontal)
+        self.cloud_trim_aggr_slider.setRange(0, 100)
+        self.cloud_trim_aggr_slider.setSingleStep(5)
+        self.cloud_trim_aggr_slider.setPageStep(10)
+        self.cloud_trim_aggr_slider.setTickPosition(QSlider.TicksBelow)
+        self.cloud_trim_aggr_slider.setTickInterval(10)
+        self.cloud_trim_aggr_slider.setToolTip("Насколько агрессивно вырезать тишину. Левее — бережно к тихой речи (режем меньше пауз); правее — агрессивнее режем паузы, но растёт риск срезать очень тихую речь. 50 — сбалансированное значение.")
+        self.cloud_trim_aggr_value = QLabel("50")
+        self.cloud_trim_aggr_value.setMinimumWidth(28)
+        self.cloud_trim_aggr_slider.valueChanged.connect(
+            lambda v: self.cloud_trim_aggr_value.setText(str(int(v)))
+        )
+        _aggr_lo = QLabel("Бережно"); _aggr_lo.setObjectName("Subtitle")
+        _aggr_hi = QLabel("Агрессивно"); _aggr_hi.setObjectName("Subtitle")
+        _aggr_row = QHBoxLayout()
+        _aggr_row.setContentsMargins(0, 0, 0, 0)
+        _aggr_row.setSpacing(6)
+        _aggr_row.addWidget(_aggr_lo)
+        _aggr_row.addWidget(self.cloud_trim_aggr_slider, 1)
+        _aggr_row.addWidget(_aggr_hi)
+        _aggr_row.addWidget(self.cloud_trim_aggr_value)
+        _aggr_cell = QWidget()
+        _aggr_cell.setLayout(_aggr_row)
+        dgl.addRow("Агрессивность вырезания", _aggr_cell)
 
         self.cloud_max_chunk_spin = NoScrollSpinBox()
         self.cloud_max_chunk_spin.setRange(30, 300)
@@ -1716,10 +1736,14 @@ class MainWindow(QMainWindow):
             # EPIC-10/US-039: вырезание тишины перед облаком
             if hasattr(self, "cloud_trim_silence_check"):
                 self.cloud_trim_silence_check.setChecked(bool(getattr(self.cfg, "cloud_trim_silence_enabled", True)))
-            if hasattr(self, "cloud_trim_aggressiveness_combo"):
-                _agg = str(getattr(self.cfg, "cloud_trim_aggressiveness", "medium") or "medium")
-                _agg_idx = self.cloud_trim_aggressiveness_combo.findData(_agg)
-                self.cloud_trim_aggressiveness_combo.setCurrentIndex(_agg_idx if _agg_idx >= 0 else 1)
+            if hasattr(self, "cloud_trim_aggr_slider"):
+                try:
+                    _agg_val = int(getattr(self.cfg, "cloud_trim_aggressiveness", 50))
+                except (TypeError, ValueError):
+                    _agg_val = 50
+                _agg_val = max(0, min(100, _agg_val))
+                self.cloud_trim_aggr_slider.setValue(_agg_val)
+                self.cloud_trim_aggr_value.setText(str(_agg_val))
             self._fill_cloud_fallback_combo()
         # US-034: постобработка
         if hasattr(self, "postprocess_enabled_check"):
@@ -1828,8 +1852,8 @@ class MainWindow(QMainWindow):
             # EPIC-10/US-039: автосейв вырезания тишины
             if hasattr(self, "cloud_trim_silence_check"):
                 self.cloud_trim_silence_check.toggled.connect(self.schedule_settings_autosave)
-            if hasattr(self, "cloud_trim_aggressiveness_combo"):
-                self.cloud_trim_aggressiveness_combo.currentIndexChanged.connect(self.schedule_settings_autosave)
+            if hasattr(self, "cloud_trim_aggr_slider"):
+                self.cloud_trim_aggr_slider.valueChanged.connect(self.schedule_settings_autosave)
         # US-034: автосейв постобработки
         if hasattr(self, "postprocess_enabled_check"):
             self.postprocess_enabled_check.stateChanged.connect(self.schedule_settings_autosave)
@@ -3163,8 +3187,8 @@ class MainWindow(QMainWindow):
             # EPIC-10/US-039: вырезание тишины перед облаком
             if hasattr(self, "cloud_trim_silence_check"):
                 self.cfg.cloud_trim_silence_enabled = bool(self.cloud_trim_silence_check.isChecked())
-            if hasattr(self, "cloud_trim_aggressiveness_combo"):
-                self.cfg.cloud_trim_aggressiveness = str(self.cloud_trim_aggressiveness_combo.currentData() or "medium")
+            if hasattr(self, "cloud_trim_aggr_slider"):
+                self.cfg.cloud_trim_aggressiveness = int(self.cloud_trim_aggr_slider.value())
             fb = str(self.cloud_fallback_combo.currentData() or DEFAULT_MODEL_KEY)
             self.cfg.cloud_fallback_model_key = fb
             # Если ключи/URL изменились — инвалидируем кэш discover и
