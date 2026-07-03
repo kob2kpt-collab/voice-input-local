@@ -1,7 +1,7 @@
 #define MyAppName "Voice Input Local"
 #define MyAppExeName "VoiceInputLocal.exe"
 #ifndef MyAppVersion
-#define MyAppVersion "4.16.0"
+#define MyAppVersion "4.17.0"
 #endif
 
 [Setup]
@@ -40,3 +40,30 @@ Name: "{autodesktop}\Voice Input Local"; Filename: "{app}\{#MyAppExeName}"; Task
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Запустить Voice Input Local"; Flags: nowait postinstall skipifsilent
+
+[Code]
+{ US-048: не прерывать активную работу пользователя централизованным обновлением. }
+{ Пока приложение занято (запись/диктовка/расшифровка файла/суммаризация), оно }
+{ держит маркер %ProgramData%\VoiceInputLocal\busy.lock и периодически обновляет }
+{ его. Если маркер присутствует — откладываем установку (Setup завершается, }
+{ ничего не заменив и не закрыв приложение); система развёртывания (Kaspersky }
+{ Security Center / GPO) повторит задачу позже, когда пользователь освободится. }
+{ Устаревший маркер после аварийного завершения снимает само приложение при }
+{ следующем запуске, поэтому обновление не блокируется навсегда. }
+{ Тихая установка при СВОБОДНОМ приложении проходит как обычно: маркера нет, }
+{ CloseApplications=yes корректно закрывает простаивающий экземпляр. }
+
+function BusyMarkerExists(): Boolean;
+begin
+  Result := FileExists(ExpandConstant('{commonappdata}\VoiceInputLocal\busy.lock'));
+end;
+
+function InitializeSetup(): Boolean;
+begin
+  Result := True;
+  if BusyMarkerExists() then
+  begin
+    Log('VoiceInputLocal занят активной работой — обновление отложено (busy.lock присутствует).');
+    Result := False;
+  end;
+end;

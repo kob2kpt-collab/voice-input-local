@@ -67,3 +67,20 @@ def logs_dir() -> Path:
     path = app_data_dir() / "logs"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def program_data_dir() -> Path:
+    """Общесистемная папка (%ProgramData%\\VoiceInputLocal).
+
+    Используется для маркера занятости (US-048): приложение работает от имени
+    пользователя, а установщик при централизованном обновлении — от имени
+    SYSTEM, поэтому маркер кладётся в общедоступное место, а не в профиль
+    пользователя (%LOCALAPPDATA%). На не-Windows PROGRAMDATA нет — fallback на
+    пользовательскую папку данных (маркер там осмыслен только локально).
+    """
+    base = os.environ.get("PROGRAMDATA")
+    if base:
+        path = Path(base) / APP_NAME
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    return app_data_dir()

@@ -16,6 +16,47 @@ from .logger import get_logger
 
 log = get_logger("updater")
 
+# --- Машинная политика централизованного отключения обновлений (US-047) ---
+# Администратор выставляет её через реестр (GPO / Kaspersky Security Center),
+# чтобы встроенный апдейтер не беспокоил пользователей, когда обновлениями
+# управляют централизованно. Ветка Policies недоступна обычному пользователю
+# на запись, поэтому политику нельзя обойти из-под учётки пользователя.
+POLICY_KEY = r"SOFTWARE\Policies\VoiceInputLocal"
+POLICY_DISABLE_UPDATES_VALUE = "DisableUpdates"
+
+
+def updates_disabled_by_policy() -> bool:
+    """Возвращает True, если встроенные обновления отключены машинной политикой.
+
+    Читает HKLM\\SOFTWARE\\Policies\\VoiceInputLocal, значение
+    DisableUpdates (DWORD). Ненулевое значение = обновления централизованно
+    отключены. Политика имеет ПРИОРИТЕТ над пользовательской настройкой
+    cfg.updates_enabled: при её включении встроенная проверка и скачивание
+    обновлений не выполняются (обновлениями управляет ИТ, например через
+    Kaspersky Security Center / GPO).
+
+    На не-Windows, при отсутствии ключа/значения или любой ошибке чтения
+    возвращает False — fail-open к обычному поведению приложения, чтобы
+    сбой чтения реестра не «залипал» на отключённых обновлениях.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+
+        access = winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, POLICY_KEY, 0, access) as key:
+            value, _typ = winreg.QueryValueEx(key, POLICY_DISABLE_UPDATES_VALUE)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        log.debug("Чтение политики обновлений не удалось", exc_info=True)
+        return False
+    try:
+        return int(value) != 0
+    except (TypeError, ValueError):
+        return False
+
 
 @dataclass(frozen=True)
 class UpdateInfo:

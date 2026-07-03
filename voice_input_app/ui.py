@@ -63,7 +63,8 @@ from .cloud_security_dialog import (
     normalize_endpoint,
 )
 from .paths import app_icon_path, logs_dir, models_dir
-from .updater import UpdateInfo, launch_update_file, normalize_repo
+from .updater import UpdateInfo, launch_update_file, normalize_repo, updates_disabled_by_policy
+from . import busy_marker
 from .workers import CloudConnectionCheckWorker, ConnectionVerifyWorker, LlmConnectionCheckWorker, PostProcessWorker, DownloadWorker, FileProgress, FileTranscribeWorker, FileTranscriptBlock, MicrophoneAutodetectWorker, MicrophoneAutodetectResult, PreloadWorker, SummarizeWorker, TranscribeWorker, UpdateCheckWorker, UpdateDownloadWorker
 try:
     from .summarizer import DEFAULT_SUMMARY_PROMPT
@@ -541,6 +542,19 @@ class MainWindow(QMainWindow):
         self._settings_save_timer = QTimer(self)
         self._settings_save_timer.setSingleShot(True)
         self._settings_save_timer.timeout.connect(self.auto_save_settings)
+
+        # US-048: маркер занятости для безопасного централизованного обновления.
+        # Пока идёт активная работа — периодически обновляем heartbeat; при
+        # простое снимаем. Источник истины — is_dictation_busy()/is_file_busy()
+        # (+суммаризация). Установщик читает маркер и откладывает обновление,
+        # если heartbeat свежий, чтобы не прервать работу пользователя.
+        # US-048: снять устаревший маркер, оставшийся после аварийного
+        # завершения (при старте единственного экземпляра работа не идёт).
+        busy_marker.clear()
+        self._busy_marker_timer = QTimer(self)
+        self._busy_marker_timer.setInterval(3000)
+        self._busy_marker_timer.timeout.connect(self._update_busy_marker)
+        self._busy_marker_timer.start()
 
         self.cancel_requested = False
         self.live_last_request_at = 0.0
@@ -1362,6 +1376,11 @@ class MainWindow(QMainWindow):
         self.update_repo_edit = QLineEdit()
         self.update_repo_edit.setPlaceholderText("owner/repo, например your-org/voice-input-local")
         self.update_repo_edit.setToolTip("Публичный GitHub-репозиторий с релизами приложения. Используется для централизованных обновлений.")
+        # US-047: пометка при централизованном отключении обновлений машинной политикой.
+        self.updates_policy_label = QLabel("Обновлениями управляет системный администратор. Встроенная проверка обновлений отключена.")
+        self.updates_policy_label.setObjectName("Subtitle")
+        self.updates_policy_label.setWordWrap(True)
+        self.updates_policy_label.setVisible(False)
         self.microphone_combo = NoScrollComboBox()
         self.refresh_microphones_btn = QPushButton("Обновить список")
         self.refresh_microphones_btn.clicked.connect(lambda: self.refresh_microphone_combo())
@@ -1402,6 +1421,7 @@ class MainWindow(QMainWindow):
         form.addRow("Hugging Face token", self.hf_token_edit)
         form.addRow("Обновления", self.updates_enabled_check)
         form.addRow("GitHub repo", self.update_repo_edit)
+        form.addRow("", self.updates_policy_label)
         microphone_row = QWidget()
         microphone_layout = QHBoxLayout(microphone_row)
         microphone_layout.setContentsMargins(0, 0, 0, 0)
@@ -1497,6 +1517,7 @@ class MainWindow(QMainWindow):
         buttons.addWidget(logs_btn)
         buttons.addWidget(models_dir_btn)
         buttons.addWidget(self.check_updates_btn)
+        self._refresh_updates_policy_state()
         buttons.addStretch(1)
         layout.addLayout(buttons)
         layout.addStretch(1)
@@ -2670,6 +2691,31 @@ class MainWindow(QMainWindow):
         """TASK-063: идёт ли сейчас расшифровка файла."""
         return self._file_job_running()
 
+    def _app_is_busy(self) -> bool:
+        # US-048: единый признак «идёт активная работа, которую нельзя прерывать»
+        # централизованным обновлением: запись/диктовка, расшифровка файла,
+        # суммаризация.
+        if self.is_dictation_busy() or self.is_file_busy():
+            return True
+        worker = getattr(self, "summarize_worker", None)
+        if worker is not None:
+            try:
+                if worker.isRunning():
+                    return True
+            except RuntimeError:
+                pass
+        return False
+
+    def _update_busy_marker(self) -> None:
+        # US-048: тик таймера — держим/снимаем маркер занятости по факту работы.
+        try:
+            if self._app_is_busy():
+                busy_marker.write_heartbeat()
+            else:
+                busy_marker.clear()
+        except Exception:  # noqa: BLE001
+            pass
+
     def _dictation_model_key(self) -> str:
         """Активная или планируемая модель диктовки (берётся из cfg)."""
         return str(self.cfg.selected_model or DEFAULT_MODEL_KEY)
@@ -3362,7 +3408,27 @@ class MainWindow(QMainWindow):
             return ""
         return repo
 
+    def _refresh_updates_policy_state(self) -> None:
+        # US-047: машинная политика (HKLM\SOFTWARE\Policies\VoiceInputLocal)
+        # централизованно отключает встроенный апдейтер с приоритетом над
+        # пользовательской настройкой. Блокируем контролы и показываем пометку.
+        disabled = updates_disabled_by_policy()
+        for name in ("updates_enabled_check", "update_repo_edit", "check_updates_btn"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(not disabled)
+        label = getattr(self, "updates_policy_label", None)
+        if label is not None:
+            label.setVisible(disabled)
+
     def check_for_updates(self, *, manual: bool = False) -> None:
+        if updates_disabled_by_policy():
+            # US-047: централизованно отключено администратором. Приоритет над
+            # cfg.updates_enabled и ручной кнопкой — к GitHub не обращаемся.
+            self._refresh_updates_policy_state()
+            if manual:
+                self.status_label.setText("Обновлениями управляет системный администратор.")
+            return
         if manual:
             self.save_settings(auto=True)
         if not manual and not self.cfg.updates_enabled:
@@ -5155,7 +5221,47 @@ class MainWindow(QMainWindow):
         self.tray.showMessage("Voice Input Local", "Приложение продолжает работать в трее.", QSystemTrayIcon.Information, 2500)
         self._sync_overlay_visibility()
 
+    def _log_running_workers_on_quit(self) -> None:
+        """DIAG (US-049/TASK-247): при выходе из трея фиксируем, какие фоновые
+        QThread ещё выполняются, и состояние рекордера.
+
+        Интермиттентный зомби-процесс + висящий оверлей при закрытии из трея:
+        really_quit дожидается только 3 воркеров из ~14. Если в момент выхода
+        жив недожидаемый (обычно сетевой) поток, уничтожение его работающего
+        C++-объекта на финализации -> qFatal/abort может подвесить процесс.
+        Лог помогает поймать конкретного виновника на реальном воспроизведении.
+        Только чтение состояния — поведение выхода не меняется.
+        """
+        worker_attrs = (
+            "transcribe_worker", "file_transcribe_worker", "preload_worker",
+            "download_worker", "microphone_autodetect_worker", "summarize_worker",
+            "update_check_worker", "update_download_worker", "live_worker",
+            "_postprocess_worker", "_llm_check_worker", "_cloud_check_worker",
+            "_check_worker", "_summary_check_worker",
+        )
+        running = []
+        for _name in worker_attrs:
+            _worker = getattr(self, _name, None)
+            try:
+                if _worker is not None and _worker.isRunning():
+                    running.append(_name)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            recording = bool(getattr(self, "recorder", None) and self.recorder.is_recording)
+        except Exception:  # noqa: BLE001
+            recording = False
+        try:
+            api_on = bool(getattr(self.cfg, "api_enabled", False))
+        except Exception:  # noqa: BLE001
+            api_on = False
+        log.info(
+            "really_quit: closing from tray. recorder_recording=%s api_enabled=%s running_workers=%s",
+            recording, api_on, ", ".join(running) if running else "none",
+        )
+
     def really_quit(self) -> None:
+        self._log_running_workers_on_quit()
         self.unregister_cancel_hotkey()
         if self.file_transcribe_worker and self.file_transcribe_worker.isRunning():
             self.file_transcribe_worker.cancel()
