@@ -359,15 +359,14 @@ def _make_cloud_spec(engine: str, display_provider: str, model_id: str) -> Model
         size_hint="облако",
         note=note,
     )
-WHISPER_REQUIRED_FILES_BY_KEY: dict[str, tuple[str, ...]] = {
-    "whisper:tiny": ("model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.json"),
-    "whisper:base": ("model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.json"),
-    "whisper:small": ("model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.json"),
-    "whisper:medium": ("model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.json"),
-    "whisper:large-v3": ("model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.json"),
-    "whisper:large-v3-turbo": ("model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.json"),
-}
-WHISPER_FALLBACK_REQUIRED_FILES = ("model.bin", "config.json", "tokenizer.json")
+# US-050: единый ГИБКИЙ набор обязательных файлов для ВСЕХ моделей Whisper.
+# faster-whisper/CTranslate2 для загрузки нужны model.bin + config.json + tokenizer.json
+# и словарь. Репозитории Systran разнятся: у tiny/base/small/medium словарь называется
+# vocabulary.txt и НЕТ preprocessor_config.json; у large-v3/turbo — vocabulary.json
+# (+ preprocessor_config.json, который для загрузки НЕ требуется). Поэтому требуем базовые
+# файлы + словарь в ЛЮБОМ из двух форматов, а preprocessor_config.json НЕ требуем (если он
+# есть в репозитории — скачается сам вместе с остальными, проверку это не ломает).
+WHISPER_REQUIRED_FILES = ("model.bin", "config.json", "tokenizer.json")
 WHISPER_VOCAB_ALTERNATIVES = ("vocabulary.json", "vocabulary.txt")
 PARAKEET_MODEL_SUFFIXES = (".onnx", ".json", ".yaml", ".yml")
 ADDITIONAL_REQUIRED_FILES_BY_KEY: dict[str, tuple[str, ...]] = {
@@ -421,16 +420,15 @@ def _missing_required_files(spec: ModelSpec, path: Path) -> list[str]:
     if _has_incomplete_downloads(path):
         missing.append("*.incomplete")
     if spec.engine == "Whisper":
-        required = WHISPER_REQUIRED_FILES_BY_KEY.get(spec.key, WHISPER_FALLBACK_REQUIRED_FILES)
-        for name in required:
+        for name in WHISPER_REQUIRED_FILES:
             file_path = path / name
             if not file_path.is_file() or file_path.stat().st_size <= 0:
                 missing.append(name)
-        # Unknown/local Whisper conversions may use either vocabulary.json or vocabulary.txt.
-        if spec.key not in WHISPER_REQUIRED_FILES_BY_KEY:
-            has_vocab = any((path / name).is_file() and (path / name).stat().st_size > 0 for name in WHISPER_VOCAB_ALTERNATIVES)
-            if not has_vocab:
-                missing.append("vocabulary.json or vocabulary.txt")
+        # Словарь может называться vocabulary.json (large-v3/turbo) или vocabulary.txt
+        # (tiny/base/small/medium) — принимаем ЛЮБОЙ из форматов.
+        has_vocab = any((path / name).is_file() and (path / name).stat().st_size > 0 for name in WHISPER_VOCAB_ALTERNATIVES)
+        if not has_vocab:
+            missing.append("vocabulary.json or vocabulary.txt")
     elif spec.engine == "Parakeet":
         has_model_file = any(p.is_file() and p.suffix.lower() in PARAKEET_MODEL_SUFFIXES and p.stat().st_size > 0 for p in path.rglob("*"))
         if not has_model_file:
@@ -447,6 +445,87 @@ def _missing_required_files(spec: ModelSpec, path: Path) -> list[str]:
 
 def _is_complete_model_dir(spec: ModelSpec, path: Path) -> bool:
     return not _missing_required_files(spec, path)
+
+
+def _looks_like_corrupt_model_error(exc: BaseException) -> bool:
+    """US-052: похоже ли исключение загрузки на битый/неоткрываемый файл модели.
+
+    Ошибка CTranslate2 при недокачанном/повреждённом model.bin —
+    'Unable to open file ...model.bin...'. Реагируем только на такие случаи,
+    чтобы не перекачивать модель из-за посторонних ошибок.
+    """
+    msg = str(exc).lower()
+    return (
+        "unable to open file" in msg
+        or "model.bin" in msg
+        or "unable to load" in msg
+        or "invalid model" in msg
+    )
+
+
+def _purge_hf_cache_for_repo(repo_id: str) -> bool:
+    """US-052: удалить папку кэша HuggingFace для репозитория. True — если что-то удалено.
+
+    faster-whisper сверяет только etag и переиспользует битый локальный model.bin.
+    Чтобы перекачать начисто, удаляем каталог кэша репозитория целиком.
+    Защита: удаляем только каталог с именем вида 'models--<org>--<name>'.
+    """
+    candidates: list[Path] = []
+    # 1) Точный путь через try_to_load_from_cache: .../models--X--Y/snapshots/<hash>/<file>
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        for fname in ("model.bin", "config.json"):
+            cached = try_to_load_from_cache(repo_id, fname)
+            if isinstance(cached, str):
+                candidates.append(Path(cached).parents[2])
+                break
+    except Exception:  # noqa: BLE001 — best-effort, ниже есть fallback
+        pass
+    # 2) Fallback по соглашению об именовании кэша HuggingFace
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        candidates.append(Path(HF_HUB_CACHE) / ("models--" + repo_id.replace("/", "--")))
+    except Exception:  # noqa: BLE001
+        pass
+
+    removed = False
+    seen: set[str] = set()
+    for repo_dir in candidates:
+        key = str(repo_dir)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if repo_dir.exists() and repo_dir.name.startswith("models--"):
+                shutil.rmtree(repo_dir, ignore_errors=True)
+                removed = True
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не удалось очистить кэш HuggingFace %s: %s", repo_dir, exc)
+    return removed
+
+
+def _whisper_model_cached(repo_id: str) -> bool:
+    """US-051: есть ли в кэше HuggingFace скачанный (непустой) model.bin для репозитория.
+
+    Дешёвая проверка без сети: try_to_load_from_cache возвращает путь только для
+    полностью закачанного файла (huggingface_hub сверяет etag при загрузке), поэтому
+    оборванная загрузка (нет закоммиченного blob) вернёт None. Проверяем существование
+    и ненулевой размер. Редкий случай «файл есть, etag совпал, но CTranslate2 не
+    открывает» ловит self-heal при загрузке (US-052) — статусу его дёшево не увидеть.
+    """
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        cached = try_to_load_from_cache(repo_id, "model.bin")
+        if isinstance(cached, str):
+            p = Path(cached)
+            return p.is_file() and p.stat().st_size > 0
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
 
 def _safe_rmtree(path: Path, *, retries: int = 3) -> None:
     if not path.exists():
@@ -658,7 +737,15 @@ class ModelManager:
         if self.is_incomplete(key):
             return "Загрузка не завершена"
         if key == DEFAULT_MODEL_KEY:
-            return "Готова по умолчанию"
+            # US-051: не утверждаем «Готова по умолчанию» безусловно. Small грузится из
+            # кэша faster-whisper; если валидного model.bin в кэше нет (свежая машина или
+            # оборванная закачка) — статус «готова» вводит в заблуждение, а диктовка падает
+            # 'Unable to open file model.bin'. Показываем реальное состояние. Доступность
+            # (is_available) НЕ трогаем: модель остаётся выбираемой, чтобы сработали
+            # первая авто-загрузка и self-heal US-052.
+            if _whisper_model_cached(self.spec(key).repo_id):
+                return "Готова по умолчанию"
+            return "Не загружена"
         return "Не загружена"
 
     def is_transcription_model(self, key: str) -> bool:
@@ -1148,8 +1235,40 @@ class ModelManager:
                 log.warning("Local Whisper model directory is incomplete and will be ignored: %s", path)
             model_source = spec.loader_name
         device = cfg.device if cfg.device != "auto" else "auto"
-        log.info("Load Whisper model: key=%s source=%s device=%s compute=%s", spec.key, model_source, device, cfg.compute_type)
-        model_obj = WhisperModel(model_source, device=device, compute_type=cfg.compute_type)
+        # US-053: авторизуем АВТО-загрузку модели тем же HF-токеном, что и кнопка «Скачать».
+        # faster-whisper качает через huggingface_hub, который читает токен из окружения
+        # (HF_TOKEN/HUGGINGFACE_HUB_TOKEN). Без этого докачка при диктовке/расшифровке шла
+        # анонимно (warning про rate limits, ниже скорость). Ставим до WhisperModel(...),
+        # чтобы авторизация действовала и на первичную загрузку, и на self-heal-перекачку.
+        _hf_tok = _resolve_hf_token(getattr(cfg, "hf_token", "") or None)
+        if _hf_tok:
+            os.environ["HF_TOKEN"] = _hf_tok
+            os.environ["HUGGINGFACE_HUB_TOKEN"] = _hf_tok
+        log.info("Load Whisper model: key=%s source=%s device=%s compute=%s token=%s", spec.key, model_source, device, cfg.compute_type, "yes" if _hf_tok else "no")
+        try:
+            model_obj = WhisperModel(model_source, device=device, compute_type=cfg.compute_type)
+        except Exception as exc:  # noqa: BLE001
+            # US-052: авто-загрузка из кэша HuggingFace может наткнуться на битый/недокачанный
+            # model.bin (обрыв прошлой закачки). faster-whisper сверяет только etag и
+            # переиспользует испорченный файл -> 'Unable to open file model.bin' при каждом
+            # запуске. Один раз чистим кэш этого репозитория и перекачиваем начисто.
+            # ТОЛЬКО для загрузки через кэш (model_source == loader_name), не для
+            # укомплектованной папки приложения.
+            if model_source != spec.loader_name or not _looks_like_corrupt_model_error(exc):
+                raise
+            log.warning("Load Whisper failed for %s (%s); attempting cache self-heal for repo %s", spec.key, exc, spec.repo_id)
+            purged = _purge_hf_cache_for_repo(spec.repo_id)
+            log.info("HF cache purge for %s: removed=%s; re-downloading", spec.repo_id, purged)
+            try:
+                model_obj = WhisperModel(model_source, device=device, compute_type=cfg.compute_type)
+            except Exception as exc2:  # noqa: BLE001
+                log.error("Whisper re-download after cache purge failed for %s: %s", spec.key, exc2)
+                raise RuntimeError(
+                    f"Не удалось загрузить модель Whisper «{spec.name}»: файл модели в кэше был "
+                    f"повреждён, а перекачать его начисто не удалось. Проверьте интернет-соединение "
+                    f"и повторите. Детали: {exc2}"
+                ) from exc2
+            log.info("Whisper cache self-heal succeeded for %s", spec.key)
         self._loaded[spec.key] = model_obj
         return model_obj
 
