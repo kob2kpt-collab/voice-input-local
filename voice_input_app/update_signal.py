@@ -1,21 +1,21 @@
 # -*- coding: utf-8 -*-
-"""US-057: сигнальные маркеры централизованного обновления (приложение <-> установщик).
+"""US-057: сигнальный маркер централизованного обновления (установщик -> приложение).
 
-Обмен идёт через файлы в общесистемной папке %ProgramData% (paths.program_data_dir()),
+Обмен через файл в общесистемной папке %ProgramData% (paths.program_data_dir()),
 доступной установщику под SYSTEM и приложению под пользователем:
 
-- update-pending.flag  — установщик -> приложение: «централизованное обновление
-  ждёт, спроси пользователя». Приложение показывает окно и снимает флаг.
-- update-declined.flag — приложение -> установщик: «пользователь отклонил в этот
-  цикл». Установщик возвращает код «отклонено» и снимает флаг (при следующей
-  занятой попытке окно показывается снова).
+- update-pending.flag — установщик -> приложению: «пришло централизованное
+  обновление, покажи окно выбора». Приложение показывает окно и снимает флаг.
 
-«Согласие» (accept) отдельного маркера НЕ требует: приложение снимает занятость
-(busy.lock, US-048) и закрывается, и следующая попытка установщика видит простой
-и ставит обновление.
+Решение пользователя обрабатывается на стороне приложения и НЕ возвращается в KSC
+отдельным кодом (упрощение после теста в KSC — см. CLAUDE.md): «Закрыть и обновить»
+закрывает приложение (следующая попытка установщика ставит обновление); «Отклонить»
+просто продолжает работу (при следующей занятой попытке окно покажется снова). При
+занятости установщик всегда возвращает «Отложено» (единый код), поэтому отдельного
+маркера «отклонено» больше нет.
 
-ВАЖНО: имена файлов и их расположение — это КОНТРАКТ с Pascal-кодом установщика
-(installer/VoiceInputLocal.iss). Менять согласованно с обеих сторон.
+ВАЖНО: имя файла и его расположение — это КОНТРАКТ с Pascal-кодом установщика
+(installer/VoiceInputLocal.iss).
 """
 from __future__ import annotations
 
@@ -27,34 +27,18 @@ from .paths import program_data_dir
 log = get_logger("update_signal")
 
 UPDATE_PENDING_NAME = "update-pending.flag"
-UPDATE_DECLINED_NAME = "update-declined.flag"
 
 
 def pending_path() -> Path:
     return program_data_dir() / UPDATE_PENDING_NAME
 
 
-def declined_path() -> Path:
-    return program_data_dir() / UPDATE_DECLINED_NAME
-
-
-def _write(path: Path) -> None:
-    try:
-        path.write_text("1", encoding="ascii")
-    except OSError:
-        log.debug("Не удалось записать маркер %s", path.name, exc_info=True)
-
-
-def _clear(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        log.debug("Не удалось снять маркер %s", path.name, exc_info=True)
-
-
-# --- update-pending: установщик пишет, приложение читает и снимает ---
 def set_update_pending() -> None:
-    _write(pending_path())
+    """Записать сигнал «обновление ждёт» (пишет установщик; в приложении — для тестов)."""
+    try:
+        pending_path().write_text("1", encoding="ascii")
+    except OSError:
+        log.debug("Не удалось записать маркер update-pending", exc_info=True)
 
 
 def is_update_pending() -> bool:
@@ -62,17 +46,7 @@ def is_update_pending() -> bool:
 
 
 def clear_update_pending() -> None:
-    _clear(pending_path())
-
-
-# --- update-declined: приложение пишет, установщик читает и снимает ---
-def set_declined() -> None:
-    _write(declined_path())
-
-
-def is_declined() -> bool:
-    return declined_path().exists()
-
-
-def clear_declined() -> None:
-    _clear(declined_path())
+    try:
+        pending_path().unlink(missing_ok=True)
+    except OSError:
+        log.debug("Не удалось снять маркер update-pending", exc_info=True)

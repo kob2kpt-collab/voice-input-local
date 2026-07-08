@@ -1,7 +1,7 @@
 #define MyAppName "Voice Input Local"
 #define MyAppExeName "VoiceInputLocal.exe"
 #ifndef MyAppVersion
-#define MyAppVersion "4.17.2"
+#define MyAppVersion "4.17.3"
 #endif
 
 [Setup]
@@ -60,23 +60,21 @@ Name: "{commonappdata}\VoiceInputLocal"; Permissions: users-modify
 {                                                                             }
 { Обмен через маркеры в %ProgramData%\VoiceInputLocal: }
 {  - busy.lock            — приложение занято (US-048); }
-{  - update-pending.flag  — установщик -> приложению: «покажи окно выбора»; }
-{  - update-declined.flag — приложение -> установщику: «пользователь отклонил». }
-{ «Согласие» отдельного маркера не требует: приложение снимает busy.lock и }
-{ закрывается, и следующая попытка видит простой и ставит обновление. }
+{  - update-pending.flag  — установщик -> приложению: «покажи окно выбора». }
+{ Решение пользователя (обновить сейчас / отложить) приложение обрабатывает }
+{ само: «Закрыть и обновить» снимает busy.lock и закрывается (следующая попытка }
+{ видит простой и ставит обновление), «Отклонить» просто продолжает работу. }
 {                                                                             }
 { Коды возврата (US-055) для KSC: }
 {  0   — обновление установлено; }
-{  100 — отклонено пользователем; }
-{  101 — отложено (приложение занято, ожидает решения пользователя); }
+{  101 — отложено (приложение занято); }
 {  прочие ненулевые — стандартные ошибки Inno Setup. }
 
 const
-  EXIT_DECLINED_USER = 100;
   EXIT_DEFERRED_BUSY = 101;
 
-{ Штатный InitializeSetup=False даёт generic-код, поэтому для «отклонено»/ }
-{ «отложено» выходим кастомным кодом через ExitProcess (ничего ещё не изменено). }
+{ Штатный InitializeSetup=False даёт generic-код, поэтому для «отложено» }
+{ выходим кастомным кодом через ExitProcess (ничего ещё не изменено). }
 procedure ExitProcess(uExitCode: Cardinal);
   external 'ExitProcess@kernel32.dll stdcall';
 
@@ -112,24 +110,14 @@ begin
   if not MarkerExists('busy.lock') then
   begin
     { Приложение простаивает — ставим тихо (CloseApplications=yes закроет }
-    { простаивающий экземпляр). Чистим сигнальные маркеры. }
+    { простаивающий экземпляр). Чистим сигнальный маркер. }
     ClearMarker('update-pending.flag');
-    ClearMarker('update-declined.flag');
     Exit;
   end;
 
-  { Приложение занято. }
-  if MarkerExists('update-declined.flag') then
-  begin
-    { Пользователь отклонил в этот цикл: сообщаем KSC «отклонено» и готовим }
-    { повторный показ окна (снимаем declined, снова пишем pending). }
-    Log('VoiceInputLocal: централизованное обновление отклонено пользователем.');
-    ClearMarker('update-declined.flag');
-    WritePendingMarker();
-    ExitProcess(EXIT_DECLINED_USER);
-  end;
-
-  { Занят, решения ещё нет: сигналим приложению показать окно и откладываем. }
+  { Приложение занято — сигналим приложению показать окно выбора и откладываем }
+  { обновление (единый код). Решение (обновить/отложить) приложение обрабатывает }
+  { само; отдельного кода «отклонено» в KSC нет. }
   Log('VoiceInputLocal занят — сигнал приложению, обновление отложено.');
   WritePendingMarker();
   ExitProcess(EXIT_DEFERRED_BUSY);

@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
-"""Регресс-тесты US-055/US-057: интерактивное централизованное обновление.
+"""Регресс-тесты US-055/US-057 (упрощённая модель): централизованное обновление.
+
+Модель после упрощения (4.17.3): при занятости установщик ВСЕГДА возвращает
+101 «Отложено» (единый код), окно выбора показывает приложение. «Закрыть и
+обновить» → приложение закрывается (следующая попытка ставит), «Отклонить» →
+продолжаем работу. Отдельного кода «отклонено» (100) и маркера update-declined
+БОЛЬШЕ НЕТ.
 
 Инварианты:
+1. Функциональный: update_signal — маркер update-pending создаётся/читается/снимается.
+2. Статический guard ui.py: окно только при занятости, из тика таймера; accept
+   снимает маркер + закрывает приложение; decline снимает pending (без declined).
+3. Статический guard установщика: InitializeSetup + busy.lock/update-pending +
+   ExitProcess + код 101; declined/код 100 отсутствуют; [Dirs] users-modify.
 
-1. Функциональный: update_signal — маркеры update-pending / update-declined
-   в общесистемной папке приложения корректно создаются/читаются/снимаются.
-
-2. Статический guard ui.py: диалог «Обновить/Отклонить» показывается только при
-   занятости, вызывается из тика busy-таймера; accept снимает маркеры и закрывает
-   приложение, decline пишет declined и снимает pending.
-
-3. Статический guard установщика (installer/VoiceInputLocal.iss): InitializeSetup
-   реализует протокол (busy.lock / update-pending / update-declined), коды
-   возврата 100/101 через ExitProcess, секция [Dirs] с users-modify.
-
-Тесты headless (без Qt). Запуск: python tests/test_us057_central_update.py
+Запуск: python tests/test_us057_central_update.py
 """
 from __future__ import annotations
 
@@ -36,14 +36,10 @@ def _find_func(tree, name):
     return None
 
 
-def test_marker_read_write_clear():
+def test_pending_marker_read_write_clear():
     u.clear_update_pending()
-    u.clear_declined()
     assert not u.is_update_pending()
-    assert not u.is_declined()
-
     assert u.pending_path().name == "update-pending.flag"
-    assert u.declined_path().name == "update-declined.flag"
     assert "VoiceInputLocal" in str(u.pending_path())
 
     u.set_update_pending()
@@ -51,10 +47,9 @@ def test_marker_read_write_clear():
     u.clear_update_pending()
     assert not u.is_update_pending()
 
-    u.set_declined()
-    assert u.is_declined()
-    u.clear_declined()
-    assert not u.is_declined()
+    # Маркера «отклонено» в упрощённой модели быть не должно.
+    assert not hasattr(u, "set_declined"), "update_signal не должен содержать set_declined"
+    assert not hasattr(u, "declined_path"), "update_signal не должен содержать declined_path"
 
 
 def test_ui_wires_decision_dialog():
@@ -62,44 +57,45 @@ def test_ui_wires_decision_dialog():
     tree = ast.parse(ui_src)
 
     assert "update_signal" in ui_src, "ui.py не импортирует update_signal"
+    assert "set_declined" not in ui_src, "в упрощённой модели ui.py не должен звать set_declined"
 
     for name in ("_check_pending_update", "_accept_centralized_update", "_decline_centralized_update"):
         assert _find_func(tree, name) is not None, f"нет метода {name}"
 
     check = ast.get_source_segment(ui_src, _find_func(tree, "_check_pending_update")) or ""
-    assert "is_update_pending" in check, "_check_pending_update не проверяет update-pending"
-    assert "_app_is_busy" in check, "окно должно показываться только при занятости (_app_is_busy)"
+    assert "is_update_pending" in check and "_app_is_busy" in check, "окно только при pending И занятости"
 
     accept = ast.get_source_segment(ui_src, _find_func(tree, "_accept_centralized_update")) or ""
-    assert "clear_update_pending" in accept and "really_quit" in accept, "accept должен снять pending и закрыть приложение"
+    assert "clear_update_pending" in accept and "really_quit" in accept, "accept снимает pending и закрывает приложение"
 
     decline = ast.get_source_segment(ui_src, _find_func(tree, "_decline_centralized_update")) or ""
-    assert "set_declined" in decline and "clear_update_pending" in decline, "decline должен записать declined и снять pending"
+    assert "clear_update_pending" in decline, "decline снимает pending (продолжаем работу)"
 
     tick = ast.get_source_segment(ui_src, _find_func(tree, "_update_busy_marker")) or ""
     assert "_check_pending_update" in tick, "проверка pending не вызывается из тика busy-таймера"
 
 
-def test_installer_handshake_and_exit_codes():
+def test_installer_deferred_only():
     iss = (REPO_ROOT / "installer" / "VoiceInputLocal.iss").read_text(encoding="utf-8")
-    assert "function InitializeSetup" in iss, "в установщике нет InitializeSetup"
-    for token in ("busy.lock", "update-pending.flag", "update-declined.flag", "ExitProcess"):
+    assert "function InitializeSetup" in iss, "нет InitializeSetup"
+    for token in ("busy.lock", "update-pending.flag", "ExitProcess", "EXIT_DEFERRED_BUSY = 101"):
         assert token in iss, f"установщик не использует {token}"
-    assert "EXIT_DECLINED_USER = 100" in iss, "нет кода 100 (отклонено)"
-    assert "EXIT_DEFERRED_BUSY = 101" in iss, "нет кода 101 (отложено)"
-    assert "users-modify" in iss, "нет [Dirs] users-modify для обмена маркерами"
+    assert "users-modify" in iss, "нет [Dirs] users-modify"
+    # Регресс упрощения: код 100 и маркер declined удалены.
+    assert "update-declined" not in iss, "маркер update-declined должен быть удалён"
+    assert "EXIT_DECLINED_USER" not in iss, "код EXIT_DECLINED_USER должен быть удалён"
 
 
 def _run():
     tests = [
-        test_marker_read_write_clear,
+        test_pending_marker_read_write_clear,
         test_ui_wires_decision_dialog,
-        test_installer_handshake_and_exit_codes,
+        test_installer_deferred_only,
     ]
     for t in tests:
         t()
         print(f"PASS: {t.__name__}")
-    print("US-055/US-057 regression: ALL PASS")
+    print("US-055/US-057 (simplified) regression: ALL PASS")
 
 
 if __name__ == "__main__":

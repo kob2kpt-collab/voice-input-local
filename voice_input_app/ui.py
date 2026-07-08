@@ -2778,7 +2778,6 @@ class MainWindow(QMainWindow):
         # на следующей попытке KSC (busy.lock снят, файлы освобождены).
         try:
             update_signal.clear_update_pending()
-            update_signal.clear_declined()
             busy_marker.clear()
         except Exception:  # noqa: BLE001
             pass
@@ -2786,15 +2785,15 @@ class MainWindow(QMainWindow):
         self.really_quit()
 
     def _decline_centralized_update(self) -> None:
-        # US-057: пользователь отложил обновление. Пишем маркер отказа (установщик
-        # вернёт в KSC статус «отклонено») и снимаем pending. При следующей занятой
-        # попытке установщик перезапишет pending — окно появится снова.
+        # US-057 (упрощено): пользователь отложил — просто продолжаем работу.
+        # Снимаем pending, чтобы окно не всплыло сразу снова; при следующей занятой
+        # попытке установщик перезапишет pending и окно покажется опять. Отдельного
+        # статуса «отклонено» в KSC нет — при занятости установщик всегда «Отложено».
         try:
-            update_signal.set_declined()
             update_signal.clear_update_pending()
         except Exception:  # noqa: BLE001
             pass
-        self.status_label.setText("Централизованное обновление отложено по вашему выбору.")
+        self.status_label.setText("Обновление отложено — продолжайте работу.")
 
     def _dictation_model_key(self) -> str:
         """Активная или планируемая модель диктовки (берётся из cfg)."""
