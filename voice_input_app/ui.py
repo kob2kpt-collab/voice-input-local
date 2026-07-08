@@ -64,7 +64,7 @@ from .cloud_security_dialog import (
 )
 from .paths import app_icon_path, logs_dir, models_dir
 from .updater import UpdateInfo, launch_update_file, normalize_repo, updates_disabled_by_policy
-from . import busy_marker
+from . import busy_marker, update_signal
 from .workers import CloudConnectionCheckWorker, ConnectionVerifyWorker, LlmConnectionCheckWorker, PostProcessWorker, DownloadWorker, FileProgress, FileTranscribeWorker, FileTranscriptBlock, MicrophoneAutodetectWorker, MicrophoneAutodetectResult, PreloadWorker, SummarizeWorker, TranscribeWorker, UpdateCheckWorker, UpdateDownloadWorker
 try:
     from .summarizer import DEFAULT_SUMMARY_PROMPT
@@ -555,6 +555,8 @@ class MainWindow(QMainWindow):
         self._busy_marker_timer.setInterval(3000)
         self._busy_marker_timer.timeout.connect(self._update_busy_marker)
         self._busy_marker_timer.start()
+        # US-057: флаг открытого диалога решения о централизованном обновлении.
+        self._update_decision_open = False
 
         self.cancel_requested = False
         self.live_last_request_at = 0.0
@@ -1725,9 +1727,24 @@ class MainWindow(QMainWindow):
         self.tray.show()
 
     def show_from_tray(self) -> None:
+        # US-054: надёжно разворачиваем окно из трея/свёрнутого состояния и
+        # выводим на передний план — в т.ч. когда запрос пришёл от повторного
+        # запуска ярлыка при свёрнутой в трей программе.
         self.showNormal()
+        try:
+            self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+        except Exception:  # noqa: BLE001
+            pass
         self.raise_()
         self.activateWindow()
+        if sys.platform == "win32":
+            # Windows не даёт фоновому процессу поднять окно вперёд; работает в
+            # паре с AllowSetForegroundWindow(ASFW_ANY) во втором процессе.
+            try:
+                import ctypes
+                ctypes.windll.user32.SetForegroundWindow(int(self.winId()))
+            except Exception:  # noqa: BLE001
+                pass
 
     def on_tray_activated(self, reason) -> None:  # noqa: ANN001
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
@@ -2715,6 +2732,69 @@ class MainWindow(QMainWindow):
                 busy_marker.clear()
         except Exception:  # noqa: BLE001
             pass
+        # US-057: в том же тике проверяем, не ждёт ли централизованное обновление.
+        self._check_pending_update()
+
+    def _check_pending_update(self) -> None:
+        # US-057: установщик под SYSTEM не может показать окно — это делает
+        # приложение. Если пришло централизованное обновление (маркер
+        # update-pending) И идёт активная работа — спрашиваем пользователя.
+        # При простое окно не нужно: установщик поставит обновление тихо.
+        if self._update_decision_open:
+            return
+        try:
+            if not update_signal.is_update_pending():
+                return
+            if not self._app_is_busy():
+                return
+        except Exception:  # noqa: BLE001
+            return
+        self._update_decision_open = True
+        try:
+            box = QMessageBox(self)
+            box.setWindowTitle("Централизованное обновление")
+            box.setIcon(QMessageBox.Question)
+            box.setText(
+                "Готово обновление Voice Input Local, но сейчас идёт активная работа.\n\n"
+                "• «Закрыть и обновить» — приложение закроется, и обновление установится "
+                "автоматически в течение нескольких минут (текущая работа будет прервана).\n"
+                "• «Отклонить» — продолжить работу; обновление придёт позже."
+            )
+            update_btn = box.addButton("Закрыть и обновить", QMessageBox.AcceptRole)
+            box.addButton("Отклонить", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is update_btn:
+                self._accept_centralized_update()
+            else:
+                self._decline_centralized_update()
+        except Exception:  # noqa: BLE001
+            log.exception("Ошибка диалога централизованного обновления")
+        finally:
+            self._update_decision_open = False
+
+    def _accept_centralized_update(self) -> None:
+        # US-057: пользователь согласился прервать работу ради обновления.
+        # Снимаем маркеры и закрываем приложение — установщик поставит обновление
+        # на следующей попытке KSC (busy.lock снят, файлы освобождены).
+        try:
+            update_signal.clear_update_pending()
+            update_signal.clear_declined()
+            busy_marker.clear()
+        except Exception:  # noqa: BLE001
+            pass
+        log.info("Централизованное обновление принято пользователем — закрываю приложение")
+        self.really_quit()
+
+    def _decline_centralized_update(self) -> None:
+        # US-057: пользователь отложил обновление. Пишем маркер отказа (установщик
+        # вернёт в KSC статус «отклонено») и снимаем pending. При следующей занятой
+        # попытке установщик перезапишет pending — окно появится снова.
+        try:
+            update_signal.set_declined()
+            update_signal.clear_update_pending()
+        except Exception:  # noqa: BLE001
+            pass
+        self.status_label.setText("Централизованное обновление отложено по вашему выбору.")
 
     def _dictation_model_key(self) -> str:
         """Активная или планируемая модель диктовки (берётся из cfg)."""
@@ -5260,20 +5340,86 @@ class MainWindow(QMainWindow):
             recording, api_on, ", ".join(running) if running else "none",
         )
 
+    def _shutdown_workers(self) -> None:
+        """US-049: отменить и коротко (с общим бюджетом) подождать фоновые
+        QThread-воркеры перед выходом. os._exit(0) в really_quit всё равно
+        гарантирует завершение — этот метод лишь даёт воркерам шанс закрыть
+        свои ресурсы (файлы/соединения). Ожидание ограничено ~3с суммарно,
+        чтобы выход не подвисал.
+        """
+        worker_attrs = (
+            "transcribe_worker", "file_transcribe_worker", "preload_worker",
+            "download_worker", "microphone_autodetect_worker", "summarize_worker",
+            "update_check_worker", "update_download_worker", "live_worker",
+            "_postprocess_worker", "_llm_check_worker", "_cloud_check_worker",
+            "_check_worker", "_summary_check_worker",
+        )
+        running = []
+        for _name in worker_attrs:
+            _worker = getattr(self, _name, None)
+            if _worker is None:
+                continue
+            try:
+                if not _worker.isRunning():
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+            _cancel = getattr(_worker, "cancel", None)
+            if callable(_cancel):
+                try:
+                    _cancel()
+                except Exception:  # noqa: BLE001
+                    pass
+            running.append(_worker)
+        if not running:
+            return
+        deadline = time.monotonic() + 3.0
+        for _worker in running:
+            remaining_ms = int(max(0.0, deadline - time.monotonic()) * 1000)
+            try:
+                _worker.wait(remaining_ms if remaining_ms > 0 else 1)
+            except Exception:  # noqa: BLE001
+                pass
+
     def really_quit(self) -> None:
+        # US-049: гарантированный ПОЛНЫЙ выход. QApplication.quit(), вызванный
+        # из вложенного event loop контекстного меню трея, завершает ТОЛЬКО
+        # вложенный цикл — главный app.exec() продолжает крутиться, приложение
+        # остаётся «полуживым» (оверлей интерактивен, но hotkey уже снят →
+        # диктовка не работает). Подтверждено логами: пикер моделей срабатывал
+        # через 33с после quit(). Плюс при api_enabled uvicorn-потоки мешают
+        # чистой финализации. Поэтому: аккуратно гасим фон, затем ПРИНУДИТЕЛЬНО
+        # завершаем процесс через os._exit(0).
+        if getattr(self, "_quitting", False):
+            return
+        self._quitting = True
         self._log_running_workers_on_quit()
         self.unregister_cancel_hotkey()
-        if self.file_transcribe_worker and self.file_transcribe_worker.isRunning():
-            self.file_transcribe_worker.cancel()
-            self.file_transcribe_worker.wait(3000)
-        if self.transcribe_worker and self.transcribe_worker.isRunning():
-            self.transcribe_worker.wait(2000)
-        if self.preload_worker and self.preload_worker.isRunning():
-            self.preload_worker.wait(1500)
+        # 1) Останавливаем ВСЕ периодические таймеры (иначе тик 300мс может
+        #    заново показать оверлей / трогать UI во время разбора).
+        try:
+            for _val in list(self.__dict__.values()):
+                if isinstance(_val, QTimer):
+                    try:
+                        _val.stop()
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            pass
+        # 2) Снимаем глобальную горячую клавишу (keyboard hook).
         try:
             self.hotkey.stop()
         except Exception:  # noqa: BLE001
             pass
+        # 3) Освобождаем аудиоустройство (сброс без сохранения WAV).
+        try:
+            if getattr(self, "recorder", None) and self.recorder.is_recording:
+                self.recorder.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+        # 4) Отменяем и коротко ждём фоновые воркеры (best-effort).
+        self._shutdown_workers()
+        # 5) Убираем оверлей и трей с экрана.
         try:
             self.tray.hide()
         except Exception:  # noqa: BLE001
@@ -5282,7 +5428,61 @@ class MainWindow(QMainWindow):
             self.overlay.hide()
         except Exception:  # noqa: BLE001
             pass
-        QApplication.quit()
+        # 6) Сбрасываем буферы логов и ПРИНУДИТЕЛЬНО завершаем процесс.
+        #    Нельзя полагаться на QApplication.quit()/возврат из app.exec().
+        try:
+            import logging as _logging
+            _logging.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        os._exit(0)
+
+
+
+def _single_instance_server_name() -> str:
+    # Имя канала активации — per-user (именованные пайпы Windows машинно-глобальны,
+    # несколько пользователей на одной машине не должны мешать друг другу).
+    user = os.environ.get("USERNAME") or os.environ.get("USER") or "user"
+    return "VoiceInputLocal-activate-" + user
+
+
+def _activate_running_instance(server_name: str, timeout_ms: int = 400) -> bool:
+    """US-054: сигналит уже работающему экземпляру показать окно.
+
+    True — сигнал доставлен (окно развернёт работающий экземпляр); False —
+    канал недоступен, вызывающий покажет прежнее уведомление «уже запущено».
+    """
+    try:
+        from PySide6.QtNetwork import QLocalSocket
+    except Exception:  # noqa: BLE001
+        return False
+    # На Windows заранее отдаём право вывода окна вперёд любому процессу — этот,
+    # только что запущенный из ярлыка, обычно ещё владеет foreground-правом.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
+        except Exception:  # noqa: BLE001
+            pass
+    socket = QLocalSocket()
+    try:
+        socket.connectToServer(server_name)
+        if not socket.waitForConnected(timeout_ms):
+            return False
+        socket.write(b"SHOW\n")
+        socket.flush()
+        socket.waitForBytesWritten(timeout_ms)
+        # Ждём ACK сервера — гарантия, что он принял сигнал (и показал окно),
+        # прежде чем этот процесс завершится и закроет канал.
+        socket.waitForReadyRead(timeout_ms)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        try:
+            socket.disconnectFromServer()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def run() -> int:
@@ -5295,10 +5495,17 @@ def run() -> int:
     import tempfile as _tempfile
     _lock_dir = QStandardPaths.writableLocation(QStandardPaths.TempLocation) or _tempfile.gettempdir()
     _lock_path = str(Path(_lock_dir) / "VoiceInputLocal.lock")
+    _server_name = _single_instance_server_name()
     _lock = QLockFile(_lock_path)
     _lock.setStaleLockTime(30000)
     if not _lock.tryLock(100):
-        log.warning("Another VoiceInputLocal instance is already running (lock=%s). Exiting.", _lock_path)
+        # US-054: экземпляр уже запущен — просим его показать окно, а не открываем
+        # «вторую версию». Канал недоступен -> прежнее уведомление (fallback).
+        log.info("Another VoiceInputLocal instance is running — requesting activation (server=%s).", _server_name)
+        if _activate_running_instance(_server_name):
+            log.info("Activation signal delivered to running instance; exiting silently.")
+            return 0
+        log.warning("Could not signal running instance (lock=%s) — showing 'already running' notice.", _lock_path)
         try:
             QMessageBox.information(
                 None,
@@ -5316,4 +5523,39 @@ def run() -> int:
         app.setWindowIcon(QIcon(str(icon_path)))
     window = MainWindow()
     window.show()
+
+    # US-054: слушаем канал активации, чтобы повторный запуск ярлыка/.exe
+    # разворачивал ЭТО окно (второй процесс шлёт сигнал и выходит).
+    try:
+        from PySide6.QtNetwork import QLocalServer
+        QLocalServer.removeServer(_server_name)  # снять устаревший канал (после крэша)
+        _activation_server = QLocalServer()
+
+        def _on_activation_request() -> None:
+            sock = _activation_server.nextPendingConnection()
+            if sock is not None:
+                try:
+                    if not sock.bytesAvailable():
+                        sock.waitForReadyRead(500)
+                    sock.readAll()
+                    sock.write(b"OK\n")  # ACK: второй процесс дождётся доставки
+                    sock.flush()
+                    sock.waitForBytesWritten(200)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    sock.disconnectFromServer()
+                except Exception:  # noqa: BLE001
+                    pass
+            log.info("Activation request received — showing window from tray.")
+            window.show_from_tray()
+
+        _activation_server.newConnection.connect(_on_activation_request)
+        if _activation_server.listen(_server_name):
+            app._voice_input_activation_server = _activation_server  # type: ignore[attr-defined]
+        else:
+            log.warning("Activation server listen failed (%s): %s", _server_name, _activation_server.errorString())
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to start activation server (US-054); continuing without it.")
+
     return app.exec()

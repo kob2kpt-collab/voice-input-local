@@ -3,6 +3,7 @@ build/
 dist/
 release/*.exe
 release/*.zip
+version_info.txt
 __pycache__/
 *.pyc
 *.pyo
