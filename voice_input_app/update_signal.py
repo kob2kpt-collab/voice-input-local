@@ -27,6 +27,13 @@ from .paths import program_data_dir
 log = get_logger("update_signal")
 
 UPDATE_PENDING_NAME = "update-pending.flag"
+# US-058: маркер «закройся для тихого обновления при простое» (установщик ->
+# приложение). При ПРОСТОЕ установщик не может закрыть трей-приложение
+# кросс-сессионно (он под SYSTEM, сессия 0), поэтому просит приложение закрыться
+# само и в том же прогоне ждёт освобождения .exe (single-pass). Приложение,
+# закрываясь, оставляет фоновый релончер, который перезапустит его после
+# установки. Имя/расположение файла — КОНТРАКТ с Pascal-кодом установщика.
+UPDATE_CLOSE_NAME = "update-close.flag"
 
 
 def pending_path() -> Path:
@@ -50,3 +57,28 @@ def clear_update_pending() -> None:
         pending_path().unlink(missing_ok=True)
     except OSError:
         log.debug("Не удалось снять маркер update-pending", exc_info=True)
+
+
+# --- US-058: маркер закрытия ради тихого обновления при простое ---
+
+def close_request_path() -> Path:
+    return program_data_dir() / UPDATE_CLOSE_NAME
+
+
+def set_update_close() -> None:
+    """Записать сигнал «закройся для обновления» (пишет установщик; в приложении — для тестов)."""
+    try:
+        close_request_path().write_text("1", encoding="ascii")
+    except OSError:
+        log.debug("Не удалось записать маркер update-close", exc_info=True)
+
+
+def is_update_close() -> bool:
+    return close_request_path().exists()
+
+
+def clear_update_close() -> None:
+    try:
+        close_request_path().unlink(missing_ok=True)
+    except OSError:
+        log.debug("Не удалось снять маркер update-close", exc_info=True)

@@ -551,12 +551,18 @@ class MainWindow(QMainWindow):
         # US-048: снять устаревший маркер, оставшийся после аварийного
         # завершения (при старте единственного экземпляра работа не идёт).
         busy_marker.clear()
+        # US-058: снять устаревший маркер запроса закрытия для обновления
+        # (мог остаться после аварийного завершения; single-instance lock
+        # гарантирует, что при старте активной работы нет).
+        update_signal.clear_update_close()
         self._busy_marker_timer = QTimer(self)
         self._busy_marker_timer.setInterval(3000)
         self._busy_marker_timer.timeout.connect(self._update_busy_marker)
         self._busy_marker_timer.start()
         # US-057: флаг открытого диалога решения о централизованном обновлении.
         self._update_decision_open = False
+        # US-058: флаг «идёт тихое закрытие ради обновления при простое».
+        self._idle_update_closing = False
 
         self.cancel_requested = False
         self.live_last_request_at = 0.0
@@ -2734,6 +2740,8 @@ class MainWindow(QMainWindow):
             pass
         # US-057: в том же тике проверяем, не ждёт ли централизованное обновление.
         self._check_pending_update()
+        # US-058: и не просит ли установщик закрыться для тихого обновления (простой).
+        self._check_idle_update_close()
 
     def _check_pending_update(self) -> None:
         # US-057: установщик под SYSTEM не может показать окно — это делает
@@ -2794,6 +2802,109 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             pass
         self.status_label.setText("Обновление отложено — продолжайте работу.")
+
+    def _check_idle_update_close(self) -> None:
+        # US-058: при ПРОСТОЕ установщик (под SYSTEM, сессия 0) не может закрыть
+        # трей-приложение пользовательской сессии кросс-сессионно, поэтому сигналит
+        # маркером update-close, а приложение закрывается САМО, оставляя фоновый
+        # релончер (перезапустит после установки). Только frozen-сборка (в dev
+        # перезапуск python.exe бессмыслен) и только при простое.
+        if getattr(self, "_idle_update_closing", False) or getattr(self, "_quitting", False):
+            return
+        if getattr(self, "_update_decision_open", False):
+            return
+        if not getattr(sys, "frozen", False):
+            return
+        try:
+            if not update_signal.is_update_close():
+                return
+            if self._app_is_busy():
+                # Стал занят после сигнала — не закрываемся; установщик отложит
+                # (таймаут -> код 101), KSC повторит позже.
+                return
+        except Exception:  # noqa: BLE001
+            return
+        self._idle_update_closing = True
+        log.info("US-058: сигнал update-close при простое — показываю сообщение, запускаю релончер, закрываюсь.")
+        try:
+            self.status_label.setText("Обновление устанавливается, программа перезапустится…")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.tray.showMessage(
+                "Voice Input Local",
+                "Обновление устанавливается, программа перезапустится…",
+                QSystemTrayIcon.Information,
+                4000,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        self._spawn_update_relauncher()
+        # Короткая пауза, чтобы пользователь увидел сообщение, затем полный выход.
+        QTimer.singleShot(1500, self.really_quit)
+
+    def _spawn_update_relauncher(self) -> None:
+        # US-058: фоновый процесс в сессии пользователя, переживает закрытие
+        # приложения, ждёт ЗАВЕРШЕНИЯ установки (разблокировка .exe + смена времени
+        # модификации файла = установщик заменил его) и заново запускает приложение
+        # с флагом --after-update. Предохранитель: по таймауту запускает то, что
+        # есть, чтобы пользователь не остался без программы. Обычный powershell —
+        # без нового бинарника сборки; запускает ПРИЛОЖЕНИЕ (сессия пользователя),
+        # а не установщик (тот под SYSTEM — стартовал бы в сессии 0).
+        try:
+            import base64
+            import subprocess
+
+            exe = sys.executable
+            exe_ps = exe.replace("'", "''")  # экранирование для PS-строки в кавычках
+            ps = (
+                "$ErrorActionPreference='SilentlyContinue';"
+                "$exe='" + exe_ps + "';"
+                "$old=(Get-Item $exe).LastWriteTimeUtc.Ticks;"
+                "$deadline=(Get-Date).AddMinutes(4);"
+                "while((Get-Date) -lt $deadline){"
+                "  try{"
+                "    $fs=[IO.File]::Open($exe,'Open','Read','None');$fs.Close();"
+                "    $cur=(Get-Item $exe).LastWriteTimeUtc.Ticks;"
+                "    if($cur -ne $old){break}"
+                "  }catch{}"
+                "  Start-Sleep -Milliseconds 700"
+                "}"
+                "Start-Sleep -Milliseconds 500;"
+                "Start-Process -FilePath $exe -ArgumentList '--after-update'"
+            )
+            encoded = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NO_WINDOW = 0x08000000
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-NonInteractive",
+                 "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
+                creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            log.info("US-058: релончер запущен (ждёт установку, перезапустит с --after-update).")
+        except Exception:  # noqa: BLE001
+            log.exception("US-058: не удалось запустить релончер обновления")
+
+    def notify_after_update(self) -> None:
+        # US-058: тост после перезапуска новой версией (флаг --after-update).
+        try:
+            self.tray.showMessage(
+                "Voice Input Local",
+                f"Обновлено до v{__version__}",
+                QSystemTrayIcon.Information,
+                5000,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.status_label.setText(f"Обновлено до версии {__version__}.")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _dictation_model_key(self) -> str:
         """Активная или планируемая модель диктовки (берётся из cfg)."""
@@ -5522,6 +5633,13 @@ def run() -> int:
         app.setWindowIcon(QIcon(str(icon_path)))
     window = MainWindow()
     window.show()
+
+    # US-058: если нас перезапустил релончер после тихого обновления — тост.
+    if "--after-update" in sys.argv:
+        try:
+            QTimer.singleShot(1500, window.notify_after_update)
+        except Exception:  # noqa: BLE001
+            pass
 
     # US-054: слушаем канал активации, чтобы повторный запуск ярлыка/.exe
     # разворачивал ЭТО окно (второй процесс шлёт сигнал и выходит).

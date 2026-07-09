@@ -1,7 +1,7 @@
 #define MyAppName "Voice Input Local"
 #define MyAppExeName "VoiceInputLocal.exe"
 #ifndef MyAppVersion
-#define MyAppVersion "4.17.3"
+#define MyAppVersion "4.17.4"
 #endif
 
 [Setup]
@@ -55,12 +55,14 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Запустить Voice Input 
 Name: "{commonappdata}\VoiceInputLocal"; Permissions: users-modify
 
 [Code]
-{ US-048 + US-055 + US-057: обработка централизованного обновления во время }
-{ активной работы пользователя, с возвратом реального статуса в KSC. }
+{ US-048 + US-055 + US-057 + US-058: обработка централизованного обновления во }
+{ время активной работы пользователя И при простое, с возвратом статуса в KSC. }
 {                                                                             }
 { Обмен через маркеры в %ProgramData%\VoiceInputLocal: }
 {  - busy.lock            — приложение занято (US-048); }
-{  - update-pending.flag  — установщик -> приложению: «покажи окно выбора». }
+{  - update-pending.flag  — установщик -> приложению: «покажи окно выбора» (занят); }
+{  - update-close.flag    — установщик -> приложению: «закройся для тихого }
+{                           обновления при простое» (US-058). }
 { Решение пользователя (обновить сейчас / отложить) приложение обрабатывает }
 { само: «Закрыть и обновить» снимает busy.lock и закрывается (следующая попытка }
 { видит простой и ставит обновление), «Отклонить» просто продолжает работу. }
@@ -72,11 +74,26 @@ Name: "{commonappdata}\VoiceInputLocal"; Permissions: users-modify
 
 const
   EXIT_DEFERRED_BUSY = 101;
+  { US-058: WinAPI-константы для проверки, залочен ли .exe работающим приложением. }
+  GENERIC_READ = $80000000;
+  OPEN_EXISTING = 3;
+  INVALID_HANDLE_VALUE = $FFFFFFFF;
+  { US-058: сколько ждать самозакрытия приложения по сигналу update-close (мс). }
+  CLOSE_WAIT_TIMEOUT_MS = 20000;
 
 { Штатный InitializeSetup=False даёт generic-код, поэтому для «отложено» }
 { выходим кастомным кодом через ExitProcess (ничего ещё не изменено). }
 procedure ExitProcess(uExitCode: Cardinal);
   external 'ExitProcess@kernel32.dll stdcall';
+
+{ US-058: открыть файл эксклюзивно на чтение удаётся только если приложение }
+{ закрыто — у работающего процесса .exe залочен как загруженный образ. }
+function CreateFileW(lpFileName: String; dwDesiredAccess, dwShareMode,
+  lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes,
+  hTemplateFile: Cardinal): Cardinal;
+  external 'CreateFileW@kernel32.dll stdcall';
+function CloseHandle(hObject: Cardinal): Boolean;
+  external 'CloseHandle@kernel32.dll stdcall';
 
 function DataDir(): String;
 begin
@@ -97,10 +114,56 @@ begin
     DeleteFile(Path);
 end;
 
-procedure WritePendingMarker();
+procedure WriteMarker(const Name: String);
 begin
   ForceDirectories(DataDir());
-  SaveStringToFile(DataDir() + '\update-pending.flag', '1', False);
+  SaveStringToFile(DataDir() + '\' + Name, '1', False);
+end;
+
+procedure WritePendingMarker();
+begin
+  WriteMarker('update-pending.flag');
+end;
+
+{ US-058: .exe свободен (приложение закрыто или ещё не установлено)? }
+function ExeIsFree(): Boolean;
+var
+  h: Cardinal;
+  ExePath: String;
+begin
+  ExePath := ExpandConstant('{app}\VoiceInputLocal.exe');
+  if not FileExists(ExePath) then
+  begin
+    Result := True;  { файла нет — первичная установка, считаем «свободен» }
+    Exit;
+  end;
+  h := CreateFileW(ExePath, GENERIC_READ, 0, 0, OPEN_EXISTING, 0, 0);
+  if h = INVALID_HANDLE_VALUE then
+  begin
+    Result := False;  { залочен работающим приложением }
+    Exit;
+  end;
+  CloseHandle(h);
+  Result := True;
+end;
+
+{ US-058: ждём самозакрытия приложения по сигналу update-close до таймаута. }
+function WaitForExeFree(TimeoutMs: Integer): Boolean;
+var
+  Waited: Integer;
+begin
+  Waited := 0;
+  while Waited < TimeoutMs do
+  begin
+    if ExeIsFree() then
+    begin
+      Result := True;
+      Exit;
+    end;
+    Sleep(1000);
+    Waited := Waited + 1000;
+  end;
+  Result := ExeIsFree();
 end;
 
 function InitializeSetup(): Boolean;
@@ -109,15 +172,38 @@ begin
 
   if not MarkerExists('busy.lock') then
   begin
-    { Приложение простаивает — ставим тихо (CloseApplications=yes закроет }
-    { простаивающий экземпляр). Чистим сигнальный маркер. }
+    { Приложение простаивает или закрыто. US-058: НЕ полагаемся на }
+    { CloseApplications кросс-сессионно — установщик под SYSTEM (сессия 0) не }
+    { закроет трей-приложение пользовательской сессии через Restart Manager }
+    { (подтверждено тестом v4.17.3: обновление вставало только при закрытом app). }
     ClearMarker('update-pending.flag');
-    Exit;
+    if ExeIsFree() then
+    begin
+      { приложение не запущено — ставим сразу }
+      ClearMarker('update-close.flag');
+      Exit;
+    end;
+    { приложение открыто и простаивает — просим его закрыться и ждём в этом же }
+    { прогоне (single-pass). Приложение покажет сообщение, оставит фоновый }
+    { релончер и закроется; после установки релончер перезапустит его. }
+    Log('VoiceInputLocal открыт и простаивает — сигнал update-close, жду закрытия.');
+    WriteMarker('update-close.flag');
+    if WaitForExeFree(CLOSE_WAIT_TIMEOUT_MS) then
+    begin
+      ClearMarker('update-close.flag');
+      Exit;  { закрылось — ставим тихо }
+    end;
+    { Не закрылось за таймаут (например, старая версия без обработчика US-058) — }
+    { откладываем; KSC повторит задачу позже. }
+    ClearMarker('update-close.flag');
+    Log('VoiceInputLocal не закрылся за таймаут — обновление отложено.');
+    ExitProcess(EXIT_DEFERRED_BUSY);
   end;
 
-  { Приложение занято — сигналим приложению показать окно выбора и откладываем }
-  { обновление (единый код). Решение (обновить/отложить) приложение обрабатывает }
-  { само; отдельного кода «отклонено» в KSC нет. }
+  { Приложение занято — US-057: сигналим приложению показать окно выбора и }
+  { откладываем обновление (единый код). Решение (обновить/отложить) приложение }
+  { обрабатывает само; отдельного кода «отклонено» в KSC нет. }
+  ClearMarker('update-close.flag');
   Log('VoiceInputLocal занят — сигнал приложению, обновление отложено.');
   WritePendingMarker();
   ExitProcess(EXIT_DEFERRED_BUSY);
