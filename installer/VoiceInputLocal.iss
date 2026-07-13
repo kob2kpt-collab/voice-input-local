@@ -1,7 +1,7 @@
 #define MyAppName "Voice Input Local"
 #define MyAppExeName "VoiceInputLocal.exe"
 #ifndef MyAppVersion
-#define MyAppVersion "4.17.4"
+#define MyAppVersion "4.17.7"
 #endif
 
 [Setup]
@@ -62,10 +62,12 @@ Name: "{commonappdata}\VoiceInputLocal"; Permissions: users-modify
 {  - busy.lock            — приложение занято (US-048); }
 {  - update-pending.flag  — установщик -> приложению: «покажи окно выбора» (занят); }
 {  - update-close.flag    — установщик -> приложению: «закройся для тихого }
-{                           обновления при простое» (US-058). }
-{ Решение пользователя (обновить сейчас / отложить) приложение обрабатывает }
-{ само: «Закрыть и обновить» снимает busy.lock и закрывается (следующая попытка }
-{ видит простой и ставит обновление), «Отклонить» просто продолжает работу. }
+{                           обновления при простое» (US-058); }
+{  - update-decline.flag  — приложение -> установщику: «пользователь отклонил» (US-059). }
+{ Решение пользователя приложение обрабатывает само: «Закрыть и обновить» -> }
+{ показывает сообщение и закрывается; установщик ждёт этого в том же прогоне и }
+{ ставит обновление (код 0). US-061: приложение НЕ запускает процессов — возврат }
+{ штатным автозапуском Windows. «Отклонить» -> update-decline, установщик -> 101. }
 {                                                                             }
 { Коды возврата (US-055) для KSC: }
 {  0   — обновление установлено; }
@@ -75,25 +77,35 @@ Name: "{commonappdata}\VoiceInputLocal"; Permissions: users-modify
 const
   EXIT_DEFERRED_BUSY = 101;
   { US-058: WinAPI-константы для проверки, залочен ли .exe работающим приложением. }
-  GENERIC_READ = $80000000;
+  { ВАЖНО: нужен доступ на ЗАПИСЬ — у запущенного .exe чтение с share=0 проходит. }
+  GENERIC_WRITE = $40000000;
   OPEN_EXISTING = 3;
   INVALID_HANDLE_VALUE = $FFFFFFFF;
+  ERROR_SHARING_VIOLATION = 32;
   { US-058: сколько ждать самозакрытия приложения по сигналу update-close (мс). }
   CLOSE_WAIT_TIMEOUT_MS = 20000;
+  { US-059: сколько ждать решения пользователя на «занятом» пути (мс). ВАЖНО: }
+  { таймаут задачи KSC должен быть БОЛЬШЕ этого значения (иначе задача упадёт по времени). }
+  BUSY_DECISION_TIMEOUT_MS = 180000;
 
 { Штатный InitializeSetup=False даёт generic-код, поэтому для «отложено» }
 { выходим кастомным кодом через ExitProcess (ничего ещё не изменено). }
 procedure ExitProcess(uExitCode: Cardinal);
   external 'ExitProcess@kernel32.dll stdcall';
 
-{ US-058: открыть файл эксклюзивно на чтение удаётся только если приложение }
-{ закрыто — у работающего процесса .exe залочен как загруженный образ. }
+{ US-058 (fix): «занят ли .exe» определяется запросом доступа НА ЗАПИСЬ. }
+{ Проверено экспериментом: у ЗАПУЩЕННОГО .exe открытие на ЧТЕНИЕ даже с }
+{ share=0 УСПЕШНО (образ процесса не мешает чтению) — так занятость не поймать. }
+{ Открытие на ЗАПИСЬ даёт ERROR_SHARING_VIOLATION (32). Это и есть вопрос, }
+{ важный установщику: «смогу ли я перезаписать файл?». }
 function CreateFileW(lpFileName: String; dwDesiredAccess, dwShareMode,
   lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes,
   hTemplateFile: Cardinal): Cardinal;
   external 'CreateFileW@kernel32.dll stdcall';
 function CloseHandle(hObject: Cardinal): Boolean;
   external 'CloseHandle@kernel32.dll stdcall';
+function GetLastError(): Cardinal;
+  external 'GetLastError@kernel32.dll stdcall';
 
 function DataDir(): String;
 begin
@@ -125,22 +137,42 @@ begin
   WriteMarker('update-pending.flag');
 end;
 
+{ US-058 (fix 4.17.5): путь к УСТАНОВЛЕННОМУ .exe берём из реестра (запись Inno }
+{ об установке), а НЕ из константы приложения: в InitializeSetup она ещё НЕ }
+{ инициализирована, поэтому обращение к ней давало runtime error «app constant }
+{ before it was initialized». Ключ Uninstall\<AppId>_is1, «Inno Setup: App Path». }
+function InstalledExePath(): String;
+var
+  Dir: String;
+begin
+  Result := '';
+  if RegQueryStringValue(HKLM64,
+       'Software\Microsoft\Windows\CurrentVersion\Uninstall\{E2F24D29-1774-4F64-9A34-4D2B6E9F4C41}_is1',
+       'Inno Setup: App Path', Dir) then
+    if Dir <> '' then
+      Result := AddBackslash(Dir) + 'VoiceInputLocal.exe';
+end;
+
 { US-058: .exe свободен (приложение закрыто или ещё не установлено)? }
 function ExeIsFree(): Boolean;
 var
-  h: Cardinal;
+  h, err: Cardinal;
   ExePath: String;
 begin
-  ExePath := ExpandConstant('{app}\VoiceInputLocal.exe');
-  if not FileExists(ExePath) then
+  ExePath := InstalledExePath();
+  if (ExePath = '') or (not FileExists(ExePath)) then
   begin
-    Result := True;  { файла нет — первичная установка, считаем «свободен» }
+    Result := True;  { не установлено ранее / файла нет — считаем «свободен» }
     Exit;
   end;
-  h := CreateFileW(ExePath, GENERIC_READ, 0, 0, OPEN_EXISTING, 0, 0);
+  h := CreateFileW(ExePath, GENERIC_WRITE, 0, 0, OPEN_EXISTING, 0, 0);
   if h = INVALID_HANDLE_VALUE then
   begin
-    Result := False;  { залочен работающим приложением }
+    err := GetLastError();
+    { Только 32 (sharing violation) означает «файл держит работающее приложение». }
+    { Прочие ошибки (напр. 5 — нет прав) считаем «свободен», чтобы не блокировать }
+    { установку навсегда; дальше Inno сам сообщит о проблеме. }
+    Result := (err <> ERROR_SHARING_VIOLATION);
     Exit;
   end;
   CloseHandle(h);
@@ -164,6 +196,23 @@ begin
     Waited := Waited + 1000;
   end;
   Result := ExeIsFree();
+end;
+
+{ US-059: ждём решения пользователя на «занятом» пути. 0 = ставить (приложение }
+{ закрылось по «Закрыть и обновить»), 1 = отложить (отклонено или таймаут). }
+function WaitBusyDecision(): Integer;
+var
+  Waited: Integer;
+begin
+  Waited := 0;
+  while Waited < BUSY_DECISION_TIMEOUT_MS do
+  begin
+    if ExeIsFree() then begin Result := 0; Exit; end;
+    if MarkerExists('update-decline.flag') then begin Result := 1; Exit; end;
+    Sleep(1000);
+    Waited := Waited + 1000;
+  end;
+  Result := 1;
 end;
 
 function InitializeSetup(): Boolean;
@@ -200,11 +249,22 @@ begin
     ExitProcess(EXIT_DEFERRED_BUSY);
   end;
 
-  { Приложение занято — US-057: сигналим приложению показать окно выбора и }
-  { откладываем обновление (единый код). Решение (обновить/отложить) приложение }
-  { обрабатывает само; отдельного кода «отклонено» в KSC нет. }
+  { Приложение занято — US-057/US-059: показываем окно выбора и ЖДЁМ решения в }
+  { этом же прогоне (single-pass). «Закрыть и обновить» -> приложение закроется }
+  { (exe освободится) -> ставим сразу (код 0), релончер перезапустит. «Отклонить» }
+  { -> приложение пишет update-decline -> откладываем (101). Нет ответа -> 101. }
   ClearMarker('update-close.flag');
-  Log('VoiceInputLocal занят — сигнал приложению, обновление отложено.');
+  ClearMarker('update-decline.flag');
   WritePendingMarker();
+  Log('VoiceInputLocal занят — сигнал приложению, жду решения пользователя.');
+  if WaitBusyDecision() = 0 then
+  begin
+    ClearMarker('update-pending.flag');
+    ClearMarker('update-decline.flag');
+    Exit;  { «Закрыть и обновить»: приложение закрылось -> ставим (0), релончер перезапустит }
+  end;
+  ClearMarker('update-pending.flag');
+  ClearMarker('update-decline.flag');
+  Log('Обновление отложено (пользователь отклонил или истёк таймаут решения).');
   ExitProcess(EXIT_DEFERRED_BUSY);
 end;

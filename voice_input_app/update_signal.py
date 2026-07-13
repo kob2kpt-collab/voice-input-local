@@ -34,6 +34,9 @@ UPDATE_PENDING_NAME = "update-pending.flag"
 # закрываясь, оставляет фоновый релончер, который перезапустит его после
 # установки. Имя/расположение файла — КОНТРАКТ с Pascal-кодом установщика.
 UPDATE_CLOSE_NAME = "update-close.flag"
+# US-059: приложение -> установщику «пользователь отклонил обновление» (занятый путь,
+# короткое замыкание ожидания установщика). Имя/расположение — КОНТРАКТ с Pascal-кодом.
+UPDATE_DECLINE_NAME = "update-decline.flag"
 
 
 def pending_path() -> Path:
@@ -82,3 +85,27 @@ def clear_update_close() -> None:
         close_request_path().unlink(missing_ok=True)
     except OSError:
         log.debug("Не удалось снять маркер update-close", exc_info=True)
+
+
+# --- US-059: маркер отказа пользователя (приложение -> установщику) ---
+
+def decline_path() -> Path:
+    return program_data_dir() / UPDATE_DECLINE_NAME
+
+
+def set_update_decline() -> None:
+    try:
+        decline_path().write_text("1", encoding="ascii")
+    except OSError:
+        log.debug("Не удалось записать маркер update-decline", exc_info=True)
+
+
+def is_update_decline() -> bool:
+    return decline_path().exists()
+
+
+def clear_update_decline() -> None:
+    try:
+        decline_path().unlink(missing_ok=True)
+    except OSError:
+        log.debug("Не удалось снять маркер update-decline", exc_info=True)
