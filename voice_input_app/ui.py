@@ -33,9 +33,11 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QKeySequenceEdit,
     QScrollArea,
+    QSlider,
     QSpinBox,
     QSystemTrayIcon,
     QStyle,
+    QStyleOptionSlider,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -198,6 +200,71 @@ class NoScrollSpinBox(QSpinBox):
                 return
             ancestor = ancestor.parent()
         event.ignore()
+
+
+class NoScrollSlider(QSlider):
+    """QSlider, который НЕ реагирует на прокрутку колесом мыши (BUG-05).
+
+    По образцу NoScrollComboBox (BUG-01) / NoScrollSpinBox (BUG-04): курсор над
+    ползунком не должен случайно менять значение при прокрутке страницы настроек.
+    Значение меняется только двумя способами:
+      * клик по дорожке — ручка сразу встаёт на позицию курсора (а не шагает на
+        pageStep, как по умолчанию у QSlider);
+      * захват ручки и её перетаскивание — штатным механизмом QSlider.
+
+    Колесо мыши над ползунком пересылается в ближайший QScrollArea, чтобы
+    прокручивалась вкладка настроек, а не значение ползунка.
+    """
+
+    def wheelEvent(self, event) -> None:  # noqa: ANN001
+        # Значение колесом не меняем НИКОГДА (даже в фокусе) — только прокрутка вкладки.
+        ancestor = self.parent()
+        while ancestor is not None:
+            if isinstance(ancestor, QScrollArea):
+                ancestor.wheelEvent(event)
+                return
+            ancestor = ancestor.parent()
+        event.ignore()
+
+    def mousePressEvent(self, event) -> None:  # noqa: ANN001
+        # Левый клик по дорожке — сразу на позицию курсора; клик по ручке — обычное
+        # перетаскивание. После setValue ручка оказывается под курсором, поэтому
+        # базовый mousePressEvent подхватывает её и тянет дальше без лишнего шага.
+        if event.button() == Qt.LeftButton:
+            opt = QStyleOptionSlider()
+            self.initStyleOption(opt)
+            handle = self.style().subControlRect(
+                QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self
+            )
+            point = event.position().toPoint()
+            if not handle.contains(point):
+                self.setValue(self._value_from_pos(point))
+        super().mousePressEvent(event)
+
+    def _value_from_pos(self, point) -> int:  # noqa: ANN001
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        groove = self.style().subControlRect(
+            QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self
+        )
+        handle = self.style().subControlRect(
+            QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self
+        )
+        if self.orientation() == Qt.Horizontal:
+            slider_min = groove.x()
+            slider_max = groove.right() - handle.width() + 1
+            pos = point.x() - handle.width() // 2
+        else:
+            slider_min = groove.y()
+            slider_max = groove.bottom() - handle.height() + 1
+            pos = point.y() - handle.height() // 2
+        return QStyle.sliderValueFromPosition(
+            self.minimum(),
+            self.maximum(),
+            pos - slider_min,
+            slider_max - slider_min,
+            opt.upsideDown,
+        )
 
 
 class ConnectionDialog(QDialog):
@@ -957,8 +1024,8 @@ class MainWindow(QMainWindow):
         dgl.addRow("Тишина (облако)", _trim_cell)
 
         # EPIC-10/US-039: непрерывный ползунок агрессивности (0..100) вместо трёх пунктов
-        from PySide6.QtWidgets import QSlider
-        self.cloud_trim_aggr_slider = QSlider(Qt.Horizontal)
+        # BUG-05: NoScrollSlider — без реакции на колесо; клик по дорожке — сразу на значение
+        self.cloud_trim_aggr_slider = NoScrollSlider(Qt.Horizontal)
         self.cloud_trim_aggr_slider.setRange(0, 100)
         self.cloud_trim_aggr_slider.setSingleStep(5)
         self.cloud_trim_aggr_slider.setPageStep(10)
