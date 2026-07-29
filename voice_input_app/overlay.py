@@ -46,7 +46,7 @@ class RecordingOverlay(QWidget):
     settings_requested = Signal()     # из пустого состояния пикера — «Открыть настройки»
     picker_requested = Signal()       # правый клик по плашке в состоянии Ready
     picker_cancelled = Signal()       # Escape в режиме пикера
-    toggle_recording_requested = Signal()  # двойной клик в состояниях Ready / Запись
+    toggle_recording_requested = Signal()  # двойной клик вне режима пикера
 
     COMPACT_MIN_WIDTH = 70
     COMPACT_MAX_WIDTH = 112
@@ -56,7 +56,15 @@ class RecordingOverlay(QWidget):
     PREVIEW_MAX_HEIGHT = 240
 
     def __init__(self) -> None:
-        flags = Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+        # WA_ShowWithoutActivating защищает только момент показа окна. Отдельный
+        # WindowDoesNotAcceptFocus не даёт обычному клику сделать overlay
+        # foreground-окном и тем самым сломать автовставку в исходное поле.
+        flags = (
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowDoesNotAcceptFocus
+        )
         super().__init__(None, flags)
         try:
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -68,13 +76,11 @@ class RecordingOverlay(QWidget):
         self._drag_start: QPoint | None = None
         self._hotkey = "Ctrl+Alt+Space"
         self._result_text = ""
-        # Состояние плашки для безопасной обработки двойного клика. Запрос на
-        # переключение записи разрешён только в Ready и во время записи; все
-        # промежуточные статусы его игнорируют. _in_picker=True пока показан
-        # выбор облачной модели (на это время снимаем WA_ShowWithoutActivating,
-        # чтобы popup QComboBox получал фокус; восстанавливаем при выходе).
+        # _idle управляет только быстрым выбором модели по правому клику.
+        # Политику старта/остановки записи определяет MainWindow.toggle_recording,
+        # а не визуальное состояние overlay. _in_picker=True пока показан выбор
+        # модели: на это время окно снова принимает фокус для popup QComboBox.
         self._idle = False
-        self._recording = False
         self._in_picker = False
         self._return_timer = QTimer(self)
         self._return_timer.setSingleShot(True)
@@ -278,7 +284,6 @@ class RecordingOverlay(QWidget):
         if self._in_picker:
             self._exit_picker_mode()
         self._idle = False
-        self._recording = False
         self._hide_picker_widgets()
         self.status_label.setText(status)
         self.dot_label.setText("●")
@@ -302,7 +307,7 @@ class RecordingOverlay(QWidget):
 
     def show_idle(self, message: str = "Ready") -> None:
         self._set_state(message, "#22c55e", compact=True)
-        # Из Ready двойной клик запускает запись.
+        # Из Ready доступен быстрый выбор модели по правому клику.
         self._idle = True
 
     def hide_overlay(self) -> None:
@@ -315,7 +320,6 @@ class RecordingOverlay(QWidget):
             self._exit_picker_mode()
         self._hide_picker_widgets()
         self._idle = False
-        self._recording = False
         self.hide()
 
     def reset_for_new_recording(self, *, live_enabled: bool = False) -> None:
@@ -331,8 +335,6 @@ class RecordingOverlay(QWidget):
     def show_recording(self, elapsed: float = 0.0, *, live_enabled: bool = False) -> None:
         # Live is disabled in the stable build, so recording remains compact.
         self._set_state("Запись", "#ef4444", compact=True)
-        # Во время записи двойной клик останавливает её и запускает расшифровку.
-        self._recording = True
 
     def show_processing(self, label: str = "Распознаю") -> None:
         self._set_state(label, "#f59e0b", compact=True)
@@ -355,7 +357,6 @@ class RecordingOverlay(QWidget):
         """Show final transcript when there was no target text field."""
         self._return_timer.stop()
         self._idle = False
-        self._recording = False
         self._result_text = text.strip()
         if not self._result_text:
             self.show_idle()
@@ -391,6 +392,14 @@ class RecordingOverlay(QWidget):
         except AttributeError:
             self.setAttribute(Qt.WA_ShowWithoutActivating, value)
 
+    def _set_accepts_focus(self, value: bool) -> None:
+        """Разрешить фокус только интерактивному пикеру моделей."""
+        try:
+            flag = Qt.WindowType.WindowDoesNotAcceptFocus
+        except AttributeError:
+            flag = Qt.WindowDoesNotAcceptFocus
+        self.setWindowFlag(flag, not value)
+
     def _hide_picker_widgets(self) -> None:
         self.picker_info.setVisible(False)
         self.picker_combo.setVisible(False)
@@ -400,11 +409,12 @@ class RecordingOverlay(QWidget):
     def _exit_picker_mode(self) -> None:
         """Выйти из режима пикера и вернуть non-activating поведение плашки.
 
-        WA_ShowWithoutActivating восстанавливается обязательно — иначе при
-        последующей диктовке overlay мог бы перехватывать фокус и ломать
-        вставку текста в активное окно (см. CLAUDE.md, раздел про overlay).
+        Оба ограничения фокуса восстанавливаются обязательно — иначе обычный
+        клик по overlay перехватит foreground и сломает вставку текста в
+        исходное активное окно.
         """
         self._in_picker = False
+        self._set_accepts_focus(False)
         self._set_show_without_activating(True)
         self._hide_picker_widgets()
 
@@ -427,7 +437,6 @@ class RecordingOverlay(QWidget):
         """
         self._return_timer.stop()
         self._idle = False
-        self._recording = False
         self._in_picker = True
         self._result_text = ""
         self.preview_label.setText("")
@@ -465,8 +474,9 @@ class RecordingOverlay(QWidget):
             else:
                 self.picker_hint.setVisible(False)
 
-        # На время пикера разрешаем плашке активироваться, иначе popup combo
-        # не получит фокус и выбор будет невозможен.
+        # На время пикера разрешаем плашке активироваться и принимать фокус,
+        # иначе popup combo не сможет обрабатывать клавиатуру и выбор модели.
+        self._set_accepts_focus(True)
         self._set_show_without_activating(False)
         if not self.isVisible():
             self.show()
@@ -524,9 +534,10 @@ class RecordingOverlay(QWidget):
         event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: ANN001
-        # Двойной клик переключает запись только из Ready или состояния записи.
-        # Распознавание, постобработка, результат, ошибка и пикер его игнорируют.
-        if event.button() == Qt.LeftButton and not self._in_picker and (self._idle or self._recording):
+        # Overlay сообщает только о намерении пользователя. Реальные состояния,
+        # параллельные задачи и технические блокировки проверяет общий обработчик
+        # MainWindow.toggle_recording. В пикере двойной клик принадлежит его UI.
+        if event.button() == Qt.LeftButton and not self._in_picker:
             self._drag_start = None
             self.toggle_recording_requested.emit()
             event.accept()

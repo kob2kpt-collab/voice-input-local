@@ -598,7 +598,7 @@ class MainWindow(QMainWindow):
         # Двойной клик по плашке использует тот же переключатель, что основная
         # кнопка и глобальная горячая клавиша.
         self.overlay.toggle_recording_requested.connect(self.toggle_recording)
-        self._overlay_picker_context = "parallel"
+        self._overlay_picker_context = "quick"
         self._last_file_overlay_text = "Файл…"
         self.model_status_overrides: dict[str, str] = {}
         self.downloading_keys: set[str] = set()
@@ -4417,7 +4417,7 @@ class MainWindow(QMainWindow):
         self.cfg.save()
         self.refresh_available_models_combo(force_current=True)
         self.overlay.show_idle()
-        ctx = getattr(self, "_overlay_picker_context", "parallel")
+        ctx = getattr(self, "_overlay_picker_context", "quick")
         if ctx == "parallel":
             self.status_label.setText(
                 f"Выбрана модель «{model_display_name(key)}». Дважды щёлкните по плашке "

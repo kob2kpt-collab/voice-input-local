@@ -36,18 +36,43 @@ def _double_click(overlay: RecordingOverlay) -> None:
     _APP.processEvents()
 
 
-def test_double_click_requests_toggle_in_ready_and_recording() -> None:
+def _window_does_not_accept_focus_flag():
+    try:
+        return Qt.WindowType.WindowDoesNotAcceptFocus
+    except AttributeError:
+        return Qt.WindowDoesNotAcceptFocus
+
+
+def _show_without_activating_attribute():
+    try:
+        return Qt.WidgetAttribute.WA_ShowWithoutActivating
+    except AttributeError:
+        return Qt.WA_ShowWithoutActivating
+
+
+def test_double_click_requests_toggle_outside_picker() -> None:
     overlay = RecordingOverlay()
     hits: list[bool] = []
     overlay.toggle_recording_requested.connect(lambda: hits.append(True))
     try:
-        overlay.show_idle()
-        _double_click(overlay)
-        assert len(hits) == 1, "двойной клик в Ready не запросил старт записи"
+        states = [
+            lambda: overlay.show_idle(),
+            lambda: overlay.show_recording(),
+            lambda: overlay.show_processing(),
+            lambda: overlay.show_error("Ошибка", seconds=60),
+            lambda: overlay.show_cancelled(seconds=60),
+            lambda: overlay.show_result_text("Готовый результат"),
+        ]
+        for expected_hits, set_state in enumerate(states, start=1):
+            set_state()
+            _double_click(overlay)
+            assert len(hits) == expected_hits, (
+                "визуальное состояние overlay не должно блокировать общий toggle_recording"
+            )
 
-        overlay.show_recording()
+        overlay.show_model_picker([("cloud:test:model", "Cloud model")])
         _double_click(overlay)
-        assert len(hits) == 2, "двойной клик во время записи не запросил остановку"
+        assert len(hits) == len(states), "двойной клик не должен управлять записью внутри пикера"
     finally:
         overlay.close()
 
@@ -102,22 +127,33 @@ def test_overlay_explains_both_mouse_actions() -> None:
         overlay.close()
 
 
-def test_double_click_is_ignored_in_noninteractive_states() -> None:
+def test_overlay_accepts_focus_only_in_picker() -> None:
     overlay = RecordingOverlay()
-    hits: list[bool] = []
-    overlay.toggle_recording_requested.connect(lambda: hits.append(True))
+    no_focus = _window_does_not_accept_focus_flag()
+    show_without_activating = _show_without_activating_attribute()
     try:
-        states = [
-            lambda: overlay.show_processing(),
-            lambda: overlay.show_error("Ошибка", seconds=60),
-            lambda: overlay.show_cancelled(seconds=60),
-            lambda: overlay.show_result_text("Готовый результат"),
-            lambda: overlay.show_model_picker([("cloud:test:model", "Cloud model")]),
-        ]
-        for set_state in states:
-            set_state()
-            _double_click(overlay)
-        assert not hits, "двойной клик сработал во время обработки/результата/пикера"
+        overlay.move(120, 80)
+        overlay.show_idle()
+        _APP.processEvents()
+        original_position = overlay.pos()
+
+        assert overlay.windowFlags() & no_focus, "обычная плашка не должна принимать фокус"
+        assert overlay.testAttribute(show_without_activating)
+        assert overlay.isVisible()
+
+        overlay.show_model_picker([("cloud:test:model", "Cloud model")])
+        _APP.processEvents()
+        assert not (overlay.windowFlags() & no_focus), "пикеру нужен фокус для QComboBox"
+        assert not overlay.testAttribute(show_without_activating)
+        assert overlay.isVisible()
+        assert overlay.pos() == original_position, "пикер изменил сохранённую позицию плашки"
+
+        overlay.show_idle()
+        _APP.processEvents()
+        assert overlay.windowFlags() & no_focus, "после пикера защита фокуса не восстановлена"
+        assert overlay.testAttribute(show_without_activating)
+        assert overlay.isVisible()
+        assert overlay.pos() == original_position, "выход из пикера изменил позицию плашки"
     finally:
         overlay.close()
 
@@ -131,11 +167,11 @@ def test_main_window_uses_common_toggle_handler() -> None:
 
 def _run() -> None:
     tests = [
-        test_double_click_requests_toggle_in_ready_and_recording,
+        test_double_click_requests_toggle_outside_picker,
         test_single_click_does_not_request_toggle,
         test_right_click_requests_picker_only_in_ready,
         test_overlay_explains_both_mouse_actions,
-        test_double_click_is_ignored_in_noninteractive_states,
+        test_overlay_accepts_focus_only_in_picker,
         test_main_window_uses_common_toggle_handler,
     ]
     for test in tests:
