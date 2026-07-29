@@ -598,6 +598,9 @@ class MainWindow(QMainWindow):
         # Двойной клик по плашке использует тот же переключатель, что основная
         # кнопка и глобальная горячая клавиша.
         self.overlay.toggle_recording_requested.connect(self.toggle_recording)
+        self._audio_level_timer = QTimer(self)
+        self._audio_level_timer.setInterval(50)
+        self._audio_level_timer.timeout.connect(self._update_overlay_audio_level)
         self._overlay_picker_context = "quick"
         self._last_file_overlay_text = "Файл…"
         self.model_status_overrides: dict[str, str] = {}
@@ -3874,9 +3877,11 @@ class MainWindow(QMainWindow):
             if self.cfg.overlay_enabled:
                 self.overlay.reset_for_new_recording(live_enabled=self.cfg.live_transcription)
                 self.overlay.show_recording(0.0, live_enabled=self.cfg.live_transcription)
+            self._start_overlay_audio_level_updates()
             self.update_recording_badge()
             log.info("Recording started. live_target_is_text_field=%s own_window=%s model=%s", self.live_target_is_text_field, self.recording_started_in_own_window, self.cfg.selected_model)
         except Exception as exc:  # noqa: BLE001
+            self._stop_overlay_audio_level_updates()
             log.exception("Recording start failed")
             self.toggle_btn.setText("Начать запись")
             self.status_label.setText("Запись недоступна. Подробности записаны в логи.")
@@ -3885,6 +3890,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Запись недоступна", str(exc))
 
     def stop_recording(self) -> None:
+        self._stop_overlay_audio_level_updates()
         try:
             wav_path, duration = self.recorder.stop_to_wav()
             if duration < 1.0:
@@ -3942,6 +3948,7 @@ class MainWindow(QMainWindow):
         final_running = bool(self.transcribe_worker and self.transcribe_worker.isRunning())
         if self.recorder.is_recording:
             self.recorder.cancel()
+        self._stop_overlay_audio_level_updates()
         self.toggle_btn.setText("Начать запись")
         self.toggle_btn.setEnabled(not final_running)
         self.record_badge.setText("Отменено")
@@ -4228,6 +4235,22 @@ class MainWindow(QMainWindow):
     def on_timer_tick(self) -> None:
         self.update_recording_badge()
         self.maybe_start_live_transcription()
+
+    def _start_overlay_audio_level_updates(self) -> None:
+        self.overlay.set_audio_level(0.0)
+        if not self._audio_level_timer.isActive():
+            self._audio_level_timer.start()
+
+    def _stop_overlay_audio_level_updates(self) -> None:
+        self._audio_level_timer.stop()
+        self.overlay.set_audio_level(0.0)
+
+    def _update_overlay_audio_level(self) -> None:
+        if not self.recorder.is_recording:
+            self._stop_overlay_audio_level_updates()
+            return
+        if self.cfg.overlay_enabled:
+            self.overlay.set_audio_level(self.recorder.input_level)
 
     def update_recording_badge(self) -> None:
         if self.recorder.is_recording:

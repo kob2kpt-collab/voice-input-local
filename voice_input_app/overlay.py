@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QPoint, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -29,6 +30,53 @@ class HotkeySafeComboBox(QComboBox):
             event.ignore()
             return
         super().keyPressEvent(event)
+
+
+class AudioLevelWaveform(QWidget):
+    """Small rolling microphone-level waveform for the compact overlay."""
+
+    BAR_COUNT = 7
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(20, 14)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAccessibleName("Уровень микрофона")
+        self._levels = [0.0] * self.BAR_COUNT
+
+    def set_level(self, level: float) -> None:
+        target = float(level)
+        if not math.isfinite(target):
+            target = 0.0
+        target = max(0.0, min(1.0, target))
+        if target < 0.03:
+            target = 0.0
+        previous = self._levels[-1]
+        smoothing = 0.72 if target > previous else 0.28
+        smoothed = previous + (target - previous) * smoothing
+        self._levels = [*self._levels[1:], smoothed]
+        self.update()
+
+    def reset(self) -> None:
+        self._levels = [0.0] * self.BAR_COUNT
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: ANN001
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#ef4444"))
+
+        bar_width = 2.0
+        gap = (self.width() - self.BAR_COUNT * bar_width) / (self.BAR_COUNT - 1)
+        min_height = 2.0
+        max_height = float(self.height() - 2)
+        for index, level in enumerate(self._levels):
+            bar_height = min_height + level * (max_height - min_height)
+            x = index * (bar_width + gap)
+            y = (self.height() - bar_height) / 2.0
+            painter.drawRoundedRect(QRectF(x, y, bar_width, bar_height), 1.0, 1.0)
 
 
 class RecordingOverlay(QWidget):
@@ -81,6 +129,7 @@ class RecordingOverlay(QWidget):
         # а не визуальное состояние overlay. _in_picker=True пока показан выбор
         # модели: на это время окно снова принимает фокус для popup QComboBox.
         self._idle = False
+        self._recording = False
         self._in_picker = False
         self._return_timer = QTimer(self)
         self._return_timer.setSingleShot(True)
@@ -148,9 +197,12 @@ class RecordingOverlay(QWidget):
 
         self.top_row = QHBoxLayout()
         self.top_row.setSpacing(4)
+        self.level_waveform = AudioLevelWaveform()
+        self.level_waveform.setVisible(False)
         self.dot_label = QLabel("●")
         self.dot_label.setObjectName("Dot")
         self.status_label = QLabel("Ready")
+        self.top_row.addWidget(self.level_waveform)
         self.top_row.addWidget(self.dot_label)
         self.top_row.addWidget(self.status_label, 1)
         self.card_layout.addLayout(self.top_row)
@@ -278,7 +330,23 @@ class RecordingOverlay(QWidget):
         height = max(self.COMPACT_HEIGHT, hint.height())
         self.resize(QSize(width, height))
 
-    def _set_state(self, status: str, dot_color: str, *, compact: bool, auto_ready_ms: int | None = None) -> None:
+    def _set_recording_visual(self, active: bool) -> None:
+        changed = active != self._recording
+        self._recording = active
+        self.level_waveform.setVisible(active)
+        self.dot_label.setVisible(not active)
+        if changed:
+            self.level_waveform.reset()
+
+    def _set_state(
+        self,
+        status: str,
+        dot_color: str,
+        *,
+        compact: bool,
+        auto_ready_ms: int | None = None,
+        recording: bool = False,
+    ) -> None:
         self._return_timer.stop()
         # Любой обычный статус выводит плашку из режима пикера.
         if self._in_picker:
@@ -288,6 +356,7 @@ class RecordingOverlay(QWidget):
         self.status_label.setText(status)
         self.dot_label.setText("●")
         self.dot_label.setStyleSheet(f"color: {dot_color};")
+        self._set_recording_visual(recording)
         if compact:
             self._result_text = ""
             self.preview_label.setText("")
@@ -320,6 +389,7 @@ class RecordingOverlay(QWidget):
             self._exit_picker_mode()
         self._hide_picker_widgets()
         self._idle = False
+        self._set_recording_visual(False)
         self.hide()
 
     def reset_for_new_recording(self, *, live_enabled: bool = False) -> None:
@@ -330,11 +400,16 @@ class RecordingOverlay(QWidget):
         self.preview_label.setMaximumHeight(self.PREVIEW_MAX_HEIGHT)
         self.preview_label.setVisible(False)
         self.copy_btn.setVisible(False)
+        self.level_waveform.reset()
         self.show_recording(0.0, live_enabled=live_enabled)
 
     def show_recording(self, elapsed: float = 0.0, *, live_enabled: bool = False) -> None:
         # Live is disabled in the stable build, so recording remains compact.
-        self._set_state("Запись", "#ef4444", compact=True)
+        self._set_state("Запись", "#ef4444", compact=True, recording=True)
+
+    def set_audio_level(self, level: float) -> None:
+        if self._recording:
+            self.level_waveform.set_level(level)
 
     def show_processing(self, label: str = "Распознаю") -> None:
         self._set_state(label, "#f59e0b", compact=True)
@@ -357,6 +432,7 @@ class RecordingOverlay(QWidget):
         """Show final transcript when there was no target text field."""
         self._return_timer.stop()
         self._idle = False
+        self._set_recording_visual(False)
         self._result_text = text.strip()
         if not self._result_text:
             self.show_idle()
@@ -437,6 +513,7 @@ class RecordingOverlay(QWidget):
         """
         self._return_timer.stop()
         self._idle = False
+        self._set_recording_visual(False)
         self._in_picker = True
         self._result_text = ""
         self.preview_label.setText("")
