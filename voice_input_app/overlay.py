@@ -41,11 +41,12 @@ class RecordingOverlay(QWidget):
 
     copy_requested = Signal(str)
     position_changed = Signal(int, int)
-    # US-019 / US-038: выбор модели через overlay.
+    # US-019: выбор облачной модели через overlay при конфликте локальных задач.
     model_selected = Signal(str)      # пользователь выбрал модель (ключ)
     settings_requested = Signal()     # из пустого состояния пикера — «Открыть настройки»
-    picker_requested = Signal()       # двойной клик по плашке в состоянии Ready
+    picker_requested = Signal()       # правый клик по плашке в состоянии Ready
     picker_cancelled = Signal()       # Escape в режиме пикера
+    toggle_recording_requested = Signal()  # двойной клик вне режима пикера
 
     COMPACT_MIN_WIDTH = 70
     COMPACT_MAX_WIDTH = 112
@@ -55,7 +56,15 @@ class RecordingOverlay(QWidget):
     PREVIEW_MAX_HEIGHT = 240
 
     def __init__(self) -> None:
-        flags = Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+        # WA_ShowWithoutActivating защищает только момент показа окна. Отдельный
+        # WindowDoesNotAcceptFocus не даёт обычному клику сделать overlay
+        # foreground-окном и тем самым сломать автовставку в исходное поле.
+        flags = (
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowDoesNotAcceptFocus
+        )
         super().__init__(None, flags)
         try:
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -67,10 +76,10 @@ class RecordingOverlay(QWidget):
         self._drag_start: QPoint | None = None
         self._hotkey = "Ctrl+Alt+Space"
         self._result_text = ""
-        # US-019 / US-038: состояние плашки. _idle=True только в Ready; двойной
-        # клик открывает пикер моделей лишь из этого состояния. _in_picker=True
-        # пока показан выбор модели (на это время снимаем WA_ShowWithoutActivating,
-        # чтобы popup QComboBox получал фокус; восстанавливаем при выходе).
+        # _idle управляет только быстрым выбором модели по правому клику.
+        # Политику старта/остановки записи определяет MainWindow.toggle_recording,
+        # а не визуальное состояние overlay. _in_picker=True пока показан выбор
+        # модели: на это время окно снова принимает фокус для popup QComboBox.
         self._idle = False
         self._in_picker = False
         self._return_timer = QTimer(self)
@@ -146,6 +155,13 @@ class RecordingOverlay(QWidget):
         self.top_row.addWidget(self.status_label, 1)
         self.card_layout.addLayout(self.top_row)
 
+        self._interaction_tooltip = (
+            "Двойной левый клик — начать или остановить запись\n"
+            "Правый клик — выбрать модель"
+        )
+        for widget in (self, self.card, self.dot_label, self.status_label):
+            widget.setToolTip(self._interaction_tooltip)
+
         self.preview_label = QLabel("")
         self.preview_label.setObjectName("Preview")
         self.preview_label.setWordWrap(True)
@@ -159,7 +175,7 @@ class RecordingOverlay(QWidget):
         self.copy_btn.clicked.connect(self._copy_clicked)
         self.card_layout.addWidget(self.copy_btn)
 
-        # US-019 / US-038: виджеты режима выбора модели (по умолчанию скрыты).
+        # US-019: виджеты режима выбора облачной модели (по умолчанию скрыты).
         self.picker_info = QLabel("")
         self.picker_info.setObjectName("PickerInfo")
         self.picker_info.setWordWrap(True)
@@ -291,7 +307,7 @@ class RecordingOverlay(QWidget):
 
     def show_idle(self, message: str = "Ready") -> None:
         self._set_state(message, "#22c55e", compact=True)
-        # Только из Ready доступен быстрый выбор модели по двойному клику.
+        # Из Ready доступен быстрый выбор модели по правому клику.
         self._idle = True
 
     def hide_overlay(self) -> None:
@@ -340,6 +356,7 @@ class RecordingOverlay(QWidget):
     def show_result_text(self, text: str) -> None:
         """Show final transcript when there was no target text field."""
         self._return_timer.stop()
+        self._idle = False
         self._result_text = text.strip()
         if not self._result_text:
             self.show_idle()
@@ -367,13 +384,21 @@ class RecordingOverlay(QWidget):
         if self._result_text:
             self.copy_requested.emit(self._result_text)
 
-    # ── US-019 / US-038: режим выбора модели ──────────────────────────────
+    # ── US-019: режим выбора облачной модели ──────────────────────────────
 
     def _set_show_without_activating(self, value: bool) -> None:
         try:
             self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, value)
         except AttributeError:
             self.setAttribute(Qt.WA_ShowWithoutActivating, value)
+
+    def _set_accepts_focus(self, value: bool) -> None:
+        """Разрешить фокус только интерактивному пикеру моделей."""
+        try:
+            flag = Qt.WindowType.WindowDoesNotAcceptFocus
+        except AttributeError:
+            flag = Qt.WindowDoesNotAcceptFocus
+        self.setWindowFlag(flag, not value)
 
     def _hide_picker_widgets(self) -> None:
         self.picker_info.setVisible(False)
@@ -384,11 +409,12 @@ class RecordingOverlay(QWidget):
     def _exit_picker_mode(self) -> None:
         """Выйти из режима пикера и вернуть non-activating поведение плашки.
 
-        WA_ShowWithoutActivating восстанавливается обязательно — иначе при
-        последующей диктовке overlay мог бы перехватывать фокус и ломать
-        вставку текста в активное окно (см. CLAUDE.md, раздел про overlay).
+        Оба ограничения фокуса восстанавливаются обязательно — иначе обычный
+        клик по overlay перехватит foreground и сломает вставку текста в
+        исходное активное окно.
         """
         self._in_picker = False
+        self._set_accepts_focus(False)
         self._set_show_without_activating(True)
         self._hide_picker_widgets()
 
@@ -448,8 +474,9 @@ class RecordingOverlay(QWidget):
             else:
                 self.picker_hint.setVisible(False)
 
-        # На время пикера разрешаем плашке активироваться, иначе popup combo
-        # не получит фокус и выбор будет невозможен.
+        # На время пикера разрешаем плашке активироваться и принимать фокус,
+        # иначе popup combo не сможет обрабатывать клавиатуру и выбор модели.
+        self._set_accepts_focus(True)
         self._set_show_without_activating(False)
         if not self.isVisible():
             self.show()
@@ -472,7 +499,7 @@ class RecordingOverlay(QWidget):
         return self._in_picker
 
     def keyPressEvent(self, event) -> None:  # noqa: ANN001
-        # US-019/US-038: Escape в режиме пикера закрывает список; в какое
+        # US-019: Escape в режиме пикера закрывает список; в какое
         # состояние вернуть overlay (Ready или прогресс файла) решает MainWindow
         # по контексту пикера через сигнал picker_cancelled.
         if self._in_picker and event.key() == Qt.Key_Escape:
@@ -482,6 +509,12 @@ class RecordingOverlay(QWidget):
         super().keyPressEvent(event)
 
     def mousePressEvent(self, event) -> None:  # noqa: ANN001
+        if event.button() == Qt.RightButton:
+            self._drag_start = None
+            if self._idle and not self._in_picker:
+                self.picker_requested.emit()
+            event.accept()
+            return
         if event.button() == Qt.LeftButton:
             self._drag_start = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             event.accept()
@@ -493,15 +526,20 @@ class RecordingOverlay(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: ANN001
         self._drag_start = None
+        if event.button() == Qt.RightButton:
+            event.accept()
+            return
         self._ensure_visible_on_screen()
         self.position_changed.emit(self.pos().x(), self.pos().y())
         event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: ANN001
-        # US-038: быстрый выбор модели по двойному клику — только из Ready.
-        if event.button() == Qt.LeftButton and self._idle and not self._in_picker:
+        # Overlay сообщает только о намерении пользователя. Реальные состояния,
+        # параллельные задачи и технические блокировки проверяет общий обработчик
+        # MainWindow.toggle_recording. В пикере двойной клик принадлежит его UI.
+        if event.button() == Qt.LeftButton and not self._in_picker:
             self._drag_start = None
-            self.picker_requested.emit()
+            self.toggle_recording_requested.emit()
             event.accept()
             return
         event.accept()

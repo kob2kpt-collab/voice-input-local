@@ -590,11 +590,14 @@ class MainWindow(QMainWindow):
         self.overlay.restore_position(self.cfg.overlay_x, self.cfg.overlay_y)
         self.overlay.copy_requested.connect(self.copy_overlay_result)
         self.overlay.position_changed.connect(self.on_overlay_position_changed)
-        # US-019 / US-038: выбор модели через overlay-пикер.
+        # US-019: автоматический выбор облачной модели через overlay-пикер.
         self.overlay.model_selected.connect(self.on_overlay_model_chosen)
         self.overlay.settings_requested.connect(self.on_overlay_settings_requested)
         self.overlay.picker_requested.connect(self.on_overlay_picker_requested)
         self.overlay.picker_cancelled.connect(self.on_overlay_picker_cancelled)
+        # Двойной клик по плашке использует тот же переключатель, что основная
+        # кнопка и глобальная горячая клавиша.
+        self.overlay.toggle_recording_requested.connect(self.toggle_recording)
         self._overlay_picker_context = "quick"
         self._last_file_overlay_text = "Файл…"
         self.model_status_overrides: dict[str, str] = {}
@@ -4321,7 +4324,7 @@ class MainWindow(QMainWindow):
         self.cfg.overlay_y = int(y)
         self.cfg.save()
 
-    # ── US-019 / US-038: выбор модели через overlay ──────────────────────
+    # ── US-019: выбор облачной модели через overlay ──────────────────────
 
     def _cloud_models_for_picker(self) -> list[tuple[str, str]]:
         """Доступные облачные модели (key, label) для пикера US-019."""
@@ -4332,7 +4335,7 @@ class MainWindow(QMainWindow):
         return out
 
     def _all_models_for_picker(self) -> list[tuple[str, str]]:
-        """Все доступные модели (локальные + облачные) для быстрого выбора (US-038)."""
+        """Все доступные модели для быстрого выбора правым кликом по плашке."""
         out: list[tuple[str, str]] = []
         for key in self.models.available_model_keys():
             if not is_cloud_model_key(key):
@@ -4369,8 +4372,7 @@ class MainWindow(QMainWindow):
             )
 
     def on_overlay_picker_requested(self) -> None:
-        """TASK-123 (US-038): двойной клик по overlay в Ready → быстрый выбор
-        модели диктовки из всех доступных (локальные + облачные)."""
+        """Правый клик по overlay в Ready открывает быстрый выбор модели."""
         if not self.cfg.overlay_enabled:
             return
         self._overlay_picker_context = "quick"
@@ -4391,7 +4393,7 @@ class MainWindow(QMainWindow):
             )
 
     def on_overlay_model_chosen(self, key: str) -> None:
-        """TASK-071/124: применить выбор модели из overlay-пикера.
+        """TASK-071: применить выбор модели из overlay-пикера.
 
         Для облачных моделей — единый привратник безопасности US-018
         (_confirm_cloud_model_switch). При подтверждении: cfg.selected_model,
@@ -4418,7 +4420,8 @@ class MainWindow(QMainWindow):
         ctx = getattr(self, "_overlay_picker_context", "quick")
         if ctx == "parallel":
             self.status_label.setText(
-                f"Выбрана модель «{model_display_name(key)}». Нажмите {self.cfg.hotkey} ещё раз, чтобы начать диктовку."
+                f"Выбрана модель «{model_display_name(key)}». Дважды щёлкните по плашке "
+                f"или нажмите {self.cfg.hotkey}, чтобы начать диктовку."
             )
         else:
             self.status_label.setText(f"Модель диктовки: {model_display_name(key)}")
@@ -4436,10 +4439,11 @@ class MainWindow(QMainWindow):
             pass
 
     def on_overlay_picker_cancelled(self) -> None:
-        """TASK-126 (US-019/US-038): Escape в overlay-пикере. Возврат в корректное
-        состояние: для контекста 'parallel' (идёт локальная расшифровка файла) —
-        обратно к показу прогресса файла; для 'quick' — в Ready. Модель НЕ меняется,
-        поэтому при следующей попытке локальной диктовки пикер появится снова."""
+        """Escape закрывает пикер и возвращает корректное состояние плашки.
+
+        При конфликте локальных задач возвращается прогресс файла; после
+        быстрого выбора правым кликом — Ready. Модель не меняется.
+        """
         ctx = getattr(self, "_overlay_picker_context", "quick")
         if ctx == "parallel" and self.is_file_busy():
             self.overlay.show_processing(getattr(self, "_last_file_overlay_text", "Файл…"))
