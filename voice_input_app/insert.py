@@ -1,12 +1,146 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import time
 from ctypes import wintypes
-from typing import Optional
+from typing import Optional, Protocol
 
 import pyperclip
+
+
+log = logging.getLogger(__name__)
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+
+VK_SHIFT = 0x10
+VK_CONTROL = 0x11
+VK_MENU = 0x12
+VK_V = 0x56
+VK_LWIN = 0x5B
+VK_RWIN = 0x5C
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", wintypes.WPARAM),
+    ]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    # INPUT is a union. MOUSEINPUT must be present even though this module only
+    # sends keys; otherwise ctypes would calculate the wrong INPUT size on x64.
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", wintypes.WPARAM),
+    ]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [
+        ("mi", MOUSEINPUT),
+        ("ki", KEYBDINPUT),
+        ("hi", HARDWAREINPUT),
+    ]
+
+
+class INPUT(ctypes.Structure):
+    _anonymous_ = ("value",)
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("value", _INPUTUNION),
+    ]
+
+
+class InputBackend(Protocol):
+    def any_pressed(self, virtual_keys: tuple[int, ...]) -> bool: ...
+
+    def send(self, inputs: list[INPUT]) -> tuple[int, int]: ...
+
+
+class Win32InputBackend:
+    """Small, write-only wrapper around Win32 SendInput.
+
+    It does not install hooks or receive keyboard events. GetAsyncKeyState is
+    queried once immediately before pasting so we do not mix Ctrl+V with keys
+    that the user is physically holding.
+    """
+
+    def __init__(self) -> None:
+        if os.name != "nt":
+            raise RuntimeError("Автовставка поддерживается только в Windows.")
+        self._user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self._user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+        self._user32.GetAsyncKeyState.restype = ctypes.c_short
+        self._user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+        self._user32.SendInput.restype = wintypes.UINT
+
+    def any_pressed(self, virtual_keys: tuple[int, ...]) -> bool:
+        return any(bool(self._user32.GetAsyncKeyState(key) & 0x8000) for key in virtual_keys)
+
+    def send(self, inputs: list[INPUT]) -> tuple[int, int]:
+        batch = (INPUT * len(inputs))(*inputs)
+        ctypes.set_last_error(0)
+        sent = int(self._user32.SendInput(len(batch), batch, ctypes.sizeof(INPUT)))
+        return sent, int(ctypes.get_last_error())
+
+
+def _keyboard_event(virtual_key: int, *, key_up: bool = False) -> INPUT:
+    event = INPUT()
+    event.type = INPUT_KEYBOARD
+    event.ki = KEYBDINPUT(
+        wVk=virtual_key,
+        wScan=0,
+        dwFlags=KEYEVENTF_KEYUP if key_up else 0,
+        time=0,
+        dwExtraInfo=0,
+    )
+    return event
+
+
+def _ctrl_v_events() -> list[INPUT]:
+    return [
+        _keyboard_event(VK_CONTROL),
+        _keyboard_event(VK_V),
+        _keyboard_event(VK_V, key_up=True),
+        _keyboard_event(VK_CONTROL, key_up=True),
+    ]
+
+
+def _release_paste_keys(backend: InputBackend) -> None:
+    cleanup = [
+        _keyboard_event(VK_V, key_up=True),
+        _keyboard_event(VK_CONTROL, key_up=True),
+    ]
+    try:
+        sent, error_code = backend.send(cleanup)
+        if sent != len(cleanup):
+            log.error(
+                "Synthetic paste key cleanup incomplete: accepted=%d expected=%d error=%d",
+                sent,
+                len(cleanup),
+                error_code,
+            )
+    except Exception:  # noqa: BLE001
+        log.exception("Could not release synthetic paste keys after partial SendInput")
 
 
 class RECT(ctypes.Structure):
@@ -149,26 +283,47 @@ def focused_control_accepts_text() -> Optional[bool]:
     return caret_result
 
 
-def _send_ctrl_v() -> bool:
-    """Send Ctrl+V using the most reliable available method."""
+def _send_ctrl_v(backend: InputBackend | None = None) -> bool:
+    """Submit one atomic Ctrl+V batch through Win32 SendInput.
+
+    True means Windows accepted all four input events. It does not claim that
+    an arbitrary target application changed its document; Windows exposes no
+    privacy-preserving, universal acknowledgement for that.
+    """
     try:
-        import keyboard  # type: ignore
+        backend = backend or Win32InputBackend()
+        guard_keys = (VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, VK_V)
+        if backend.any_pressed(guard_keys):
+            log.warning("Auto-paste skipped because a modifier or V is currently pressed")
+            return False
 
-        keyboard.send("ctrl+v")
-        return True
-    except Exception:
-        pass
-
-    try:
-        import pyautogui  # type: ignore
-
-        pyautogui.hotkey("ctrl", "v")
-        return True
-    except Exception:
+        events = _ctrl_v_events()
+        sent, error_code = backend.send(events)
+        if sent == len(events):
+            log.info("Auto-paste SendInput accepted all %d events", sent)
+            return True
+        if sent > 0:
+            _release_paste_keys(backend)
+        log.warning(
+            "Auto-paste SendInput incomplete: accepted=%d expected=%d error=%d; showing fallback result",
+            sent,
+            len(events),
+            error_code,
+        )
+        return False
+    except Exception:  # noqa: BLE001
+        log.exception("Auto-paste SendInput failed; showing fallback result")
         return False
 
 
-def copy_and_maybe_paste(text: str, auto_paste: bool, only_when_text_field_detected: bool = True, *, allow_current_process: bool = False) -> bool:
+def copy_and_maybe_paste(
+    text: str,
+    auto_paste: bool,
+    only_when_text_field_detected: bool = True,
+    *,
+    allow_current_process: bool = False,
+    expected_foreground_hwnd: int | None = None,
+) -> bool:
     """Always copy text to clipboard. Return True if Ctrl+V was sent.
 
     When only_when_text_field_detected=True, paste is allowed only if Windows reports
@@ -186,10 +341,18 @@ def copy_and_maybe_paste(text: str, auto_paste: bool, only_when_text_field_detec
         return False
     if not allow_current_process and foreground_belongs_to_current_process():
         return False
+    if expected_foreground_hwnd is not None and foreground_window_handle() != expected_foreground_hwnd:
+        log.info("Auto-paste skipped because the foreground window changed since recording started")
+        return False
 
     detection = focused_control_accepts_text()
     if only_when_text_field_detected and detection is not True:
         return False
 
     time.sleep(0.12)
+    # Focus may change while clipboard/UI Automation work is in progress. Do a
+    # final identity check immediately before emitting Ctrl+V.
+    if expected_foreground_hwnd is not None and foreground_window_handle() != expected_foreground_hwnd:
+        log.info("Auto-paste skipped because the foreground window changed before SendInput")
+        return False
     return _send_ctrl_v()

@@ -54,7 +54,7 @@ from .config import AppConfig, CloudConnection, CONNECTION_TYPE_OPENAI, CONNECTI
 from .history import HistoryItem, HistoryStore
 from . import export as history_export
 from .hotkeys import HotkeyService, normalize_hotkey
-from .insert import copy_and_maybe_paste, focused_control_accepts_text, foreground_belongs_to_current_process, foreground_matches_window_handle
+from .insert import copy_and_maybe_paste, focused_control_accepts_text, foreground_belongs_to_current_process, foreground_matches_window_handle, foreground_window_handle
 from .logger import get_logger, setup_logging
 from .models import ALL_MODELS, DEFAULT_MODEL_KEY, DEFAULT_SUMMARY_MODEL_KEY, SUMMARY_MODELS, DownloadProgress, ModelManager, TRANSCRIPTION_MODELS, cloud_connection_id_of, cloud_provider_of, is_cloud_model_key, merge_transcript_parts, model_display_name
 from .overlay import HotkeySafeComboBox, RecordingOverlay
@@ -410,16 +410,6 @@ class HotkeySignal(QObject):
     triggered = Signal()
 
 
-# US-026: сигналы Push-to-Talk. Колбэки приходят из потока библиотеки keyboard,
-# поэтому маршалятся в Qt-поток через сигналы (QueuedConnection), как HotkeySignal.
-class PttPressSignal(QObject):
-    triggered = Signal()
-
-
-class PttReleaseSignal(QObject):
-    triggered = Signal()
-
-
 class CancelSignal(QObject):
     triggered = Signal()
 
@@ -572,19 +562,10 @@ class MainWindow(QMainWindow):
         self.pending_final: tuple[Path, float, AppConfig] | None = None
         self.hotkey_signal = HotkeySignal()
         self.hotkey_signal.triggered.connect(self.toggle_recording)
-        # US-026: сигналы Push-to-Talk (старт по нажатию, стоп по отпусканию).
-        self.ptt_press_signal = PttPressSignal()
-        self.ptt_press_signal.triggered.connect(self.on_hotkey_press)
-        self.ptt_release_signal = PttReleaseSignal()
-        self.ptt_release_signal.triggered.connect(self.on_hotkey_release)
         self.cancel_signal = CancelSignal()
         self.cancel_signal.triggered.connect(self.cancel_current_action)
-        self.hotkey = HotkeyService(
-            lambda: self.hotkey_signal.triggered.emit(),
-            on_press=lambda: self.ptt_press_signal.triggered.emit(),
-            on_release=lambda: self.ptt_release_signal.triggered.emit(),
-        )
-        self.cancel_hotkey_handle = None
+        self.hotkey = HotkeyService(lambda: self.hotkey_signal.triggered.emit())
+        self.cancel_hotkey_handle = False
         self.record_blink = False
         self.overlay = RecordingOverlay()
         self.overlay.restore_position(self.cfg.overlay_x, self.cfg.overlay_y)
@@ -608,6 +589,7 @@ class MainWindow(QMainWindow):
         self.result_preview_text = ""
 
         self.recording_started_in_own_window = False
+        self.recording_target_hwnd: int | None = None
         self._settings_loading = True
         self._settings_save_timer = QTimer(self)
         self._settings_save_timer.setSingleShot(True)
@@ -734,7 +716,7 @@ class MainWindow(QMainWindow):
         # TASK-047: иначе после клика по кнопке она остаётся в keyboard focus,
         # и нажатие Space (часть hotkey Ctrl+Space) активирует её через Qt
         # default-button behavior — диктовка стартует/стопится без Ctrl.
-        # Глобальный hotkey через keyboard library продолжает работать.
+        # Системная регистрация Ctrl+Space продолжает работать.
         self.toggle_btn.setFocusPolicy(Qt.NoFocus)
         self.toggle_btn.setAutoDefault(False)
         self.toggle_btn.setDefault(False)
@@ -1479,19 +1461,10 @@ class MainWindow(QMainWindow):
             self.compute_combo.addItem(v, v)
 
         form.addRow("Горячая клавиша", self.hotkey_edit)
-        self.hotkey_hint_label = QLabel("Кликните поле и нажмите новую комбинацию. Если комбинация недоступна, поле подсветится.")
+        self.hotkey_hint_label = QLabel("Используйте Ctrl, Alt, Shift или Win вместе с буквой, цифрой, Space либо F1–F24. Нажатие запускает запись, повторное нажатие останавливает её.")
         self.hotkey_hint_label.setObjectName("Subtitle")
         self.hotkey_hint_label.setWordWrap(True)
         form.addRow("", self.hotkey_hint_label)
-        # US-026: режим горячей клавиши (Переключатель / Push-to-Talk).
-        self.hotkey_mode_combo = NoScrollComboBox()
-        self.hotkey_mode_combo.addItem("Переключатель (нажать / нажать ещё раз)", "toggle")
-        self.hotkey_mode_combo.addItem("Зажать и держать (Push-to-Talk)", "ptt")
-        form.addRow("Режим клавиши", self.hotkey_mode_combo)
-        self.hotkey_mode_hint_label = QLabel("Переключатель: нажать — запись, нажать снова — расшифровка. Push-to-Talk: держать — запись, отпустить — расшифровка. Для Push-to-Talk выбирайте комбинацию с Ctrl или Alt (например Ctrl+Space): одиночную клавишу пришлось бы удерживать всю диктовку, и она печаталась бы в текущем поле ввода.")
-        self.hotkey_mode_hint_label.setObjectName("Subtitle")
-        self.hotkey_mode_hint_label.setWordWrap(True)
-        form.addRow("", self.hotkey_mode_hint_label)
         form.addRow("Вставка", self.auto_paste_check)
         form.addRow("Безопасная вставка", self.detect_text_field_check)
         form.addRow("Созвоны", self.meeting_compat_check)
@@ -1853,9 +1826,6 @@ class MainWindow(QMainWindow):
 
     def _load_settings_into_ui(self) -> None:
         self.hotkey_edit.setKeySequence(QKeySequence(self.cfg.hotkey))
-        _hm = getattr(self.cfg, "hotkey_mode", "toggle")
-        _hm_idx = self.hotkey_mode_combo.findData(_hm)
-        self.hotkey_mode_combo.setCurrentIndex(_hm_idx if _hm_idx >= 0 else 0)
         self.auto_paste_check.setChecked(self.cfg.auto_paste)
         self.detect_text_field_check.setChecked(self.cfg.paste_only_when_text_field_detected)
         self.meeting_compat_check.setChecked(self.cfg.audio_meeting_compatibility)
@@ -2019,7 +1989,7 @@ class MainWindow(QMainWindow):
         self.update_repo_edit.editingFinished.connect(self.schedule_settings_autosave)
         for checkbox in [self.auto_paste_check, self.detect_text_field_check, self.meeting_compat_check, self.overlay_enabled_check, self.autostart_check, self.updates_enabled_check]:
             checkbox.stateChanged.connect(self.schedule_settings_autosave)
-        for combo in [self.microphone_combo, self.language_combo, self.device_combo, self.compute_combo, self.hotkey_mode_combo]:
+        for combo in [self.microphone_combo, self.language_combo, self.device_combo, self.compute_combo]:
             combo.currentIndexChanged.connect(self.schedule_settings_autosave)
         self.file_stable_timestamps_check.stateChanged.connect(self.save_file_options)
         self.file_diarization_check.stateChanged.connect(self.save_file_options)
@@ -2305,7 +2275,7 @@ class MainWindow(QMainWindow):
                 self.hotkey_hint_label.setText(message or "Нажмите поле выше и задайте другую комбинацию клавиш.")
                 self.hotkey_hint_label.setStyleSheet("color: #fbbf24;")
             else:
-                self.hotkey_hint_label.setText("Кликните поле и нажмите новую комбинацию. Если комбинация недоступна, поле подсветится.")
+                self.hotkey_hint_label.setText("Используйте Ctrl, Alt, Shift или Win вместе с буквой, цифрой, Space либо F1–F24.")
                 self.hotkey_hint_label.setStyleSheet("")
 
     def _flash_button_state(self, button: QPushButton, text: str, *, kind: str = "info", seconds: int = 4) -> None:
@@ -2337,7 +2307,7 @@ class MainWindow(QMainWindow):
 
     def register_hotkey(self, show_errors: bool = True) -> bool:
         try:
-            self.hotkey.start(self.cfg.hotkey, mode=getattr(self.cfg, "hotkey_mode", "toggle"))
+            self.hotkey.start(self.cfg.hotkey)
             self.status_label.setText(f"Готово. Горячая клавиша: {self.cfg.hotkey}")
             self.overlay.set_hotkey(self.cfg.hotkey)
             self._set_hotkey_attention(False)
@@ -2352,26 +2322,23 @@ class MainWindow(QMainWindow):
             return False
 
     def register_cancel_hotkey(self) -> None:
-        if self.cancel_hotkey_handle is not None:
+        if self.cancel_hotkey_handle:
             return
         try:
-            import keyboard
-
-            self.cancel_hotkey_handle = keyboard.add_hotkey("esc", lambda: self.cancel_signal.triggered.emit(), suppress=False, trigger_on_release=False)
+            self.hotkey.register_cancel(lambda: self.cancel_signal.triggered.emit())
+            self.cancel_hotkey_handle = True
         except Exception:  # noqa: BLE001
             log.exception("Esc cancel hotkey registration failed")
-            self.cancel_hotkey_handle = None
+            self.cancel_hotkey_handle = False
 
     def unregister_cancel_hotkey(self) -> None:
-        if self.cancel_hotkey_handle is None:
+        if not self.cancel_hotkey_handle:
             return
         try:
-            import keyboard
-
-            keyboard.remove_hotkey(self.cancel_hotkey_handle)
+            self.hotkey.unregister_cancel()
         except Exception:
             pass
-        self.cancel_hotkey_handle = None
+        self.cancel_hotkey_handle = False
 
     def _sync_overlay_visibility(self) -> None:
         self.overlay.set_hotkey(self.cfg.hotkey)
@@ -3329,10 +3296,8 @@ class MainWindow(QMainWindow):
         self.file_status_label.setText("Отмена запрошена. Дождитесь завершения фонового процесса…")
         self.file_progress.setFormat("Отмена…")
         self.status_label.setText("Отмена расшифровки файла запрошена. Результат будет проигнорирован.")
-        # TASK-084 (US-019): hotkey re-register СРАЗУ при клике cancel
-        # (не дожидаясь окончания всех in-flight чанков, что может занять
-        # до 30 сек). Keyboard listener мог потерять Win32-хук во время
-        # длительной cloud-операции.
+        # TASK-084 (US-019): прежний defensive-вызов сохранён; для системной
+        # регистрации той же комбинации это безопасный no-op.
         try:
             self.register_hotkey(show_errors=False)
             log.info("Hotkey re-registered on cancel click (defensive)")
@@ -3407,11 +3372,8 @@ class MainWindow(QMainWindow):
         if self.cfg.overlay_enabled and not self.is_dictation_busy():
             self.overlay.show_cancelled(seconds=3)
         self._reset_file_transcription_ui()
-        # TASK-081 (US-019): defensive перерегистрация hotkey.
-        # После длительной cloud-расшифровки (особенно с отменой через
-        # ThreadPoolExecutor.shutdown) keyboard listener иногда теряет
-        # активный Win32-хук. register_hotkey() переустанавливает его
-        # поверх старого — это безопасно (см. CLAUDE.md, раздел про hotkey).
+        # Сохраняем прежний defensive-вызов: для RegisterHotKey повторная
+        # регистрация той же комбинации является безопасным no-op.
         try:
             self.register_hotkey(show_errors=False)
             log.info("Hotkey re-registered after file transcription cancel (defensive)")
@@ -3424,8 +3386,6 @@ class MainWindow(QMainWindow):
         old_model_runtime = (self.cfg.language, self.cfg.device, self.cfg.compute_type)
         seq = self.hotkey_edit.keySequence().toString(QKeySequence.NativeText)
         requested_hotkey = normalize_hotkey(seq) if seq else old_hotkey
-        old_hotkey_mode = getattr(self.cfg, "hotkey_mode", "toggle")
-        requested_hotkey_mode = str(self.hotkey_mode_combo.currentData() or "toggle")
         self.cfg.auto_paste = self.auto_paste_check.isChecked()
         self.cfg.paste_only_when_text_field_detected = self.detect_text_field_check.isChecked()
         self.cfg.audio_meeting_compatibility = self.meeting_compat_check.isChecked()
@@ -3576,9 +3536,7 @@ class MainWindow(QMainWindow):
         self.cfg.device = str(self.device_combo.currentData())
         self.cfg.compute_type = str(self.compute_combo.currentData())
         hotkey_error = None
-        # US-026: применяем смену комбинации И/ИЛИ режима без перезапуска.
-        self.cfg.hotkey_mode = requested_hotkey_mode
-        if requested_hotkey != old_hotkey or requested_hotkey_mode != old_hotkey_mode:
+        if requested_hotkey != old_hotkey:
             # Do not persist a broken hotkey. The HotkeyService keeps the old
             # handle active if the new combo cannot be parsed/registered.
             previous = self.cfg.hotkey
@@ -3586,7 +3544,6 @@ class MainWindow(QMainWindow):
             if not self.register_hotkey(show_errors=not auto):
                 hotkey_error = requested_hotkey
                 self.cfg.hotkey = previous
-                self.cfg.hotkey_mode = old_hotkey_mode
                 self.overlay.set_hotkey(self.cfg.hotkey)
         else:
             self.overlay.set_hotkey(self.cfg.hotkey)
@@ -3799,31 +3756,6 @@ class MainWindow(QMainWindow):
         log.info("toggle_recording: starting recording")
         self.start_recording()
 
-    def on_hotkey_press(self) -> None:
-        # US-026 Push-to-Talk: нажатие комбинации — старт записи. Технические
-        # блокировки и матричная проверка — как в toggle_recording.
-        if self._mic_autodetect_running():
-            self.status_label.setText("Идёт автонастройка микрофона. Диктовка временно недоступна.")
-            return
-        if self.transcribe_worker and self.transcribe_worker.isRunning():
-            return
-        if self.recorder.is_recording:
-            return  # уже идёт запись (защита от повторного срабатывания при удержании)
-        ok, reason = self._can_start_dictation()
-        if not ok:
-            log.info("on_hotkey_press BLOCKED by _can_start_dictation: %s", reason)
-            self.status_label.setText(reason)
-            self._open_overlay_cloud_picker()
-            return
-        log.info("on_hotkey_press: starting recording (PTT)")
-        self.start_recording()
-
-    def on_hotkey_release(self) -> None:
-        # US-026 Push-to-Talk: отпускание комбинации — стоп и расшифровка.
-        if self.recorder.is_recording:
-            log.info("on_hotkey_release: stopping recording (PTT)")
-            self.stop_recording()
-
     def start_recording(self) -> None:
         # TASK-083 (US-019): логирование точки входа в start_recording
         log.info("start_recording entered. selected_model=%s overlay_enabled=%s", self.cfg.selected_model, self.cfg.overlay_enabled)
@@ -3859,6 +3791,7 @@ class MainWindow(QMainWindow):
                 self.recording_started_in_own_window = foreground_matches_window_handle(int(self.winId()))
             except Exception:
                 self.recording_started_in_own_window = foreground_belongs_to_current_process()
+            self.recording_target_hwnd = foreground_window_handle()
             self.recorder.start()
             self.cancel_requested = False
             self.live_last_request_at = 0.0
@@ -4137,7 +4070,16 @@ class MainWindow(QMainWindow):
                     auto_paste=True,
                     only_when_text_field_detected=self.cfg.paste_only_when_text_field_detected,
                     allow_current_process=False,
+                    expected_foreground_hwnd=self.recording_target_hwnd,
                 )
+            log.info(
+                "Dictation delivery: chars=%d should_try_paste=%s inserted=%s target_was_text_field=%s own_window=%s",
+                len(text),
+                should_try_paste,
+                inserted,
+                self.live_target_is_text_field,
+                self.recording_started_in_own_window,
+            )
             if not inserted:
                 pyperclip.copy(text)
                 show_overlay_result = not self.recording_started_in_own_window
@@ -4291,7 +4233,12 @@ class MainWindow(QMainWindow):
             self.last_text.setPlainText(self.live_total_text)
             if self.recorder.is_recording and self.cfg.live_insert_confirmed_text and self.cfg.auto_paste and self.live_target_is_text_field:
                 if delta:
-                    inserted = copy_and_maybe_paste(delta, auto_paste=True, only_when_text_field_detected=self.cfg.paste_only_when_text_field_detected)
+                    inserted = copy_and_maybe_paste(
+                        delta,
+                        auto_paste=True,
+                        only_when_text_field_detected=self.cfg.paste_only_when_text_field_detected,
+                        expected_foreground_hwnd=self.recording_target_hwnd,
+                    )
                     if inserted:
                         self.live_had_insertions = True
                         if self.cfg.overlay_enabled:
@@ -5543,7 +5490,7 @@ class MainWindow(QMainWindow):
                         pass
         except Exception:  # noqa: BLE001
             pass
-        # 2) Снимаем глобальную горячую клавишу (keyboard hook).
+        # 2) Освобождаем системную регистрацию горячей клавиши.
         try:
             self.hotkey.stop()
         except Exception:  # noqa: BLE001
