@@ -147,9 +147,6 @@ class CloudConnection:
 @dataclass
 class AppConfig:
     hotkey: str = "ctrl+alt+space"
-    # US-026: режим горячей клавиши. "toggle" — нажал/нажал ещё раз (текущее
-    # поведение, дефолт), "ptt" — Push-to-Talk: зажал → запись, отпустил → расшифровка.
-    hotkey_mode: str = "toggle"
     selected_model: str = "whisper:small"
     file_selected_model: str = ""  # TASK-051 (US-017): отдельная модель для расшифровки файлов; пусто — использовать selected_model
     auto_paste: bool = True
