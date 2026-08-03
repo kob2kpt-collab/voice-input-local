@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 import uuid
 import wave
@@ -13,6 +14,21 @@ from .logger import get_logger
 from .paths import recordings_dir
 
 log = get_logger("audio")
+
+_LEVEL_FLOOR_DB = -55.0
+_LEVEL_CEILING_DB = -8.0
+
+
+def _normalize_audio_level(samples: np.ndarray) -> float:
+    """Map an audio chunk's RMS loudness to a UI-friendly 0..1 value."""
+    if samples.size == 0:
+        return 0.0
+    mean_square = float(np.mean(np.square(samples, dtype=np.float32)))
+    if not math.isfinite(mean_square) or mean_square <= 0.0:
+        return 0.0
+    dbfs = 10.0 * math.log10(mean_square)
+    normalized = (dbfs - _LEVEL_FLOOR_DB) / (_LEVEL_CEILING_DB - _LEVEL_FLOOR_DB)
+    return max(0.0, min(1.0, normalized))
 
 
 @dataclass(frozen=True)
@@ -158,6 +174,7 @@ class AudioRecorder:
         self._frames: list[np.ndarray] = []
         self._started_at: float | None = None
         self._active_label = ""
+        self._input_level = 0.0
 
     @property
     def is_recording(self) -> bool:
@@ -168,6 +185,11 @@ class AudioRecorder:
         if self._started_at is None:
             return 0.0
         return max(0.0, time.perf_counter() - self._started_at)
+
+    @property
+    def input_level(self) -> float:
+        """Latest normalized microphone level, sampled by the UI thread."""
+        return self._input_level
 
     def _rate_candidates(self, preferred: tuple[int, ...] | list[int] | None = None) -> list[int]:
         rates: list[int] = []
@@ -308,11 +330,13 @@ class AudioRecorder:
         if self._stream is not None:
             return
         self._frames = []
+        self._input_level = 0.0
         self._started_at = time.perf_counter()
 
         def callback(indata, frames, time_info, status) -> None:  # noqa: ANN001
             if status:
                 log.warning("PortAudio input status: %s", status)
+            self._input_level = _normalize_audio_level(indata)
             self._frames.append(indata.copy())
 
         errors: list[str] = []
@@ -367,6 +391,7 @@ class AudioRecorder:
                     log.warning("Input stream open failed: %s", error)
 
         self._started_at = None
+        self._input_level = 0.0
         self._log_devices()
         meeting_hint = (
             "\n\nПохоже, микрофон занят другим приложением или драйвер не разрешает совместную запись. "
@@ -395,6 +420,7 @@ class AudioRecorder:
                 stream.close()
         self._frames = []
         self._started_at = None
+        self._input_level = 0.0
 
     def snapshot_audio(self) -> tuple[np.ndarray, float]:
         """Return a copy of audio captured so far and its duration in seconds."""
@@ -445,6 +471,7 @@ class AudioRecorder:
         self._stream = None
         stream.stop()
         stream.close()
+        self._input_level = 0.0
         audio, duration = self.snapshot_audio()
         self._started_at = None
         if audio.size == 0:
