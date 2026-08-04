@@ -91,7 +91,7 @@ def _child_really_quit() -> None:
         hotkey=types.SimpleNamespace(stop=lambda: None),
         tray=types.SimpleNamespace(hide=lambda: None),
         overlay=types.SimpleNamespace(hide=lambda: None),
-        unregister_cancel_hotkey=lambda: None,
+        stop_escape_watch=lambda: None,  # EPIC-13: отмена по Escape — наблюдение, не хоткей
         # _log замокан, чтобы тест не писал в app.log; _shutdown_workers — настоящий.
         _log_running_workers_on_quit=lambda: None,
     )
