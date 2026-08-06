@@ -214,8 +214,65 @@ def test_blocked_paste_is_logged() -> None:
     assert "log.info" in block, "отказ из-за ненайденного поля ввода не логируется"
 
 
+class _FakeControl:
+    def __init__(self, control_type: str, class_name: str, automation_id: str = "") -> None:
+        self.ControlTypeName = control_type
+        self.ClassName = class_name
+        self.AutomationId = automation_id
+
+
+def _detect(control: _FakeControl | None, *, caret: bool | None) -> bool | None:
+    """Прогнать распознавание поля с подменёнными UI Automation и кареткой."""
+    fake_module = types.ModuleType("uiautomation")
+    fake_module.GetFocusedControl = lambda: control  # type: ignore[attr-defined]
+    saved_module = sys.modules.get("uiautomation")
+    saved_caret = insert_module._win32_caret_is_visible
+    sys.modules["uiautomation"] = fake_module
+    insert_module._win32_caret_is_visible = lambda: caret
+    try:
+        return insert_module.focused_control_accepts_text()
+    finally:
+        if saved_module is None:
+            sys.modules.pop("uiautomation", None)
+        else:
+            sys.modules["uiautomation"] = saved_module
+        insert_module._win32_caret_is_visible = saved_caret
+
+
+# Данные ниже сняты на устройстве через scripts/diagnose_text_field.py.
+def test_self_drawn_editor_is_recognised() -> None:
+    """Claude Desktop: каретки нет, UIA отдаёт «группу» с классами редактора."""
+    control = _FakeControl("GroupControl", "tiptap ProseMirror ProseMirror-focused")
+    assert _detect(control, caret=False) is True, "поле ввода Claude Desktop снова не распознаётся"
+
+
+def test_web_page_without_input_stays_blocked() -> None:
+    """Chrome со страницей в фокусе: поля нет — вставлять туда нельзя."""
+    control = _FakeControl("PaneControl", "Chrome_WidgetWin_1")
+    assert _detect(control, caret=False) is not True, (
+        "правило слишком широкое: текст улетит в произвольную веб-страницу"
+    )
+
+
+def test_button_inside_editor_is_not_a_text_field() -> None:
+    control = _FakeControl("ButtonControl", "prosemirror-menu-item")
+    assert _detect(control, caret=False) is not True, "кнопка редактора принята за поле ввода"
+
+
+def test_classic_windows_fields_still_recognised() -> None:
+    """Блокнот и VK Teams распознавались и раньше — проверяем, что не сломались."""
+    notepad = _FakeControl("DocumentControl", "RichEditD2DPT")
+    assert _detect(notepad, caret=True) is True
+    vk_teams = _FakeControl("TextControl", "Ui::HistoryTextEdit", "Utils::IMApp.AS_MainWindow")
+    assert _detect(vk_teams, caret=True) is True
+
+
 def _run() -> None:
     tests = [
+        test_self_drawn_editor_is_recognised,
+        test_web_page_without_input_stays_blocked,
+        test_button_inside_editor_is_not_a_text_field,
+        test_classic_windows_fields_still_recognised,
         test_safe_paste_on_still_blocks_when_no_text_field,
         test_safe_paste_off_pastes_where_windows_sees_no_field,
         test_decision_is_made_at_delivery_not_at_recording_start,

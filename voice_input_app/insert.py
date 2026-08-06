@@ -58,6 +58,31 @@ MODIFIER_POLL_SECONDS = 0.025
 # Задержка перед Ctrl+V: буферу обмена Windows нужно время устояться.
 CLIPBOARD_SETTLE_SECONDS = 0.12
 
+# US-070 (TASK-358): признаки редакторов, которые рисуют поле ввода сами.
+#
+# Ни Windows, ни доступность не считают такие поля текстовыми: у Claude Desktop
+# системной каретки нет вовсе, UI Automation отдаёт тип «группа», а
+# LegacyIAccessible — роль ROLE_SYSTEM_GROUPING (проверено на устройстве).
+# Единственная зацепка — CSS-классы элемента, которые Chromium прокидывает в
+# UIA как ClassName. Поэтому список ИМЕНОВАННЫЙ, а не «раз это Chromium, значит
+# можно»: в том же срезе обычная страница Chrome дала PaneControl без каретки —
+# при широком правиле текст улетал бы в произвольную веб-страницу.
+#
+# Список пополняется по мере встречи новых программ; общий обход для всего
+# остального — снятая пользователем «Безопасная вставка».
+RICH_TEXT_EDITOR_MARKERS = (
+    "prosemirror",   # Claude Desktop, Microsoft Teams в браузере, Notion
+    "tiptap",        # обёртка над ProseMirror
+    "codemirror",
+    "monaco-editor",
+    "ql-editor",     # Quill, используется в Slack
+    "slate-editor",
+    "draftjs",
+    "public-drafteditor",
+    "lexical",
+    "contenteditable",
+)
+
 
 class RECT(ctypes.Structure):
     _fields_ = [
@@ -261,6 +286,8 @@ def focused_control_accepts_text() -> Optional[bool]:
                 or "mozillawindowclass" in name
                 or "internet explorer_server" in name
                 or "windows.ui.composition" in name
+                # US-070: поля, которые программа рисует сама (см. RICH_TEXT_EDITOR_MARKERS).
+                or any(marker in name for marker in RICH_TEXT_EDITOR_MARKERS)
             )
             negative = any(term in name for term in ("button", "menu", "tab", "listitem", "checkbox", "combobox"))
             if positive and not negative:
