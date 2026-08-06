@@ -53,11 +53,13 @@ from . import __version__
 from .config import AppConfig, CloudConnection, CONNECTION_TYPE_OPENAI, CONNECTION_TYPE_ELEVENLABS, DEFAULT_OPENAI_INITIAL_PROMPT, DEFAULT_POSTPROCESS_SYSTEM_PROMPT, DEFAULT_SUMMARY_SYSTEM_PROMPT
 from .history import HistoryItem, HistoryStore
 from . import export as history_export
-from .hotkeys import HotkeyService, normalize_hotkey
-from .insert import copy_and_maybe_paste, focused_control_accepts_text, foreground_belongs_to_current_process, foreground_matches_window_handle
+from .hotkeys import VK_ESCAPE, HotkeyService, normalize_hotkey
+from .insert import copy_and_maybe_paste, focused_control_accepts_text, foreground_belongs_to_current_process, foreground_matches_window_handle, foreground_window_handle
+from .key_watch import KeyStateWatcher
 from .logger import get_logger, setup_logging
 from .models import ALL_MODELS, DEFAULT_MODEL_KEY, DEFAULT_SUMMARY_MODEL_KEY, SUMMARY_MODELS, DownloadProgress, ModelManager, TRANSCRIPTION_MODELS, cloud_connection_id_of, cloud_provider_of, is_cloud_model_key, merge_transcript_parts, model_display_name
 from .overlay import HotkeySafeComboBox, RecordingOverlay
+from .session_lock import SessionLockWatcher
 from .cloud_security_dialog import (
     confirm_external_switch,
     confirm_safe_switch,
@@ -410,8 +412,10 @@ class HotkeySignal(QObject):
     triggered = Signal()
 
 
-# US-026: сигналы Push-to-Talk. Колбэки приходят из потока библиотеки keyboard,
-# поэтому маршалятся в Qt-поток через сигналы (QueuedConnection), как HotkeySignal.
+# US-026/US-066: сигналы Push-to-Talk. Колбэки приходят из нативного фильтра
+# событий (WM_HOTKEY) и из таймера наблюдения за клавишами, поэтому доставляются
+# сигналами с QueuedConnection: обработчик открывает диалоги и запускает запись,
+# а делать это прямо внутри разбора нативного сообщения Windows нельзя.
 class PttPressSignal(QObject):
     triggered = Signal()
 
@@ -571,20 +575,35 @@ class MainWindow(QMainWindow):
         self.preload_worker: PreloadWorker | None = None
         self.pending_final: tuple[Path, float, AppConfig] | None = None
         self.hotkey_signal = HotkeySignal()
-        self.hotkey_signal.triggered.connect(self.toggle_recording)
+        # EPIC-13: QueuedConnection обязателен. WM_HOTKEY разбирается ВНУТРИ
+        # нативного фильтра событий Qt, а обработчик открывает модальные окна и
+        # запускает запись — вложенный event loop прямо в разборе сообщения ОС
+        # недопустим. Сигнал переносит выполнение на следующий проход цикла.
+        self.hotkey_signal.triggered.connect(self.toggle_recording, Qt.QueuedConnection)
         # US-026: сигналы Push-to-Talk (старт по нажатию, стоп по отпусканию).
         self.ptt_press_signal = PttPressSignal()
-        self.ptt_press_signal.triggered.connect(self.on_hotkey_press)
+        self.ptt_press_signal.triggered.connect(self.on_hotkey_press, Qt.QueuedConnection)
         self.ptt_release_signal = PttReleaseSignal()
-        self.ptt_release_signal.triggered.connect(self.on_hotkey_release)
+        self.ptt_release_signal.triggered.connect(self.on_hotkey_release, Qt.QueuedConnection)
         self.cancel_signal = CancelSignal()
-        self.cancel_signal.triggered.connect(self.cancel_current_action)
+        self.cancel_signal.triggered.connect(self.cancel_current_action, Qt.QueuedConnection)
         self.hotkey = HotkeyService(
             lambda: self.hotkey_signal.triggered.emit(),
             on_press=lambda: self.ptt_press_signal.triggered.emit(),
             on_release=lambda: self.ptt_release_signal.triggered.emit(),
         )
-        self.cancel_hotkey_handle = None
+        # US-065: отмена по Escape — точечное наблюдение за ОДНОЙ клавишей и
+        # только на время операции. Регистрировать Escape системной горячей
+        # клавишей нельзя: Windows отдала бы её нам одним, и в активной
+        # программе Escape перестал бы закрывать диалоги и подсказки.
+        self.escape_watcher = KeyStateWatcher(self)
+        # US-069: блокировка экрана останавливает диктовку. Состояние сессии
+        # спрашивается у Windows только пока идёт запись — как и состояние
+        # клавиш. Расшифровки файла это не касается: она идёт часами и с
+        # присутствием пользователя не связана.
+        self.session_lock_watcher = SessionLockWatcher(self)
+        self._dictation_stopped_by_lock = False
+        self._hotkey_error_message = ""
         self.record_blink = False
         self.overlay = RecordingOverlay()
         self.overlay.restore_position(self.cfg.overlay_x, self.cfg.overlay_y)
@@ -611,6 +630,9 @@ class MainWindow(QMainWindow):
         self.result_preview_text = ""
 
         self.recording_started_in_own_window = False
+        # US-067: окно, активное на момент начала записи. Используется в режиме
+        # «вставлять в окно, активное на момент начала записи».
+        self.recording_target_hwnd: int | None = None
         self._settings_loading = True
         self._settings_save_timer = QTimer(self)
         self._settings_save_timer.setSingleShot(True)
@@ -655,7 +677,11 @@ class MainWindow(QMainWindow):
         self.refresh_models_table()
         self.refresh_available_models_combo()
         self.refresh_history()
-        self.register_hotkey(show_errors=False)
+        if not self.register_hotkey(show_errors=False):
+            # TASK-334 (US-064): сохранённая комбинация не регистрируется —
+            # сообщаем заметно, а не строкой в статус-баре. С задержкой, чтобы
+            # окно успело появиться и сообщение не всплыло раньше него.
+            QTimer.singleShot(1200, self._notify_hotkey_registration_failed)
         self._sync_overlay_visibility()
         self.start_preload_selected_model()
         QTimer.singleShot(900, self.maybe_start_first_microphone_autodetect)
@@ -737,7 +763,7 @@ class MainWindow(QMainWindow):
         # TASK-047: иначе после клика по кнопке она остаётся в keyboard focus,
         # и нажатие Space (часть hotkey Ctrl+Space) активирует её через Qt
         # default-button behavior — диктовка стартует/стопится без Ctrl.
-        # Глобальный hotkey через keyboard library продолжает работать.
+        # Системная регистрация комбинации при этом продолжает работать.
         self.toggle_btn.setFocusPolicy(Qt.NoFocus)
         self.toggle_btn.setAutoDefault(False)
         self.toggle_btn.setDefault(False)
@@ -1482,7 +1508,7 @@ class MainWindow(QMainWindow):
             self.compute_combo.addItem(v, v)
 
         form.addRow("Горячая клавиша", self.hotkey_edit)
-        self.hotkey_hint_label = QLabel("Кликните поле и нажмите новую комбинацию. Если комбинация недоступна, поле подсветится.")
+        self.hotkey_hint_label = QLabel("Кликните поле и нажмите новую комбинацию. Нужен хотя бы один модификатор — Ctrl, Alt, Shift или Win. Если комбинация занята другой программой, поле подсветится.")
         self.hotkey_hint_label.setObjectName("Subtitle")
         self.hotkey_hint_label.setWordWrap(True)
         form.addRow("", self.hotkey_hint_label)
@@ -1497,6 +1523,20 @@ class MainWindow(QMainWindow):
         form.addRow("", self.hotkey_mode_hint_label)
         form.addRow("Вставка", self.auto_paste_check)
         form.addRow("Безопасная вставка", self.detect_text_field_check)
+        # US-067: выбор целевого окна автовставки.
+        self.paste_target_combo = NoScrollComboBox()
+        self.paste_target_combo.addItem("В окно, активное на момент завершения записи", "on_finish")
+        self.paste_target_combo.addItem("В окно, активное на момент начала записи", "on_start")
+        form.addRow("Куда вставлять", self.paste_target_combo)
+        self.paste_target_hint_label = QLabel(
+            "«На момент завершения» — можно во время диктовки перейти в нужное поле, текст попадёт туда. "
+            "«На момент начала» — текст вернётся в то окно, где вы начали диктовать, даже если вы успели "
+            "переключиться в другое: приложение сделает это окно активным и вставит текст туда. Если Windows "
+            "не разрешит переключение, текст останется в буфере обмена и в плашке."
+        )
+        self.paste_target_hint_label.setObjectName("Subtitle")
+        self.paste_target_hint_label.setWordWrap(True)
+        form.addRow("", self.paste_target_hint_label)
         form.addRow("Созвоны", self.meeting_compat_check)
         form.addRow("Плавающая плашка", self.overlay_enabled_check)
         form.addRow("Автозагрузка", self.autostart_check)
@@ -1861,6 +1901,9 @@ class MainWindow(QMainWindow):
         self.hotkey_mode_combo.setCurrentIndex(_hm_idx if _hm_idx >= 0 else 0)
         self.auto_paste_check.setChecked(self.cfg.auto_paste)
         self.detect_text_field_check.setChecked(self.cfg.paste_only_when_text_field_detected)
+        _pt = getattr(self.cfg, "paste_target_window", "on_finish")
+        _pt_idx = self.paste_target_combo.findData(_pt)
+        self.paste_target_combo.setCurrentIndex(_pt_idx if _pt_idx >= 0 else 0)
         self.meeting_compat_check.setChecked(self.cfg.audio_meeting_compatibility)
         self.overlay_enabled_check.setChecked(self.cfg.overlay_enabled)
         autostart_enabled = autostart.is_enabled() if autostart.is_supported() else False
@@ -2022,7 +2065,7 @@ class MainWindow(QMainWindow):
         self.update_repo_edit.editingFinished.connect(self.schedule_settings_autosave)
         for checkbox in [self.auto_paste_check, self.detect_text_field_check, self.meeting_compat_check, self.overlay_enabled_check, self.autostart_check, self.updates_enabled_check]:
             checkbox.stateChanged.connect(self.schedule_settings_autosave)
-        for combo in [self.microphone_combo, self.language_combo, self.device_combo, self.compute_combo, self.hotkey_mode_combo]:
+        for combo in [self.microphone_combo, self.language_combo, self.device_combo, self.compute_combo, self.hotkey_mode_combo, self.paste_target_combo]:
             combo.currentIndexChanged.connect(self.schedule_settings_autosave)
         self.file_stable_timestamps_check.stateChanged.connect(self.save_file_options)
         self.file_diarization_check.stateChanged.connect(self.save_file_options)
@@ -2308,7 +2351,7 @@ class MainWindow(QMainWindow):
                 self.hotkey_hint_label.setText(message or "Нажмите поле выше и задайте другую комбинацию клавиш.")
                 self.hotkey_hint_label.setStyleSheet("color: #fbbf24;")
             else:
-                self.hotkey_hint_label.setText("Кликните поле и нажмите новую комбинацию. Если комбинация недоступна, поле подсветится.")
+                self.hotkey_hint_label.setText("Кликните поле и нажмите новую комбинацию. Нужен хотя бы один модификатор — Ctrl, Alt, Shift или Win. Если комбинация занята другой программой, поле подсветится.")
                 self.hotkey_hint_label.setStyleSheet("")
 
     def _flash_button_state(self, button: QPushButton, text: str, *, kind: str = "info", seconds: int = 4) -> None:
@@ -2344,37 +2387,71 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"Готово. Горячая клавиша: {self.cfg.hotkey}")
             self.overlay.set_hotkey(self.cfg.hotkey)
             self._set_hotkey_attention(False)
+            self._hotkey_error_message = ""
             return True
         except Exception as exc:  # noqa: BLE001
             log.exception("Hotkey registration failed")
             message = str(exc)
+            self._hotkey_error_message = message
             self.status_label.setText(message)
             self._set_hotkey_attention(True, "Комбинация не зарегистрировалась. Нажмите поле и выберите другую, например Ctrl+Alt+Space.")
             if show_errors:
                 QMessageBox.warning(self, "Горячая клавиша", message)
             return False
 
-    def register_cancel_hotkey(self) -> None:
-        if self.cancel_hotkey_handle is not None:
-            return
-        try:
-            import keyboard
+    def _notify_hotkey_registration_failed(self) -> None:
+        """TASK-334 (US-064): заметное уведомление о нерабочей комбинации.
 
-            self.cancel_hotkey_handle = keyboard.add_hotkey("esc", lambda: self.cancel_signal.triggered.emit(), suppress=False, trigger_on_release=False)
+        Сохранённую комбинацию могла занять другая программа, или она пришла из
+        старых настроек в неподдерживаемом виде. Раньше об этом сообщала только
+        строка статуса — её не замечали, и выглядело это как «диктовка сломалась».
+        Теперь: уведомление в трее + модальное окно с переходом на вкладку
+        настроек к подсвеченному полю.
+        """
+        message = getattr(self, "_hotkey_error_message", "") or "Комбинацию не удалось зарегистрировать."
+        try:
+            self.tray.showMessage(
+                "Voice Input Local",
+                f"Горячая клавиша {self.cfg.hotkey} не работает. Задайте другую комбинацию в настройках.",
+                QSystemTrayIcon.Warning,
+                10000,
+            )
         except Exception:  # noqa: BLE001
-            log.exception("Esc cancel hotkey registration failed")
-            self.cancel_hotkey_handle = None
+            pass
+        try:
+            self.tabs.setCurrentIndex(3)  # 0 Диктовка,1 Файлы,2 Модели,3 Настройки
+            self.hotkey_edit.setFocus()
+        except Exception:  # noqa: BLE001
+            pass
+        QMessageBox.warning(
+            self,
+            "Горячая клавиша не работает",
+            f"Комбинация {self.cfg.hotkey} не зарегистрирована — диктовка по горячей клавише сейчас недоступна.\n\n"
+            f"{message}\n\n"
+            "Нажмите подсвеченное поле «Горячая клавиша» на вкладке «Настройки» и задайте другую комбинацию, "
+            "например Ctrl+Alt+Space.",
+        )
 
-    def unregister_cancel_hotkey(self) -> None:
-        if self.cancel_hotkey_handle is None:
+    def start_escape_watch(self) -> None:
+        """US-065: включить отмену по Escape на время операции.
+
+        Наблюдение точечное: опрашивается ровно один виртуальный код и только
+        пока идёт запись или расшифровка. Клавиша не поглощается — то же
+        нажатие как обычно доходит до активной программы.
+        """
+        if self.escape_watcher.is_active:
             return
         try:
-            import keyboard
+            self.escape_watcher.start([VK_ESCAPE], on_press=lambda _vk: self.cancel_signal.triggered.emit())
+        except Exception:  # noqa: BLE001
+            log.exception("Escape watch start failed")
 
-            keyboard.remove_hotkey(self.cancel_hotkey_handle)
-        except Exception:
+    def stop_escape_watch(self) -> None:
+        """US-065: снять наблюдение за Escape. Зовётся во всех точках выхода."""
+        try:
+            self.escape_watcher.stop()
+        except Exception:  # noqa: BLE001
             pass
-        self.cancel_hotkey_handle = None
 
     def _sync_overlay_visibility(self) -> None:
         self.overlay.set_hotkey(self.cfg.hotkey)
@@ -3332,10 +3409,11 @@ class MainWindow(QMainWindow):
         self.file_status_label.setText("Отмена запрошена. Дождитесь завершения фонового процесса…")
         self.file_progress.setFormat("Отмена…")
         self.status_label.setText("Отмена расшифровки файла запрошена. Результат будет проигнорирован.")
-        # TASK-084 (US-019): hotkey re-register СРАЗУ при клике cancel
-        # (не дожидаясь окончания всех in-flight чанков, что может занять
-        # до 30 сек). Keyboard listener мог потерять Win32-хук во время
-        # длительной cloud-операции.
+        # TASK-084 (US-019): defensive-перерегистрация hotkey при клике cancel.
+        # Прежняя причина — клавиатурный хук терялся во время длительной
+        # cloud-операции — с переходом на системную регистрацию (EPIC-13)
+        # исчезла. Вызов сохранён и стал безопасным no-op: HotkeyService не
+        # трогает уже зарегистрированную ту же комбинацию.
         try:
             self.register_hotkey(show_errors=False)
             log.info("Hotkey re-registered on cancel click (defensive)")
@@ -3410,11 +3488,9 @@ class MainWindow(QMainWindow):
         if self.cfg.overlay_enabled and not self.is_dictation_busy():
             self.overlay.show_cancelled(seconds=3)
         self._reset_file_transcription_ui()
-        # TASK-081 (US-019): defensive перерегистрация hotkey.
-        # После длительной cloud-расшифровки (особенно с отменой через
-        # ThreadPoolExecutor.shutdown) keyboard listener иногда теряет
-        # активный Win32-хук. register_hotkey() переустанавливает его
-        # поверх старого — это безопасно (см. CLAUDE.md, раздел про hotkey).
+        # TASK-081 (US-019): defensive перерегистрация hotkey. С системной
+        # регистрацией (EPIC-13) терять нечего — вызов остаётся безопасным
+        # no-op и сохранён, чтобы не менять поведение соседних веток.
         try:
             self.register_hotkey(show_errors=False)
             log.info("Hotkey re-registered after file transcription cancel (defensive)")
@@ -3431,6 +3507,7 @@ class MainWindow(QMainWindow):
         requested_hotkey_mode = str(self.hotkey_mode_combo.currentData() or "toggle")
         self.cfg.auto_paste = self.auto_paste_check.isChecked()
         self.cfg.paste_only_when_text_field_detected = self.detect_text_field_check.isChecked()
+        self.cfg.paste_target_window = str(self.paste_target_combo.currentData() or "on_finish")
         self.cfg.audio_meeting_compatibility = self.meeting_compat_check.isChecked()
         self.cfg.overlay_enabled = self.overlay_enabled_check.isChecked()
         self.cfg.autostart_enabled = self.autostart_check.isChecked() and autostart.is_supported()
@@ -3852,7 +3929,8 @@ class MainWindow(QMainWindow):
                 return
             self.result_preview_active = False
             self.result_preview_text = ""
-            self.unregister_cancel_hotkey()
+            self._dictation_stopped_by_lock = False  # US-069: признак этой диктовки
+            self.stop_escape_watch()
             self.recorder = AudioRecorder(sample_rate=self.cfg.sample_rate, input_device_id=self.cfg.audio_input_device_id, meeting_compatibility=self.cfg.audio_meeting_compatibility)
             # Only the main Voice Input Local window should count as "own window".
             # The floating overlay is also a window in this process; after dragging
@@ -3862,6 +3940,8 @@ class MainWindow(QMainWindow):
                 self.recording_started_in_own_window = foreground_matches_window_handle(int(self.winId()))
             except Exception:
                 self.recording_started_in_own_window = foreground_belongs_to_current_process()
+            # US-067: окно-получатель для режима «на момент начала записи».
+            self.recording_target_hwnd = foreground_window_handle()
             self.recorder.start()
             self.cancel_requested = False
             self.live_last_request_at = 0.0
@@ -3871,17 +3951,19 @@ class MainWindow(QMainWindow):
             self.live_unavailable_notice_shown = False
             self.pending_final = None
             self.live_target_is_text_field = (focused_control_accepts_text() is True) and not self.recording_started_in_own_window
-            self.register_cancel_hotkey()
+            self.start_escape_watch()
             self.toggle_btn.setText("Остановить запись")
             self.status_label.setText("Идёт запись… Esc отменит запись, горячая клавиша остановит и запустит расшифровку.")
             if self.cfg.overlay_enabled:
                 self.overlay.reset_for_new_recording(live_enabled=self.cfg.live_transcription)
                 self.overlay.show_recording(0.0, live_enabled=self.cfg.live_transcription)
             self._start_overlay_audio_level_updates()
+            self._start_session_lock_watch()  # US-069
             self.update_recording_badge()
             log.info("Recording started. live_target_is_text_field=%s own_window=%s model=%s", self.live_target_is_text_field, self.recording_started_in_own_window, self.cfg.selected_model)
         except Exception as exc:  # noqa: BLE001
             self._stop_overlay_audio_level_updates()
+            self._stop_session_lock_watch()  # US-069
             log.exception("Recording start failed")
             self.toggle_btn.setText("Начать запись")
             self.status_label.setText("Запись недоступна. Подробности записаны в логи.")
@@ -3891,23 +3973,32 @@ class MainWindow(QMainWindow):
 
     def stop_recording(self) -> None:
         self._stop_overlay_audio_level_updates()
+        self._stop_session_lock_watch()  # US-069
+        # US-069: при остановке по блокировке экрана модальные окна не
+        # показываем — они повисли бы позади экрана блокировки и заморозили
+        # приложение до разблокировки. Причина остаётся в статус-строке и логах.
+        stopped_by_lock = bool(getattr(self, "_dictation_stopped_by_lock", False))
         try:
             wav_path, duration = self.recorder.stop_to_wav()
             if duration < 1.0:
                 self._cleanup_wav(wav_path)
                 self.toggle_btn.setText("Начать запись")
-                self.unregister_cancel_hotkey()
+                self.stop_escape_watch()
                 self.update_recording_badge()
                 if self.cfg.overlay_enabled:
                     self.overlay.show_cancelled(seconds=3)
                 self.status_label.setText("Запись слишком короткая. Скажите фразу дольше 1 секунды и попробуйте снова.")
-                QMessageBox.information(self, "Запись", "Запись слишком короткая или речь не обнаружена. Попробуйте ещё раз.")
+                if not stopped_by_lock:
+                    QMessageBox.information(self, "Запись", "Запись слишком короткая или речь не обнаружена. Попробуйте ещё раз.")
                 return
         except Exception as exc:  # noqa: BLE001
             log.exception("Recording stop failed")
-            QMessageBox.critical(self, "Запись", str(exc))
+            if not stopped_by_lock:
+                QMessageBox.critical(self, "Запись", str(exc))
+            else:
+                self.status_label.setText("Не удалось сохранить запись, остановленную при блокировке экрана. Подробности в логах.")
             self.toggle_btn.setText("Начать запись")
-            self.unregister_cancel_hotkey()
+            self.stop_escape_watch()
             return
         self.toggle_btn.setEnabled(True)
         self.toggle_btn.setText("Начать запись")
@@ -3935,7 +4026,7 @@ class MainWindow(QMainWindow):
             self.result_preview_text = ""
             if self.cfg.overlay_enabled:
                 self.overlay.show_idle()
-            self.unregister_cancel_hotkey()
+            self.stop_escape_watch()
             self.status_label.setText("Готово. Текст сохранён в истории и буфере обмена.")
             return
 
@@ -3949,6 +4040,8 @@ class MainWindow(QMainWindow):
         if self.recorder.is_recording:
             self.recorder.cancel()
         self._stop_overlay_audio_level_updates()
+        self._stop_session_lock_watch()  # US-069
+        self._dictation_stopped_by_lock = False
         self.toggle_btn.setText("Начать запись")
         self.toggle_btn.setEnabled(not final_running)
         self.record_badge.setText("Отменено")
@@ -3959,7 +4052,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Отменено. История и буфер обмена не изменены.")
         if self.cfg.overlay_enabled:
             self.overlay.show_cancelled(seconds=4)
-        self.unregister_cancel_hotkey()
+        self.stop_escape_watch()
         log.info("Current recording/transcription cancelled by user")
 
     def _begin_final_transcription(self, wav_path: Path, duration: float, cfg: AppConfig) -> None:
@@ -4099,7 +4192,7 @@ class MainWindow(QMainWindow):
         self._stop_dictation_progress()  # US-022
         self._cleanup_wav(wav_path)
         self.update_recording_badge()
-        self.unregister_cancel_hotkey()
+        self.stop_escape_watch()
         self.toggle_btn.setEnabled(True)
         self.toggle_btn.setText("Начать запись")
         self.result_preview_active = False
@@ -4116,7 +4209,7 @@ class MainWindow(QMainWindow):
         if self.cancel_requested:
             self._cleanup_wav(wav_path)
             self.update_recording_badge()
-            self.unregister_cancel_hotkey()
+            self.stop_escape_watch()
             self.toggle_btn.setEnabled(True)
             self.status_label.setText("Расшифровка отменена. Результат проигнорирован.")
             return
@@ -4135,15 +4228,44 @@ class MainWindow(QMainWindow):
     def _deliver_dictation_result(self, text: str, duration: float, wav_path: Path, *, postprocess_failed: bool = False) -> None:
         self.last_text.setPlainText(text)
         inserted = False
+        should_try_paste = False
         show_overlay_result = False
+        # US-069: диктовку, остановленную блокировкой экрана, НЕ вставляем в
+        # активное окно. Расшифровка может закончиться, пока экран заблокирован,
+        # а после разблокировки фокус окажется неизвестно где — текст улетел бы
+        # в чужое поле. Всё остальное (буфер, история, плашка, постобработка)
+        # работает как обычно. Признак одноразовый: снимаем его здесь.
+        stopped_by_lock = bool(getattr(self, "_dictation_stopped_by_lock", False))
+        self._dictation_stopped_by_lock = False
         if text:
-            should_try_paste = self.cfg.auto_paste and self.live_target_is_text_field and not self.recording_started_in_own_window
+            # US-070: решение о вставке принимается ЗДЕСЬ, в момент доставки
+            # текста, а не по снимку состояния в начале записи. Во-первых, за
+            # время диктовки пользователь мог поставить курсор в нужное поле —
+            # раньше это не учитывалось вовсе. Во-вторых, наличие поля ввода
+            # проверяет `copy_and_maybe_paste`, и только если пользователь
+            # оставил включённой «Безопасную вставку»: прежний безусловный гейт
+            # делал эту настройку недействующей для диктовки, из-за чего в
+            # программах, рисующих поле самостоятельно (Chromium, Qt), вставку
+            # нельзя было включить вообще ничем.
+            should_try_paste = (
+                self.cfg.auto_paste
+                and not self.recording_started_in_own_window
+                and not stopped_by_lock
+            )
             if should_try_paste:
+                # US-067: в режиме «на момент начала записи» вставка выполняется
+                # только в то же окно; иначе текст остаётся в буфере и в плашке.
+                expected_hwnd = (
+                    self.recording_target_hwnd
+                    if str(getattr(self.cfg, "paste_target_window", "on_finish")) == "on_start"
+                    else None
+                )
                 inserted = copy_and_maybe_paste(
                     text,
                     auto_paste=True,
                     only_when_text_field_detected=self.cfg.paste_only_when_text_field_detected,
                     allow_current_process=False,
+                    expected_foreground_hwnd=expected_hwnd,
                 )
             if not inserted:
                 pyperclip.copy(text)
@@ -4156,17 +4278,24 @@ class MainWindow(QMainWindow):
         self.toggle_btn.setText("Начать запись")
         self.result_preview_active = False
         self.result_preview_text = ""
-        self.unregister_cancel_hotkey()
+        self.stop_escape_watch()
         if show_overlay_result and text and self.cfg.overlay_enabled:
             self.result_preview_active = True
             self.result_preview_text = text
             self.overlay.show_result_text(text)
-            self.register_cancel_hotkey()
-            suffix = "поле ввода не найдено; текст показан под плашкой, сохранён в истории и скопирован в буфер"
+            self.start_escape_watch()
+            if stopped_by_lock:
+                suffix = "экран был заблокирован; запись остановлена, текст показан под плашкой, сохранён в истории и скопирован в буфер"
+            elif should_try_paste:
+                suffix = "вставка не выполнена (поле ввода не найдено, окно сменилось или программа не приняла текст); текст показан под плашкой, сохранён в истории и скопирован в буфер"
+            else:
+                suffix = "поле ввода не найдено; текст показан под плашкой, сохранён в истории и скопирован в буфер"
         else:
             if self.cfg.overlay_enabled:
                 QTimer.singleShot(1400, self.overlay.show_idle)
-            if self.recording_started_in_own_window and text and not inserted:
+            if stopped_by_lock and text and not inserted:
+                suffix = "экран был заблокирован; запись остановлена, текст сохранён в истории и скопирован в буфер"
+            elif self.recording_started_in_own_window and text and not inserted:
                 suffix = "текст показан во вкладке «Диктовка», сохранён в истории и скопирован в буфер"
             else:
                 suffix = "текст вставлен" if inserted else "текст скопирован в буфер и сохранён в истории"
@@ -4205,7 +4334,7 @@ class MainWindow(QMainWindow):
         if self.cancel_requested:
             log.info("Cancelled transcription failed after cancellation; suppressing user-facing error")
             self.update_recording_badge()
-            self.unregister_cancel_hotkey()
+            self.stop_escape_watch()
             self.toggle_btn.setEnabled(True)
             self.toggle_btn.setText("Начать запись")
             self.status_label.setText("Расшифровка отменена. Фоновый результат проигнорирован.")
@@ -4217,7 +4346,7 @@ class MainWindow(QMainWindow):
         self.toggle_btn.setEnabled(True)
         self.toggle_btn.setText("Начать запись")
         self.update_recording_badge()
-        self.unregister_cancel_hotkey()
+        self.stop_escape_watch()
         if self.cfg.overlay_enabled:
             self.overlay.show_error("Ошибка", seconds=5)
         log.error("Worker failed detail: %s", detail)
@@ -4235,6 +4364,38 @@ class MainWindow(QMainWindow):
     def on_timer_tick(self) -> None:
         self.update_recording_badge()
         self.maybe_start_live_transcription()
+
+    def _start_session_lock_watch(self) -> None:
+        """US-069: следить за блокировкой экрана, пока идёт запись."""
+        try:
+            self.session_lock_watcher.start(self._on_session_locked)
+        except Exception:  # noqa: BLE001
+            log.exception("Session lock watch start failed")
+
+    def _stop_session_lock_watch(self) -> None:
+        """US-069: снять наблюдение. Зовётся во всех точках завершения записи."""
+        try:
+            self.session_lock_watcher.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_session_locked(self) -> None:
+        """US-069: экран заблокирован — остановить диктовку и расшифровать.
+
+        Останавливаем ровно тем же путём, что и повторное нажатие горячей
+        клавиши: запись прекращается, запускается расшифровка, текст попадает в
+        историю и буфер обмена — надиктованное не теряется. В Push-to-Talk
+        запись к этому моменту обычно уже остановлена отпусканием клавиш,
+        поэтому проверка `is_recording` обязательна: второй остановки и второй
+        расшифровки быть не должно. Расшифровка файла не затрагивается.
+        """
+        if not self.recorder.is_recording:
+            self._stop_session_lock_watch()
+            return
+        log.info("Screen locked during dictation: stopping recording and transcribing")
+        self._dictation_stopped_by_lock = True
+        self.status_label.setText("Экран заблокирован. Диктовка остановлена, расшифровываю…")
+        self.stop_recording()
 
     def _start_overlay_audio_level_updates(self) -> None:
         self.overlay.set_audio_level(0.0)
@@ -4339,7 +4500,7 @@ class MainWindow(QMainWindow):
         self.result_preview_text = ""
         if self.cfg.overlay_enabled:
             self.overlay.show_idle()
-        self.unregister_cancel_hotkey()
+        self.stop_escape_watch()
         self.status_label.setText("Текст скопирован. Готово.")
 
     def on_overlay_position_changed(self, x: int, y: int) -> None:
@@ -5554,7 +5715,8 @@ class MainWindow(QMainWindow):
             return
         self._quitting = True
         self._log_running_workers_on_quit()
-        self.unregister_cancel_hotkey()
+        self.stop_escape_watch()
+        self._stop_session_lock_watch()  # US-069
         # 1) Останавливаем ВСЕ периодические таймеры (иначе тик 300мс может
         #    заново показать оверлей / трогать UI во время разбора).
         try:
@@ -5566,7 +5728,8 @@ class MainWindow(QMainWindow):
                         pass
         except Exception:  # noqa: BLE001
             pass
-        # 2) Снимаем глобальную горячую клавишу (keyboard hook).
+        # 2) Снимаем системную регистрацию горячей клавиши и наблюдение
+        #    за клавишами комбинации (Push-to-Talk).
         try:
             self.hotkey.stop()
         except Exception:  # noqa: BLE001
