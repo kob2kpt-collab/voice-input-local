@@ -418,6 +418,14 @@ def copy_and_maybe_paste(
 
     detection = focused_control_accepts_text()
     if only_when_text_field_detected and detection is not True:
+        # US-070: раньше этот отказ был молчаливым, и в журнале не оставалось
+        # ничего — из-за этого «не вставляет в такую-то программу» годами
+        # выглядело как случайность.
+        log.info(
+            "Автовставка пропущена: Windows не сообщает об активном поле ввода (проверка вернула %s). "
+            "Программы, рисующие поле сами (Chromium, Qt), так и выглядят — помогает снятая «Безопасная вставка».",
+            detection,
+        )
         return False
 
     time.sleep(CLIPBOARD_SETTLE_SECONDS)

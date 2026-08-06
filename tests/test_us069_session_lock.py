@@ -278,10 +278,15 @@ def test_normal_delivery_still_pastes() -> None:
 
 
 def test_normal_delivery_respects_existing_rules() -> None:
-    """Прежние условия отказа от вставки продолжают действовать без изменений."""
+    """Прежние условия отказа от вставки продолжают действовать без изменений.
+
+    Условие «Windows не видела поля ввода в начале записи» здесь намеренно
+    отсутствует: US-070 перенесла эту проверку на момент доставки текста, где
+    ею управляет настройка «Безопасная вставка». Поведение закреплено в
+    tests/test_us070_paste_gate.py.
+    """
     for kwargs in (
         {"auto_paste": False},
-        {"target_is_text_field": False},
         {"own_window": True},
     ):
         window = _delivery_window(stopped_by_lock=False, **kwargs)
