@@ -58,6 +58,13 @@ MODIFIER_POLL_SECONDS = 0.025
 # Задержка перед Ctrl+V: буферу обмена Windows нужно время устояться.
 CLIPBOARD_SETTLE_SECONDS = 0.12
 
+# US-071: сколько ждать, пока окно, выбранное пользователем, реально станет
+# активным после запроса. Windows может отказать молча, поэтому результат
+# проверяется опросом.
+WINDOW_ACTIVATION_TIMEOUT_SECONDS = 0.6
+WINDOW_ACTIVATION_POLL_SECONDS = 0.03
+SW_RESTORE = 9
+
 # US-070 (TASK-358): признаки редакторов, которые рисуют поле ввода сами.
 #
 # Ни Windows, ни доступность не считают такие поля текстовыми: у Claude Desktop
@@ -194,6 +201,57 @@ def foreground_window_handle() -> Optional[int]:
         return int(hwnd) if hwnd else None
     except Exception:
         return None
+
+
+def _request_window_activation(hwnd: int) -> bool:
+    """Попросить Windows сделать окно активным. True — запрос отправлен.
+
+    Отдельная функция, чтобы полностью изолировать обращение к Win32: в тестах
+    подменяется, а логика ожидания проверяется без реальных окон.
+    """
+    try:
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        handle = wintypes.HWND(hwnd)
+        if not user32.IsWindow(handle):
+            log.info("Окно, в котором начиналась запись, больше не существует")
+            return False
+        if user32.IsIconic(handle):
+            user32.ShowWindow(handle, SW_RESTORE)
+        user32.SetForegroundWindow(handle)
+        return True
+    except Exception:  # noqa: BLE001
+        log.exception("Не удалось запросить активацию окна")
+        return False
+
+
+def activate_window(
+    hwnd: int | None,
+    *,
+    timeout: float = WINDOW_ACTIVATION_TIMEOUT_SECONDS,
+    poll: float = WINDOW_ACTIVATION_POLL_SECONDS,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+) -> bool:
+    """Вернуть фокус окну, в котором пользователь начал диктовать (US-071).
+
+    Возвращает True, только если окно ДЕЙСТВИТЕЛЬНО стало активным: Windows
+    намеренно ограничивает переключение фокуса чужими процессами, и запрос
+    может быть отклонён молча. Поэтому результат проверяется опросом, а не
+    принимается на веру — иначе Ctrl+V ушёл бы в чужое окно.
+    """
+    if not hwnd:
+        return False
+    if foreground_window_handle() == hwnd:
+        return True
+    if not _request_window_activation(hwnd):
+        return False
+    deadline = monotonic() + max(0.0, timeout)
+    while True:
+        if foreground_window_handle() == hwnd:
+            return True
+        if monotonic() >= deadline:
+            return False
+        sleep(poll)
 
 
 def foreground_window_pid() -> Optional[int]:
@@ -440,8 +498,15 @@ def copy_and_maybe_paste(
     if not allow_current_process and foreground_belongs_to_current_process():
         return False
     if expected_foreground_hwnd is not None and foreground_window_handle() != expected_foreground_hwnd:
-        log.info("Автовставка пропущена: активное окно сменилось с момента начала записи")
-        return False
+        # US-071: текст адресован окну, в котором пользователь начал диктовать,
+        # поэтому фокус туда возвращается, а не бросается затея. Раньше вставка
+        # просто не выполнялась — режим не делал того, что обещал названием.
+        if not activate_window(expected_foreground_hwnd):
+            log.info(
+                "Автовставка пропущена: Windows не вернула фокус окну, в котором начиналась запись"
+            )
+            return False
+        log.info("Фокус возвращён окну, в котором начиналась запись")
 
     detection = focused_control_accepts_text()
     if only_when_text_field_detected and detection is not True:

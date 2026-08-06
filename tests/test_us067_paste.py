@@ -158,19 +158,31 @@ def _run_paste(monkey: dict, **kwargs) -> tuple[bool, ClipboardSpy, list[str]]:
     """Выполнить copy_and_maybe_paste с подменёнными Win32-зависимостями."""
     clipboard = ClipboardSpy()
     sent: list[str] = []
+    state = {"foreground": monkey.get("foreground", 111)}
     originals = {
         "pyperclip": insert_module.pyperclip,
         "foreground_belongs_to_current_process": insert_module.foreground_belongs_to_current_process,
         "foreground_window_handle": insert_module.foreground_window_handle,
         "focused_control_accepts_text": insert_module.focused_control_accepts_text,
         "_send_ctrl_v": insert_module._send_ctrl_v,
+        "_request_window_activation": insert_module._request_window_activation,
         "time": insert_module.time,
     }
+
+    def request_activation(_hwnd: int) -> bool:
+        """monkey['activates']: куда встанет фокус, либо None — Windows отказала."""
+        target = monkey.get("activates")
+        if target is None:
+            return False
+        state["foreground"] = target
+        return True
+
     insert_module.pyperclip = clipboard
     insert_module.foreground_belongs_to_current_process = lambda: monkey.get("own_process", False)
-    insert_module.foreground_window_handle = lambda: monkey.get("foreground", 111)
+    insert_module.foreground_window_handle = lambda: state["foreground"]
     insert_module.focused_control_accepts_text = lambda: monkey.get("text_field", True)
     insert_module._send_ctrl_v = lambda: (sent.append("ctrl+v"), True)[1]
+    insert_module._request_window_activation = request_activation
 
     class _NoSleep:
         monotonic = staticmethod(lambda: 0.0)
@@ -197,11 +209,54 @@ def test_same_window_mode_pastes_when_window_unchanged() -> None:
     assert result is True and sent == ["ctrl+v"]
 
 
-def test_same_window_mode_skips_when_focus_changed() -> None:
-    result, clipboard, sent = _run_paste({"foreground": 222}, expected_foreground_hwnd=111)
-    assert result is False, "текст вставлен в чужое окно"
-    assert sent == [], "Ctrl+V всё же был отправлен"
+def test_same_window_mode_returns_focus_and_pastes() -> None:
+    """US-071: фокус возвращается окну, в котором начиналась запись."""
+    result, _clipboard, sent = _run_paste(
+        {"foreground": 222, "activates": 111},
+        expected_foreground_hwnd=111,
+    )
+    assert result is True, "текст не попал в окно, где начиналась диктовка"
+    assert sent == ["ctrl+v"]
+
+
+def test_same_window_mode_falls_back_when_windows_refuses() -> None:
+    """Windows вправе не отдать фокус — тогда честный фолбэк, а не вставка вслепую."""
+    result, clipboard, sent = _run_paste(
+        {"foreground": 222, "activates": None},
+        expected_foreground_hwnd=111,
+    )
+    assert result is False, "вставка выполнена, хотя фокус остался у чужого окна"
+    assert sent == [], "Ctrl+V ушёл в чужое окно"
     assert clipboard.copied == ["текст"], "текст потерян — его нет даже в буфере"
+
+
+def test_activation_waits_for_the_window_to_actually_come_forward() -> None:
+    """Запрос активации принят — но результат проверяется опросом, а не на веру."""
+    state = {"foreground": 222}
+    clock = {"now": 0.0}
+
+    def request(_hwnd: int) -> bool:
+        return True
+
+    def sleep(seconds: float) -> None:
+        clock["now"] += seconds
+        if clock["now"] >= 0.1:
+            state["foreground"] = 111  # окно вышло вперёд не мгновенно
+
+    saved = (insert_module._request_window_activation, insert_module.foreground_window_handle)
+    insert_module._request_window_activation = request
+    insert_module.foreground_window_handle = lambda: state["foreground"]
+    try:
+        assert insert_module.activate_window(
+            111, timeout=0.6, poll=0.025, monotonic=lambda: clock["now"], sleep=sleep
+        ) is True
+        state["foreground"] = 222
+        clock["now"] = 0.0
+        assert insert_module.activate_window(
+            111, timeout=0.2, poll=0.025, monotonic=lambda: clock["now"], sleep=lambda _s: clock.__setitem__("now", clock["now"] + _s)
+        ) is False, "молчаливый отказ Windows принят за успешную активацию"
+    finally:
+        insert_module._request_window_activation, insert_module.foreground_window_handle = saved
 
 
 def test_paste_is_skipped_without_text_field() -> None:
@@ -273,7 +328,9 @@ def _run() -> None:
         test_guard_reads_only_a_short_fixed_key_list,
         test_default_mode_pastes_into_whatever_window_is_active,
         test_same_window_mode_pastes_when_window_unchanged,
-        test_same_window_mode_skips_when_focus_changed,
+        test_same_window_mode_returns_focus_and_pastes,
+        test_same_window_mode_falls_back_when_windows_refuses,
+        test_activation_waits_for_the_window_to_actually_come_forward,
         test_paste_is_skipped_without_text_field,
         test_paste_is_skipped_for_own_window,
         test_config_has_paste_target_setting,
