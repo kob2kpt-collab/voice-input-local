@@ -154,6 +154,11 @@ class AppConfig:
     file_selected_model: str = ""  # TASK-051 (US-017): отдельная модель для расшифровки файлов; пусто — использовать selected_model
     auto_paste: bool = True
     paste_only_when_text_field_detected: bool = True
+    # US-067: в какое окно вставлять текст. "on_finish" — в то, что активно к
+    # моменту готовности текста (прежнее поведение, дефолт); "on_start" — в то,
+    # что было активно в начале записи, иначе вставка не выполняется и текст
+    # остаётся в буфере и в плашке.
+    paste_target_window: str = "on_finish"
     language: str = ""  # empty means auto for Whisper and Parakeet v3
     device: str = "cpu"  # cpu, cuda, auto
     compute_type: str = "int8"  # int8, int8_float16, float16, float32

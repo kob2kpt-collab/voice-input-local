@@ -54,7 +54,7 @@ from .config import AppConfig, CloudConnection, CONNECTION_TYPE_OPENAI, CONNECTI
 from .history import HistoryItem, HistoryStore
 from . import export as history_export
 from .hotkeys import VK_ESCAPE, HotkeyService, normalize_hotkey
-from .insert import copy_and_maybe_paste, focused_control_accepts_text, foreground_belongs_to_current_process, foreground_matches_window_handle
+from .insert import copy_and_maybe_paste, focused_control_accepts_text, foreground_belongs_to_current_process, foreground_matches_window_handle, foreground_window_handle
 from .key_watch import KeyStateWatcher
 from .logger import get_logger, setup_logging
 from .models import ALL_MODELS, DEFAULT_MODEL_KEY, DEFAULT_SUMMARY_MODEL_KEY, SUMMARY_MODELS, DownloadProgress, ModelManager, TRANSCRIPTION_MODELS, cloud_connection_id_of, cloud_provider_of, is_cloud_model_key, merge_transcript_parts, model_display_name
@@ -630,6 +630,9 @@ class MainWindow(QMainWindow):
         self.result_preview_text = ""
 
         self.recording_started_in_own_window = False
+        # US-067: окно, активное на момент начала записи. Используется в режиме
+        # «вставлять в окно, активное на момент начала записи».
+        self.recording_target_hwnd: int | None = None
         self._settings_loading = True
         self._settings_save_timer = QTimer(self)
         self._settings_save_timer.setSingleShot(True)
@@ -1520,6 +1523,19 @@ class MainWindow(QMainWindow):
         form.addRow("", self.hotkey_mode_hint_label)
         form.addRow("Вставка", self.auto_paste_check)
         form.addRow("Безопасная вставка", self.detect_text_field_check)
+        # US-067: выбор целевого окна автовставки.
+        self.paste_target_combo = NoScrollComboBox()
+        self.paste_target_combo.addItem("В окно, активное на момент завершения записи", "on_finish")
+        self.paste_target_combo.addItem("В окно, активное на момент начала записи", "on_start")
+        form.addRow("Куда вставлять", self.paste_target_combo)
+        self.paste_target_hint_label = QLabel(
+            "«На момент завершения» — можно во время диктовки перейти в нужное поле, текст попадёт туда. "
+            "«На момент начала» — текст попадёт только в то окно, где вы начали диктовать; если фокус сменился, "
+            "вставка не выполняется, а текст остаётся в буфере обмена и в плашке."
+        )
+        self.paste_target_hint_label.setObjectName("Subtitle")
+        self.paste_target_hint_label.setWordWrap(True)
+        form.addRow("", self.paste_target_hint_label)
         form.addRow("Созвоны", self.meeting_compat_check)
         form.addRow("Плавающая плашка", self.overlay_enabled_check)
         form.addRow("Автозагрузка", self.autostart_check)
@@ -1884,6 +1900,9 @@ class MainWindow(QMainWindow):
         self.hotkey_mode_combo.setCurrentIndex(_hm_idx if _hm_idx >= 0 else 0)
         self.auto_paste_check.setChecked(self.cfg.auto_paste)
         self.detect_text_field_check.setChecked(self.cfg.paste_only_when_text_field_detected)
+        _pt = getattr(self.cfg, "paste_target_window", "on_finish")
+        _pt_idx = self.paste_target_combo.findData(_pt)
+        self.paste_target_combo.setCurrentIndex(_pt_idx if _pt_idx >= 0 else 0)
         self.meeting_compat_check.setChecked(self.cfg.audio_meeting_compatibility)
         self.overlay_enabled_check.setChecked(self.cfg.overlay_enabled)
         autostart_enabled = autostart.is_enabled() if autostart.is_supported() else False
@@ -2045,7 +2064,7 @@ class MainWindow(QMainWindow):
         self.update_repo_edit.editingFinished.connect(self.schedule_settings_autosave)
         for checkbox in [self.auto_paste_check, self.detect_text_field_check, self.meeting_compat_check, self.overlay_enabled_check, self.autostart_check, self.updates_enabled_check]:
             checkbox.stateChanged.connect(self.schedule_settings_autosave)
-        for combo in [self.microphone_combo, self.language_combo, self.device_combo, self.compute_combo, self.hotkey_mode_combo]:
+        for combo in [self.microphone_combo, self.language_combo, self.device_combo, self.compute_combo, self.hotkey_mode_combo, self.paste_target_combo]:
             combo.currentIndexChanged.connect(self.schedule_settings_autosave)
         self.file_stable_timestamps_check.stateChanged.connect(self.save_file_options)
         self.file_diarization_check.stateChanged.connect(self.save_file_options)
@@ -3487,6 +3506,7 @@ class MainWindow(QMainWindow):
         requested_hotkey_mode = str(self.hotkey_mode_combo.currentData() or "toggle")
         self.cfg.auto_paste = self.auto_paste_check.isChecked()
         self.cfg.paste_only_when_text_field_detected = self.detect_text_field_check.isChecked()
+        self.cfg.paste_target_window = str(self.paste_target_combo.currentData() or "on_finish")
         self.cfg.audio_meeting_compatibility = self.meeting_compat_check.isChecked()
         self.cfg.overlay_enabled = self.overlay_enabled_check.isChecked()
         self.cfg.autostart_enabled = self.autostart_check.isChecked() and autostart.is_supported()
@@ -3919,6 +3939,8 @@ class MainWindow(QMainWindow):
                 self.recording_started_in_own_window = foreground_matches_window_handle(int(self.winId()))
             except Exception:
                 self.recording_started_in_own_window = foreground_belongs_to_current_process()
+            # US-067: окно-получатель для режима «на момент начала записи».
+            self.recording_target_hwnd = foreground_window_handle()
             self.recorder.start()
             self.cancel_requested = False
             self.live_last_request_at = 0.0
@@ -4205,6 +4227,7 @@ class MainWindow(QMainWindow):
     def _deliver_dictation_result(self, text: str, duration: float, wav_path: Path, *, postprocess_failed: bool = False) -> None:
         self.last_text.setPlainText(text)
         inserted = False
+        should_try_paste = False
         show_overlay_result = False
         # US-069: диктовку, остановленную блокировкой экрана, НЕ вставляем в
         # активное окно. Расшифровка может закончиться, пока экран заблокирован,
@@ -4221,11 +4244,19 @@ class MainWindow(QMainWindow):
                 and not stopped_by_lock
             )
             if should_try_paste:
+                # US-067: в режиме «на момент начала записи» вставка выполняется
+                # только в то же окно; иначе текст остаётся в буфере и в плашке.
+                expected_hwnd = (
+                    self.recording_target_hwnd
+                    if str(getattr(self.cfg, "paste_target_window", "on_finish")) == "on_start"
+                    else None
+                )
                 inserted = copy_and_maybe_paste(
                     text,
                     auto_paste=True,
                     only_when_text_field_detected=self.cfg.paste_only_when_text_field_detected,
                     allow_current_process=False,
+                    expected_foreground_hwnd=expected_hwnd,
                 )
             if not inserted:
                 pyperclip.copy(text)
@@ -4246,6 +4277,8 @@ class MainWindow(QMainWindow):
             self.start_escape_watch()
             if stopped_by_lock:
                 suffix = "экран был заблокирован; запись остановлена, текст показан под плашкой, сохранён в истории и скопирован в буфер"
+            elif should_try_paste:
+                suffix = "вставка не выполнена (окно ввода сменилось или не приняло текст); текст показан под плашкой, сохранён в истории и скопирован в буфер"
             else:
                 suffix = "поле ввода не найдено; текст показан под плашкой, сохранён в истории и скопирован в буфер"
         else:
