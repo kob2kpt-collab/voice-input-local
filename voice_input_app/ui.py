@@ -59,6 +59,7 @@ from .key_watch import KeyStateWatcher
 from .logger import get_logger, setup_logging
 from .models import ALL_MODELS, DEFAULT_MODEL_KEY, DEFAULT_SUMMARY_MODEL_KEY, SUMMARY_MODELS, DownloadProgress, ModelManager, TRANSCRIPTION_MODELS, cloud_connection_id_of, cloud_provider_of, is_cloud_model_key, merge_transcript_parts, model_display_name
 from .overlay import HotkeySafeComboBox, RecordingOverlay
+from .session_lock import SessionLockWatcher
 from .cloud_security_dialog import (
     confirm_external_switch,
     confirm_safe_switch,
@@ -596,6 +597,12 @@ class MainWindow(QMainWindow):
         # клавишей нельзя: Windows отдала бы её нам одним, и в активной
         # программе Escape перестал бы закрывать диалоги и подсказки.
         self.escape_watcher = KeyStateWatcher(self)
+        # US-069: блокировка экрана останавливает диктовку. Состояние сессии
+        # спрашивается у Windows только пока идёт запись — как и состояние
+        # клавиш. Расшифровки файла это не касается: она идёт часами и с
+        # присутствием пользователя не связана.
+        self.session_lock_watcher = SessionLockWatcher(self)
+        self._dictation_stopped_by_lock = False
         self._hotkey_error_message = ""
         self.record_blink = False
         self.overlay = RecordingOverlay()
@@ -3901,6 +3908,7 @@ class MainWindow(QMainWindow):
                 return
             self.result_preview_active = False
             self.result_preview_text = ""
+            self._dictation_stopped_by_lock = False  # US-069: признак этой диктовки
             self.stop_escape_watch()
             self.recorder = AudioRecorder(sample_rate=self.cfg.sample_rate, input_device_id=self.cfg.audio_input_device_id, meeting_compatibility=self.cfg.audio_meeting_compatibility)
             # Only the main Voice Input Local window should count as "own window".
@@ -3927,10 +3935,12 @@ class MainWindow(QMainWindow):
                 self.overlay.reset_for_new_recording(live_enabled=self.cfg.live_transcription)
                 self.overlay.show_recording(0.0, live_enabled=self.cfg.live_transcription)
             self._start_overlay_audio_level_updates()
+            self._start_session_lock_watch()  # US-069
             self.update_recording_badge()
             log.info("Recording started. live_target_is_text_field=%s own_window=%s model=%s", self.live_target_is_text_field, self.recording_started_in_own_window, self.cfg.selected_model)
         except Exception as exc:  # noqa: BLE001
             self._stop_overlay_audio_level_updates()
+            self._stop_session_lock_watch()  # US-069
             log.exception("Recording start failed")
             self.toggle_btn.setText("Начать запись")
             self.status_label.setText("Запись недоступна. Подробности записаны в логи.")
@@ -3940,6 +3950,11 @@ class MainWindow(QMainWindow):
 
     def stop_recording(self) -> None:
         self._stop_overlay_audio_level_updates()
+        self._stop_session_lock_watch()  # US-069
+        # US-069: при остановке по блокировке экрана модальные окна не
+        # показываем — они повисли бы позади экрана блокировки и заморозили
+        # приложение до разблокировки. Причина остаётся в статус-строке и логах.
+        stopped_by_lock = bool(getattr(self, "_dictation_stopped_by_lock", False))
         try:
             wav_path, duration = self.recorder.stop_to_wav()
             if duration < 1.0:
@@ -3950,11 +3965,15 @@ class MainWindow(QMainWindow):
                 if self.cfg.overlay_enabled:
                     self.overlay.show_cancelled(seconds=3)
                 self.status_label.setText("Запись слишком короткая. Скажите фразу дольше 1 секунды и попробуйте снова.")
-                QMessageBox.information(self, "Запись", "Запись слишком короткая или речь не обнаружена. Попробуйте ещё раз.")
+                if not stopped_by_lock:
+                    QMessageBox.information(self, "Запись", "Запись слишком короткая или речь не обнаружена. Попробуйте ещё раз.")
                 return
         except Exception as exc:  # noqa: BLE001
             log.exception("Recording stop failed")
-            QMessageBox.critical(self, "Запись", str(exc))
+            if not stopped_by_lock:
+                QMessageBox.critical(self, "Запись", str(exc))
+            else:
+                self.status_label.setText("Не удалось сохранить запись, остановленную при блокировке экрана. Подробности в логах.")
             self.toggle_btn.setText("Начать запись")
             self.stop_escape_watch()
             return
@@ -3998,6 +4017,8 @@ class MainWindow(QMainWindow):
         if self.recorder.is_recording:
             self.recorder.cancel()
         self._stop_overlay_audio_level_updates()
+        self._stop_session_lock_watch()  # US-069
+        self._dictation_stopped_by_lock = False
         self.toggle_btn.setText("Начать запись")
         self.toggle_btn.setEnabled(not final_running)
         self.record_badge.setText("Отменено")
@@ -4185,8 +4206,20 @@ class MainWindow(QMainWindow):
         self.last_text.setPlainText(text)
         inserted = False
         show_overlay_result = False
+        # US-069: диктовку, остановленную блокировкой экрана, НЕ вставляем в
+        # активное окно. Расшифровка может закончиться, пока экран заблокирован,
+        # а после разблокировки фокус окажется неизвестно где — текст улетел бы
+        # в чужое поле. Всё остальное (буфер, история, плашка, постобработка)
+        # работает как обычно. Признак одноразовый: снимаем его здесь.
+        stopped_by_lock = bool(getattr(self, "_dictation_stopped_by_lock", False))
+        self._dictation_stopped_by_lock = False
         if text:
-            should_try_paste = self.cfg.auto_paste and self.live_target_is_text_field and not self.recording_started_in_own_window
+            should_try_paste = (
+                self.cfg.auto_paste
+                and self.live_target_is_text_field
+                and not self.recording_started_in_own_window
+                and not stopped_by_lock
+            )
             if should_try_paste:
                 inserted = copy_and_maybe_paste(
                     text,
@@ -4211,11 +4244,16 @@ class MainWindow(QMainWindow):
             self.result_preview_text = text
             self.overlay.show_result_text(text)
             self.start_escape_watch()
-            suffix = "поле ввода не найдено; текст показан под плашкой, сохранён в истории и скопирован в буфер"
+            if stopped_by_lock:
+                suffix = "экран был заблокирован; запись остановлена, текст показан под плашкой, сохранён в истории и скопирован в буфер"
+            else:
+                suffix = "поле ввода не найдено; текст показан под плашкой, сохранён в истории и скопирован в буфер"
         else:
             if self.cfg.overlay_enabled:
                 QTimer.singleShot(1400, self.overlay.show_idle)
-            if self.recording_started_in_own_window and text and not inserted:
+            if stopped_by_lock and text and not inserted:
+                suffix = "экран был заблокирован; запись остановлена, текст сохранён в истории и скопирован в буфер"
+            elif self.recording_started_in_own_window and text and not inserted:
                 suffix = "текст показан во вкладке «Диктовка», сохранён в истории и скопирован в буфер"
             else:
                 suffix = "текст вставлен" if inserted else "текст скопирован в буфер и сохранён в истории"
@@ -4284,6 +4322,38 @@ class MainWindow(QMainWindow):
     def on_timer_tick(self) -> None:
         self.update_recording_badge()
         self.maybe_start_live_transcription()
+
+    def _start_session_lock_watch(self) -> None:
+        """US-069: следить за блокировкой экрана, пока идёт запись."""
+        try:
+            self.session_lock_watcher.start(self._on_session_locked)
+        except Exception:  # noqa: BLE001
+            log.exception("Session lock watch start failed")
+
+    def _stop_session_lock_watch(self) -> None:
+        """US-069: снять наблюдение. Зовётся во всех точках завершения записи."""
+        try:
+            self.session_lock_watcher.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_session_locked(self) -> None:
+        """US-069: экран заблокирован — остановить диктовку и расшифровать.
+
+        Останавливаем ровно тем же путём, что и повторное нажатие горячей
+        клавиши: запись прекращается, запускается расшифровка, текст попадает в
+        историю и буфер обмена — надиктованное не теряется. В Push-to-Talk
+        запись к этому моменту обычно уже остановлена отпусканием клавиш,
+        поэтому проверка `is_recording` обязательна: второй остановки и второй
+        расшифровки быть не должно. Расшифровка файла не затрагивается.
+        """
+        if not self.recorder.is_recording:
+            self._stop_session_lock_watch()
+            return
+        log.info("Screen locked during dictation: stopping recording and transcribing")
+        self._dictation_stopped_by_lock = True
+        self.status_label.setText("Экран заблокирован. Диктовка остановлена, расшифровываю…")
+        self.stop_recording()
 
     def _start_overlay_audio_level_updates(self) -> None:
         self.overlay.set_audio_level(0.0)
@@ -5604,6 +5674,7 @@ class MainWindow(QMainWindow):
         self._quitting = True
         self._log_running_workers_on_quit()
         self.stop_escape_watch()
+        self._stop_session_lock_watch()  # US-069
         # 1) Останавливаем ВСЕ периодические таймеры (иначе тик 300мс может
         #    заново показать оверлей / трогать UI во время разбора).
         try:

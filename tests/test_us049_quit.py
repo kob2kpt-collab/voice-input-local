@@ -92,6 +92,7 @@ def _child_really_quit() -> None:
         tray=types.SimpleNamespace(hide=lambda: None),
         overlay=types.SimpleNamespace(hide=lambda: None),
         stop_escape_watch=lambda: None,  # EPIC-13: отмена по Escape — наблюдение, не хоткей
+        _stop_session_lock_watch=lambda: None,  # US-069: наблюдение за блокировкой экрана
         # _log замокан, чтобы тест не писал в app.log; _shutdown_workers — настоящий.
         _log_running_workers_on_quit=lambda: None,
     )

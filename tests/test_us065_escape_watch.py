@@ -113,6 +113,8 @@ def _make_window(keyboard: FakeKeyboard, *, recording: bool, transcribing: bool)
         ),
         _stop_dictation_progress=lambda: None,
         _stop_overlay_audio_level_updates=lambda: events.append("audio_level.stopped"),
+        _stop_session_lock_watch=lambda: events.append("session_lock.stopped"),  # US-069
+        _dictation_stopped_by_lock=False,
         _cleanup_wav=lambda _p: None,
     )
     for name in ("start_escape_watch", "stop_escape_watch", "cancel_current_action"):
