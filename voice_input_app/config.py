@@ -136,12 +136,35 @@ class CloudConnection:
     base_url: str = ""
     api_key: str = ""
     discovered_models: list[str] = field(default_factory=list)
+    # US-073: показывать только модели, размещённые в Cloud.ru.
+    # Дефолт True — флажок включается и для уже настроенных подключений при
+    # обновлении программы (решение владельца продукта). На подключениях,
+    # которые размещение не сообщают, фильтр бездействует и флажок недоступен
+    # (см. cloud_placement.connection_hidden_reason / AC 5), поэтому включение
+    # по умолчанию не ломает сторонние OpenAI-совместимые сервисы.
+    only_internal_models: bool = True
+    # Сообщал ли сервис размещение при последнем успешном опросе /v1/models.
+    # Нужен, чтобы «признак пропал» не открывал внешние модели молча (AC 7).
+    reports_model_placement: bool = False
+    # Кэш признаков последнего опроса: id модели -> "internal"/"external"
+    # и id модели -> metadata.type (TASK-365). Хранятся в config.json, чтобы
+    # реестр моделей восстанавливался при старте БЕЗ HTTP-запроса.
+    model_placement: dict = field(default_factory=dict)
+    model_types: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.id:
             self.id = _gen_connection_id()
         if self.type not in (CONNECTION_TYPE_OPENAI, CONNECTION_TYPE_ELEVENLABS):
             self.type = CONNECTION_TYPE_OPENAI
+        # US-073: защита от битого config.json — карты признаков обязаны быть
+        # словарями, иначе фильтр упал бы при первом обращении.
+        if not isinstance(self.model_placement, dict):
+            self.model_placement = {}
+        if not isinstance(self.model_types, dict):
+            self.model_types = {}
+        self.only_internal_models = bool(self.only_internal_models)
+        self.reports_model_placement = bool(self.reports_model_placement)
 
 
 @dataclass

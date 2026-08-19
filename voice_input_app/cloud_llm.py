@@ -23,6 +23,7 @@ from typing import Optional
 
 import requests
 
+from . import cloud_placement
 from .cloud_stt import (
     CONNECT_TIMEOUT,
     VERIFY_READ_TIMEOUT,
@@ -404,11 +405,14 @@ def verify_connection(api_key: str, base_url: str) -> tuple[bool, str]:
 
 # In-memory cache: ключ api_key+base_url → список model id
 _discover_cache: dict[str, list[str]] = {}
+# US-073: кэш ПОЛНОГО разбора ответа (id + размещение + тип) того же эндпоинта.
+_detailed_cache: dict[str, list] = {}
 
 
 def invalidate_discover_cache() -> None:
     """Сбросить кэш discover (при смене ключа/URL в настройках)."""
     _discover_cache.clear()
+    _detailed_cache.clear()
 
 
 # US-034: модели, НЕ умеющие одновременно текст-на-входе И текст-на-выходе,
@@ -480,34 +484,37 @@ def discover_chat_models(
     if not isinstance(data, list):
         log.warning("discover_llm: response has no 'data' list")
         return []
-    all_ids: list[str] = []
-    for entry in data:
-        if not isinstance(entry, dict):
-            continue
-        model_id = str(entry.get("id") or "").strip()
-        if model_id:
-            all_ids.append(model_id)
-    all_ids.sort()
+    # US-073: разбор через общий парсер — попутно запоминаем размещение моделей
+    # эндпоинта, даже если этот вызов пришёл не из диалога подключения.
+    infos = cloud_placement.parse_models_payload(payload)
+    cloud_placement.remember_endpoint_models(base, infos)
+    all_ids = sorted(i.id for i in infos)
     text_ids = [mid for mid in all_ids if _is_text_io_model(mid)]
     excluded = [mid for mid in all_ids if mid not in text_ids]
     log.info("discover_llm: got %d models, %d text-capable; excluded %d (first 30: %s)",
              len(all_ids), len(text_ids), len(excluded), ", ".join(excluded[:30]))
+    # US-073: внешние модели не должны попадать и в списки постобработки и
+    # суммаризации (AC 2/AC 3).
+    text_ids, hidden = cloud_placement.filter_ids_by_policy(base, text_ids)
+    if hidden:
+        log.info("discover_llm: скрыто фильтром Cloud.ru %d моделей (US-073)", hidden)
     _discover_cache[ck] = list(text_ids)
     return text_ids
 
 
-def discover_all_models(
+def discover_all_models_detailed(
     api_key: str,
     base_url: Optional[str] = None,
     *,
     use_cache: bool = True,
-) -> list[str]:
-    """US-037: ВСЕ модели эндпоинта (/v1/models) БЕЗ фильтра по типу функции.
+) -> list:
+    """US-073: ВСЕ модели эндпоинта с разобранными признаками.
 
-    Используется при проверке облачного ПОДКЛЮЧЕНИЯ — подключение должно
-    находить полный список моделей. Фильтрация по назначению (STT для
-    диктовки, text→text для постобработки/суммаризации, и т.п.) выполняется
-    позже, в настройках конкретной функции. При ошибке — пустой список.
+    Возвращает список cloud_placement.CloudModelInfo (id + размещение из
+    metadata.provider + тип из metadata.type). Фильтр размещения здесь НЕ
+    применяется НАМЕРЕННО: это функция «сырой правды» для диалога подключения —
+    администратор должен видеть полный список и число внешних моделей, а сами
+    признаки сохраняются в подключение, чтобы фильтровать без сети при старте.
     """
     if not api_key:
         return []
@@ -517,8 +524,8 @@ def discover_all_models(
         return []
     base = base_url or "https://api.openai.com/v1"
     ck = "ALL|" + f"{api_key}|{base}"
-    if use_cache and ck in _discover_cache:
-        return list(_discover_cache[ck])
+    if use_cache and ck in _detailed_cache:
+        return list(_detailed_cache[ck])
     url = base.rstrip("/") + "/models"
     headers = {"Authorization": f"Bearer {api_key}"}
     log.info("discover_all: GET %s", url)
@@ -539,16 +546,39 @@ def discover_all_models(
     except ValueError as exc:
         log.warning("discover_all: invalid JSON on %s (%s)", url, exc)
         return []
-    data = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(data, list):
+    infos = cloud_placement.parse_models_payload(payload)
+    snap = cloud_placement.remember_endpoint_models(base, infos)
+    log.info("discover_all: got %d models (внутренних %d, внешних %d, без признака %d)",
+             len(infos), snap.internal_count(), snap.external_count(),
+             len(infos) - len(snap.placement))
+    _detailed_cache[ck] = list(infos)
+    return list(infos)
+
+
+def discover_all_models(
+    api_key: str,
+    base_url: Optional[str] = None,
+    *,
+    use_cache: bool = True,
+) -> list[str]:
+    """US-037: ВСЕ модели эндпоинта (/v1/models) БЕЗ фильтра по типу функции.
+
+    Используется при проверке облачного ПОДКЛЮЧЕНИЯ — подключение должно
+    находить полный список моделей. Фильтрация по назначению (STT для
+    диктовки, text→text для постобработки/суммаризации, и т.п.) выполняется
+    позже, в настройках конкретной функции. При ошибке — пустой список.
+
+    US-073: тонкая обёртка над discover_all_models_detailed — возврат прежний
+    (список id), признаки размещения и типа доступны через
+    cloud_placement.endpoint_snapshot(base_url) и сохраняются в подключение.
+    """
+    if not api_key:
         return []
-    all_ids: list[str] = []
-    for entry in data:
-        if isinstance(entry, dict):
-            mid = str(entry.get("id") or "").strip()
-            if mid:
-                all_ids.append(mid)
-    all_ids.sort()
-    log.info("discover_all: got %d models", len(all_ids))
+    base = base_url or "https://api.openai.com/v1"
+    ck = "ALL|" + f"{api_key}|{base}"
+    if use_cache and ck in _discover_cache:
+        return list(_discover_cache[ck])
+    infos = discover_all_models_detailed(api_key, base_url, use_cache=use_cache)
+    all_ids = sorted(i.id for i in infos)
     _discover_cache[ck] = list(all_ids)
     return all_ids

@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from . import cloud_placement
 from .audio_files import split_wav_by_duration
 from .logger import get_logger
 
@@ -589,8 +590,23 @@ def discover_models(
 
 
 def _looks_like_stt_model(model_id: str) -> bool:
+    """Догадка по имени модели. Оставлена ТОЛЬКО как запасной вариант для
+    сервисов, которые не сообщают metadata.type (см. is_stt_model)."""
     low = model_id.lower()
     return any(kw in low for kw in STT_MODEL_ID_KEYWORDS)
+
+
+def is_stt_model(model_id: str, model_type: str = "") -> bool:
+    """TASK-365: распознаёт ли модель речь.
+
+    Приоритет — явный признак сервиса `metadata.type == "audio-to-text"`.
+    Если сервис тип не сообщает (сторонние OpenAI-совместимые прокси), падаем
+    обратно на разбор имени: без этого список моделей диктовки у них опустел бы.
+    """
+    declared = (model_type or "").strip().lower()
+    if declared:
+        return declared == cloud_placement.STT_MODEL_TYPE
+    return _looks_like_stt_model(model_id)
 
 
 def _discover_openai_compatible(api_key: str, base_url: str) -> list[str]:
@@ -621,23 +637,28 @@ def _discover_openai_compatible(api_key: str, base_url: str) -> list[str]:
         log.warning("discover_openai: response has no 'data' list; payload keys=%s",
                     list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__)
         return []
-    all_ids: list[str] = []
-    for entry in data:
-        if not isinstance(entry, dict):
-            continue
-        model_id = str(entry.get("id") or "").strip()
-        if model_id:
-            all_ids.append(model_id)
-    stt_ids = [mid for mid in all_ids if _looks_like_stt_model(mid)]
-    stt_ids.sort()
-    log.info("discover_openai: got %d total models, %d match STT filter (%s)",
-             len(all_ids), len(stt_ids), ", ".join(STT_MODEL_ID_KEYWORDS))
+    # US-073/TASK-365: единый разбор ответа — id, размещение (metadata.provider)
+    # и тип (metadata.type). Снимок запоминается, чтобы фильтр размещения
+    # работал и там, где вызывающий код о подключении ничего не знает.
+    infos = cloud_placement.parse_models_payload(payload)
+    cloud_placement.remember_endpoint_models(base_url, infos)
+    all_ids = [i.id for i in infos]
+    typed = sum(1 for i in infos if i.model_type)
+    stt_ids = sorted(i.id for i in infos if is_stt_model(i.id, i.model_type))
+    log.info("discover_openai: got %d total models (%d с типом от сервиса), %d STT",
+             len(all_ids), typed, len(stt_ids))
     if all_ids and not stt_ids:
         # Логируем первые 30 ID, чтобы пользователь увидел, как реально называются
         # модели у его провайдера, и мог ввести нужный id вручную в combo.
         log.warning("discover_openai: STT filter matched 0. Available model ids (first 30): %s",
                     all_ids[:30])
-    return stt_ids
+    # US-073: если для эндпоинта опубликована политика «только Cloud.ru» —
+    # применяем её здесь же, чтобы внешние модели не попали даже в промежуточные
+    # списки. Основной чокпоинт — реестр моделей (models._register_cloud_model).
+    allowed, hidden = cloud_placement.filter_ids_by_policy(base_url, stt_ids)
+    if hidden:
+        log.info("discover_openai: скрыто фильтром Cloud.ru %d STT-моделей (US-073)", hidden)
+    return allowed
 
 
 def _discover_elevenlabs(api_key: str) -> list[str]:

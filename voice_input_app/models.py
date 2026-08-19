@@ -24,6 +24,7 @@ try:
 except Exception:
     pass
 
+from . import cloud_placement
 from .config import AppConfig
 from .logger import get_logger
 from .paths import models_dir
@@ -601,20 +602,34 @@ class ModelManager:
 
         # US-037: реестр строится из подключений и их кэша discovered_models
         # (без HTTP). Ключи — cloud:<connection_id>:<model_id>.
-        # STT-фильтр: список диктовки/файлов должен содержать ТОЛЬКО модели с
-        # аудио-входом. Одно openai-подключение может использоваться и для LLM
-        # (постобработка/суммаризация) — их chat-модели не должны попадать в
-        # реестр STT. Для openai фильтруем по именам, ElevenLabs — всегда STT.
-        try:
-            from . import cloud_stt as _cs
-            _stt_ok = _cs._looks_like_stt_model
-        except Exception:  # noqa: BLE001
-            _stt_ok = lambda _m: True
-        for conn in (getattr(cfg, "cloud_connections", None) or []):
+        # Отбор STT-моделей и фильтр размещения (US-073) выполняет
+        # _register_cloud_model — единая точка регистрации.
+        connections = list(getattr(cfg, "cloud_connections", None) or [])
+        # US-073: публикуем политику фильтра по эндпоинтам. Это нужно
+        # discover-функциям (cloud_stt/cloud_llm), которые о подключениях
+        # ничего не знают: даже промежуточные списки не расширятся внешними
+        # моделями. Перепубликация полная — чтобы удалённое подключение не
+        # оставляло за собой политику.
+        cloud_placement.clear_policies()
+        for conn in connections:
+            base = getattr(conn, "base_url", "") or ""
+            if not base and getattr(conn, "type", "") == "elevenlabs":
+                base = cloud_placement.elevenlabs_endpoint_key()
+            cloud_placement.set_endpoint_policy(
+                base,
+                only_internal=bool(getattr(conn, "only_internal_models", False)),
+                reports=cloud_placement.connection_reports_placement(conn),
+            )
+        for conn in connections:
+            registered = 0
+            skipped: dict[str, int] = {}
             for mid in (getattr(conn, "discovered_models", None) or []):
-                if conn.type == "openai" and not _stt_ok(mid):
-                    continue
-                self._register_cloud_model(conn.id, conn.type, mid)
+                reason = self._register_cloud_model(conn.id, conn.type, mid)
+                if reason:
+                    skipped[reason] = skipped.get(reason, 0) + 1
+                else:
+                    registered += 1
+            self._log_cloud_registration(conn, registered, skipped)
 
     def set_cloud_models(self, a, b, c=None) -> None:
         """US-037: зарегистрировать обнаруженные модели ОДНОГО подключения.
@@ -642,8 +657,28 @@ class ModelManager:
         for key in list(_CLOUD_MODELS_REGISTRY.keys()):
             if cloud_connection_id_of(key) == connection_id:
                 _CLOUD_MODELS_REGISTRY.pop(key, None)
+        # US-073: регистрация идёт через тот же чокпоинт, поэтому список,
+        # пришедший из проверки соединения, тоже не может расширить реестр
+        # внешними моделями.
+        registered = 0
+        skipped: dict[str, int] = {}
         for mid in model_ids:
-            self._register_cloud_model(connection_id, conn_type, mid)
+            reason = self._register_cloud_model(connection_id, conn_type, mid)
+            if reason:
+                skipped[reason] = skipped.get(reason, 0) + 1
+            else:
+                registered += 1
+        conn_obj = None
+        if self._last_cfg is not None:
+            try:
+                conn_obj = self._last_cfg.connection_by_id(connection_id)
+            except Exception:  # noqa: BLE001
+                conn_obj = None
+        if conn_obj is not None:
+            self._log_cloud_registration(conn_obj, registered, skipped)
+        else:
+            log.info("US-073 registry: connection %s — available %d, skipped %s",
+                     connection_id, registered, skipped or "none")
         # US-037 ВАЖНО: НЕ перезаписываем cc.discovered_models здесь. Это кэш
         # ПОЛНОГО списка моделей подключения (его ведёт диалог подключения через
         # discover_all_models). Старый стартовый STT-discover вызывает
@@ -652,11 +687,37 @@ class ModelManager:
         # после каждого перезапуска. set_cloud_models только обновляет живой
         # реестр _CLOUD_MODELS_REGISTRY.
 
-    def _register_cloud_model(self, connection_id: str, conn_type: str, model_id: str) -> None:
+    @staticmethod
+    def _log_cloud_registration(conn, registered: int, skipped: dict) -> None:
+        """US-073 (AC 9): в журнале видно, сколько моделей скрыто по каждому
+        подключению и по какой причине."""
+        external = int(skipped.get("external", 0))
+        unknown = int(skipped.get("unknown", 0))
+        non_stt = int(skipped.get("non-stt", 0))
+        log.info(
+            "US-073 registry: connection %r (%s) — available %d, hidden by Cloud.ru filter %d "
+            "(external %d, placement unknown %d), skipped as non-STT %d",
+            getattr(conn, "name", "") or getattr(conn, "id", "?"),
+            getattr(conn, "id", "?"), registered, external + unknown, external, unknown, non_stt,
+        )
+
+    def _register_cloud_model(self, connection_id: str, conn_type: str, model_id: str) -> str:
         """US-037: добавить одну cloud-модель в _CLOUD_MODELS_REGISTRY.
-        Ключ формата cloud:<connection_id>:<model_id>."""
+        Ключ формата cloud:<connection_id>:<model_id>.
+
+        US-073 ЧОКПОИНТ: это ЕДИНСТВЕННАЯ точка регистрации облачной модели,
+        поэтому здесь же стоят оба отбора — фильтр размещения (внешние модели
+        Cloud.ru) и отбор STT-моделей. Любой путь регистрации (восстановление
+        из настроек, ответ проверки соединения, стартовая проверка) проходит
+        через этот метод, значит внешняя модель не может попасть в списки в
+        обход фильтра. Не переносить эти проверки в вызывающий код.
+
+        Возвращает "" — модель зарегистрирована; иначе причину отказа:
+        "external"/"unknown" — фильтр размещения, "non-stt" — модель не
+        распознаёт речь, "bad" — пустые аргументы или неизвестный тип.
+        """
         if not model_id or not connection_id:
-            return
+            return "bad"
         if conn_type == "openai":
             engine = CLOUD_OPENAI_ENGINE
             display = "OpenAI"
@@ -664,7 +725,28 @@ class ModelManager:
             engine = CLOUD_ELEVENLABS_ENGINE
             display = "ElevenLabs"
         else:
-            return
+            return "bad"
+        conn = None
+        if self._last_cfg is not None:
+            try:
+                conn = self._last_cfg.connection_by_id(connection_id)
+            except Exception:  # noqa: BLE001
+                conn = None
+        # US-073: внешние модели (metadata.provider = external) в списки не попадают.
+        reason = cloud_placement.connection_hidden_reason(conn, model_id)
+        if reason:
+            return reason
+        # TASK-365: STT определяется явным типом сервиса (metadata.type =
+        # audio-to-text), а при его отсутствии — прежним разбором имени.
+        # ElevenLabs — всегда STT (у этого эндпоинта других моделей нет).
+        if conn_type == "openai":
+            try:
+                from . import cloud_stt as _cs
+                declared = cloud_placement.connection_model_type(conn, model_id)
+                if not _cs.is_stt_model(model_id, declared):
+                    return "non-stt"
+            except Exception:  # noqa: BLE001
+                pass
         key = f"cloud:{connection_id}:{model_id}"
         spec_obj = _make_cloud_spec(engine, display, model_id)
         _CLOUD_MODELS_REGISTRY[key] = ModelSpec(
@@ -677,6 +759,7 @@ class ModelManager:
             size_hint=spec_obj.size_hint,
             note=spec_obj.note,
         )
+        return ""
 
     def is_installed(self, key: str) -> bool:
         """Return True only for fully downloaded, loadable app-managed models.
