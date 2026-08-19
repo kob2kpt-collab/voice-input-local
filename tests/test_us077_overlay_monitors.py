@@ -29,8 +29,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt  # noqa: E402
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, Qt, Signal  # noqa: E402
 from PySide6.QtGui import QMouseEvent  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from voice_input_app.config import AppConfig  # noqa: E402
@@ -386,6 +387,256 @@ def test_overlay_subscribes_to_screen_change() -> None:
         overlay.close()
 
 
+# ── TASK-386: масштаб меняется на ТОМ ЖЕ мониторе ─────────────────────────
+
+
+class _FakeScreen(QObject):
+    """Экран с теми же сигналами метрик, что у QScreen.
+
+    Нужен там, где важна САМА подписка (переезд между экранами, отписка):
+    подменить список мониторов у Qt в headless-окружении нельзя.
+    """
+
+    logicalDotsPerInchChanged = Signal(float)
+    physicalDotsPerInchChanged = Signal(float)
+    geometryChanged = Signal(QRect)
+    availableGeometryChanged = Signal(QRect)
+
+    def __init__(self, label: str) -> None:
+        super().__init__()
+        self.label = label
+
+
+class _DeletedScreen:
+    """Заглушка снесённого Qt-объекта: любое обращение к нему — RuntimeError.
+
+    Записывает попытки обращения, чтобы тест мог доказать, что код к
+    удалённому экрану не потянулся вовсе.
+    """
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "touched", [])
+
+    def __getattr__(self, name):  # noqa: ANN001, ANN204
+        object.__getattribute__(self, "touched").append(name)
+        raise RuntimeError("Internal C++ object (QScreen) already deleted.")
+
+
+def _relayout_probe(overlay: RecordingOverlay) -> list:
+    """Записывать вызовы пересчёта, не отменяя его."""
+    calls: list = []
+    original = overlay._relayout_for_screen  # noqa: SLF001
+
+    def spy(**kwargs) -> None:  # noqa: ANN003
+        calls.append(kwargs)
+        original(**kwargs)
+
+    overlay._relayout_for_screen = spy  # noqa: SLF001
+    return calls
+
+
+def test_scale_change_on_same_monitor_triggers_relayout() -> None:
+    """Пользователь сменил масштаб в параметрах Windows, плашку не двигал."""
+    overlay = RecordingOverlay()
+    try:
+        overlay.show()
+        _APP.processEvents()
+        screen = overlay._metrics_screen  # noqa: SLF001
+        assert screen is not None, "подписка на метрики экрана не встала"
+        assert overlay._metrics_signal_names, "не подключён ни один сигнал"  # noqa: SLF001
+
+        calls = _relayout_probe(overlay)
+        screen.logicalDotsPerInchChanged.emit(120.0)
+        QTest.qWait(120)
+        _APP.processEvents()
+        assert calls == [{"ensure_visible": True}], calls
+        # Пересчёт возвращает плашку в видимую область: рабочая область
+        # монитора при смене масштаба меняет размер.
+        assert overlay.height() == overlay.COMPACT_HEIGHT
+    finally:
+        overlay.close()
+
+
+def test_logical_dpi_alone_is_not_the_only_subscription() -> None:
+    """В Qt6 логический DPI нормализован к 96 и на масштаб Windows не реагирует.
+
+    Поэтому подписка обязана включать геометрию экрана — иначе смена
+    масштаба прошла бы мимо нас.
+    """
+    assert "geometryChanged" in RecordingOverlay.SCREEN_METRIC_SIGNALS
+    assert "logicalDotsPerInchChanged" in RecordingOverlay.SCREEN_METRIC_SIGNALS
+    overlay = RecordingOverlay()
+    try:
+        overlay.show()
+        _APP.processEvents()
+        screen = overlay._metrics_screen  # noqa: SLF001
+        calls = _relayout_probe(overlay)
+        screen.geometryChanged.emit(screen.geometry())
+        QTest.qWait(120)
+        _APP.processEvents()
+        assert calls == [{"ensure_visible": True}], calls
+    finally:
+        overlay.close()
+
+
+def test_signal_burst_gives_exactly_one_relayout() -> None:
+    """Одна смена масштаба даёт всплеск сигналов — пересчёт должен быть один."""
+    overlay = RecordingOverlay()
+    try:
+        overlay.show()
+        _APP.processEvents()
+        screen = overlay._metrics_screen  # noqa: SLF001
+        calls = _relayout_probe(overlay)
+        screen.logicalDotsPerInchChanged.emit(120.0)
+        screen.physicalDotsPerInchChanged.emit(120.0)
+        screen.geometryChanged.emit(screen.geometry())
+        screen.availableGeometryChanged.emit(screen.availableGeometry())
+        assert calls == [], "пересчёт не должен идти прямо из сигнала"
+        QTest.qWait(120)
+        _APP.processEvents()
+        assert calls == [{"ensure_visible": True}], calls
+    finally:
+        overlay.close()
+
+
+def test_metrics_path_respects_reentrancy_guard() -> None:
+    """Защита от повторного входа покрывает и путь смены масштаба."""
+    overlay = RecordingOverlay()
+    try:
+        applied: list = []
+        overlay._apply_screen_relayout = lambda **kw: applied.append(kw)  # noqa: SLF001
+        overlay._relayout_in_progress = True  # noqa: SLF001
+        overlay._relayout_after_metrics_change()  # noqa: SLF001
+        assert applied == []
+        overlay._relayout_in_progress = False  # noqa: SLF001
+        overlay._relayout_after_metrics_change()  # noqa: SLF001
+        assert applied == [{"ensure_visible": True}]
+    finally:
+        overlay.close()
+
+
+def test_metrics_subscription_moves_with_the_overlay() -> None:
+    """Переезд на другой монитор переносит и подписку на масштаб.
+
+    Иначе после перехода мы слушали бы масштаб прежнего экрана.
+    """
+    overlay = RecordingOverlay()
+    first = _FakeScreen("first")
+    second = _FakeScreen("second")
+    try:
+        overlay.show()
+        _APP.processEvents()
+        overlay._current_screen = lambda: first  # noqa: SLF001
+        overlay._bind_screen_metrics_signals()  # noqa: SLF001
+        assert overlay._metrics_screen is first  # noqa: SLF001
+
+        # Плашка переехала: сигнал окна о смене экрана переносит подписку.
+        overlay._current_screen = lambda: second  # noqa: SLF001
+        overlay._on_window_screen_changed(None)  # noqa: SLF001
+        assert overlay._metrics_screen is second  # noqa: SLF001
+
+        calls = _relayout_probe(overlay)
+        first.logicalDotsPerInchChanged.emit(120.0)
+        QTest.qWait(120)
+        _APP.processEvents()
+        assert calls == [], "прежний экран всё ещё дёргает пересчёт"
+
+        second.logicalDotsPerInchChanged.emit(120.0)
+        QTest.qWait(120)
+        _APP.processEvents()
+        assert calls == [{"ensure_visible": True}], calls
+    finally:
+        overlay.close()
+
+
+def test_repeated_binding_does_not_duplicate_subscription() -> None:
+    """Повторный показ плашки не добавляет второе соединение к тому же экрану."""
+    overlay = RecordingOverlay()
+    screen = _FakeScreen("only")
+    try:
+        overlay._current_screen = lambda: screen  # noqa: SLF001
+        for _ in range(3):
+            overlay._bind_screen_metrics_signals()  # noqa: SLF001
+        assert overlay._metrics_screen is screen  # noqa: SLF001
+        calls = _relayout_probe(overlay)
+        screen.logicalDotsPerInchChanged.emit(120.0)
+        QTest.qWait(120)
+        _APP.processEvents()
+        assert calls == [{"ensure_visible": True}], calls
+    finally:
+        overlay.close()
+
+
+def test_removed_screen_leaves_no_subscription() -> None:
+    """Отключение монитора снимает подписку, не трогая удалённый объект Qt."""
+    overlay = RecordingOverlay()
+    try:
+        deleted = _DeletedScreen()
+        overlay._metrics_screen = deleted  # noqa: SLF001
+        overlay._metrics_signal_names = list(RecordingOverlay.SCREEN_METRIC_SIGNALS)  # noqa: SLF001
+        overlay._current_screen = lambda: None  # noqa: SLF001
+
+        overlay._on_screen_removed(deleted)  # noqa: SLF001
+
+        assert deleted.touched == [], deleted.touched
+        assert overlay._metrics_screen is None  # noqa: SLF001
+        assert overlay._metrics_signal_names == []  # noqa: SLF001
+        assert overlay._screen_refresh_timer.isActive()  # noqa: SLF001
+        _APP.processEvents()
+        assert overlay._metrics_screen is None  # noqa: SLF001
+    finally:
+        overlay.close()
+
+
+def test_removing_another_screen_keeps_our_subscription() -> None:
+    """Отключили чужой монитор — наша подписка остаётся рабочей."""
+    overlay = RecordingOverlay()
+    ours = _FakeScreen("ours")
+    other = _FakeScreen("other")
+    try:
+        overlay._current_screen = lambda: ours  # noqa: SLF001
+        overlay._bind_screen_metrics_signals()  # noqa: SLF001
+        overlay._on_screen_removed(other)  # noqa: SLF001
+        _APP.processEvents()
+        assert overlay._metrics_screen is ours  # noqa: SLF001
+        calls = _relayout_probe(overlay)
+        ours.logicalDotsPerInchChanged.emit(120.0)
+        QTest.qWait(120)
+        _APP.processEvents()
+        assert calls == [{"ensure_visible": True}], calls
+    finally:
+        overlay.close()
+
+
+def test_disconnect_survives_a_screen_deleted_behind_our_back() -> None:
+    """Экран снесли без сигнала screenRemoved — отписка не должна падать."""
+    overlay = RecordingOverlay()
+    try:
+        overlay._metrics_screen = _DeletedScreen()  # noqa: SLF001
+        overlay._metrics_signal_names = list(RecordingOverlay.SCREEN_METRIC_SIGNALS)  # noqa: SLF001
+        overlay._disconnect_screen_metrics()  # noqa: SLF001
+        assert overlay._metrics_screen is None  # noqa: SLF001
+        # И подписка на новый экран после этого встаёт как обычно.
+        fresh = _FakeScreen("fresh")
+        overlay._current_screen = lambda: fresh  # noqa: SLF001
+        overlay._bind_screen_metrics_signals()  # noqa: SLF001
+        assert overlay._metrics_screen is fresh  # noqa: SLF001
+    finally:
+        overlay.close()
+
+
+def test_binding_a_deleted_screen_does_not_crash() -> None:
+    """Подписка на уже снесённый экран не роняет плашку."""
+    overlay = RecordingOverlay()
+    try:
+        overlay._current_screen = lambda: _DeletedScreen()  # noqa: SLF001
+        overlay._bind_screen_metrics_signals()  # noqa: SLF001
+        assert overlay._metrics_screen is None  # noqa: SLF001
+        assert overlay._metrics_signal_names == []  # noqa: SLF001
+    finally:
+        overlay.close()
+
+
 # ── статические гарантии ──────────────────────────────────────────────────
 
 def test_clamp_no_longer_falls_back_to_primary_screen() -> None:
@@ -439,6 +690,16 @@ def _run() -> None:
         test_screen_change_recomputes_size_for_current_layout,
         test_screen_change_during_drag_does_not_clamp,
         test_overlay_subscribes_to_screen_change,
+        test_scale_change_on_same_monitor_triggers_relayout,
+        test_logical_dpi_alone_is_not_the_only_subscription,
+        test_signal_burst_gives_exactly_one_relayout,
+        test_metrics_path_respects_reentrancy_guard,
+        test_metrics_subscription_moves_with_the_overlay,
+        test_repeated_binding_does_not_duplicate_subscription,
+        test_removed_screen_leaves_no_subscription,
+        test_removing_another_screen_keeps_our_subscription,
+        test_disconnect_survives_a_screen_deleted_behind_our_back,
+        test_binding_a_deleted_screen_does_not_crash,
         test_clamp_no_longer_falls_back_to_primary_screen,
         test_overlay_window_flags_untouched,
         test_screen_infos_reads_real_qscreens,

@@ -177,6 +177,19 @@ def screen_binding(
     return target.name, rect.x() - origin.x(), rect.y() - origin.y()
 
 
+def _screen_signal(screen, name: str):
+    """Сигнал экрана по имени. None — если экрана уже нет.
+
+    TASK-386: у удалённого Qt-объекта обращение к атрибуту из Python даёт
+    RuntimeError, и это единственный способ узнать о сносе постфактум.
+    Ошибку гасим здесь, чтобы ни подписка, ни отписка не роняли плашку.
+    """
+    try:
+        return getattr(screen, name, None)
+    except (RuntimeError, AttributeError):  # noqa: BLE001
+        return None
+
+
 def position_from_binding(
     infos: list[ScreenInfo],
     name: str,
@@ -280,6 +293,23 @@ class RecordingOverlay(QWidget):
     PREVIEW_MAX_WIDTH = 560
     PREVIEW_MAX_HEIGHT = 240
 
+    # TASK-386: сигналы, по которым видно смену масштаба ТЕКУЩЕГО монитора.
+    # Одного logicalDotsPerInchChanged НЕДОСТАТОЧНО: в Qt6 логический DPI
+    # нормализован к 96, а масштаб Windows приходит через devicePixelRatio,
+    # у которого сигнала нет вовсе (замер на устройстве: панель 3840x2160
+    # при масштабе 175 % → devicePixelRatio 1.75, logicalDotsPerInch 96.0,
+    # geometry 2194x1234, physicalDotsPerInch 93.3). Меняются при этом
+    # геометрия экрана в независимых пикселях и физический DPI, который
+    # Qt считает из неё же, — поэтому слушаем набор, а не один сигнал.
+    # Лишние срабатывания безопасны: пересчёт идемпотентен и объединяется
+    # таймером.
+    SCREEN_METRIC_SIGNALS = (
+        "logicalDotsPerInchChanged",
+        "physicalDotsPerInchChanged",
+        "geometryChanged",
+        "availableGeometryChanged",
+    )
+
     def __init__(self) -> None:
         # WA_ShowWithoutActivating защищает только момент показа окна. Отдельный
         # WindowDoesNotAcceptFocus не даёт обычному клику сделать overlay
@@ -306,6 +336,10 @@ class RecordingOverlay(QWidget):
         self._compact = True
         self._screen_signal_window = None
         self._relayout_in_progress = False
+        # TASK-386: экран, за масштабом которого следим сейчас, и имена
+        # сигналов, на которые мы к нему подключились.
+        self._metrics_screen = None
+        self._metrics_signal_names: list[str] = []
         self._hotkey = "Ctrl+Alt+Space"
         self._result_text = ""
         # _idle управляет только быстрым выбором модели по правому клику.
@@ -445,7 +479,17 @@ class RecordingOverlay(QWidget):
         self._screen_refresh_timer = QTimer(self)
         self._screen_refresh_timer.setSingleShot(True)
         self._screen_refresh_timer.setInterval(0)
-        self._screen_refresh_timer.timeout.connect(self._ensure_visible_on_screen)
+        self._screen_refresh_timer.timeout.connect(self._on_screens_changed)
+        # TASK-386: одна смена масштаба даёт всплеск сразу нескольких
+        # сигналов экрана. Защита _relayout_in_progress ловит только
+        # повторный ВХОД, а идущие подряд сигналы дали бы три пересчёта
+        # подряд — плашка мигала бы размером. Таймер сводит всплеск к
+        # одному пересчёту и уводит его из момента, когда Qt ещё
+        # досчитывает новое состояние экрана.
+        self._metrics_relayout_timer = QTimer(self)
+        self._metrics_relayout_timer.setSingleShot(True)
+        self._metrics_relayout_timer.setInterval(50)
+        self._metrics_relayout_timer.timeout.connect(self._relayout_after_metrics_change)
         app = QApplication.instance()
         if app is not None:
             try:
@@ -532,16 +576,104 @@ class RecordingOverlay(QWidget):
         """Подписаться на переезд окна между мониторами (US-077).
 
         QWindow появляется только после создания окна, поэтому подписку
-        обновляем при каждом показе, а не один раз в конструкторе.
+        обновляем при каждом показе, а не один раз в конструкторе. Подписка
+        на масштаб текущего экрана (TASK-386) обновляется здесь же и БЕЗ
+        привязки к тому, сменилось ли окно.
         """
         handle = self.windowHandle()
-        if handle is None or handle is self._screen_signal_window:
-            return
+        if handle is not None and handle is not self._screen_signal_window:
+            try:
+                handle.screenChanged.connect(self._on_window_screen_changed)
+            except (AttributeError, RuntimeError):  # noqa: BLE001
+                pass
+            else:
+                self._screen_signal_window = handle
+        self._bind_screen_metrics_signals()
+
+    # ── TASK-386: масштаб меняется на ТОМ ЖЕ мониторе ─────────────────────
+
+    def _current_screen(self):
+        """Экран, на котором сейчас плашка. Вынесено ради подмены в тестах."""
         try:
-            handle.screenChanged.connect(self._on_window_screen_changed)
+            return self.screen()
         except (AttributeError, RuntimeError):  # noqa: BLE001
+            return None
+
+    def _bind_screen_metrics_signals(self) -> None:
+        """Следить за масштабом ТЕКУЩЕГО экрана.
+
+        Подписка обязана переезжать вместе с плашкой: иначе после перехода на
+        соседний монитор мы слушали бы масштаб прежнего.
+        """
+        screen = self._current_screen()
+        if screen is not None and screen is self._metrics_screen:
             return
-        self._screen_signal_window = handle
+        self._disconnect_screen_metrics()
+        if screen is None:
+            return
+        connected: list[str] = []
+        for name in self.SCREEN_METRIC_SIGNALS:
+            signal = _screen_signal(screen, name)
+            if signal is None:
+                continue
+            try:
+                signal.connect(self._on_screen_metrics_changed)
+            except (AttributeError, RuntimeError, TypeError):  # noqa: BLE001
+                continue
+            connected.append(name)
+        if connected:
+            self._metrics_screen = screen
+            self._metrics_signal_names = connected
+
+    def _disconnect_screen_metrics(self) -> None:
+        """Отписаться от прежнего экрана, если он ещё жив."""
+        screen = self._metrics_screen
+        names = self._metrics_signal_names
+        self._forget_screen_metrics()
+        if screen is None:
+            return
+        for name in names:
+            signal = _screen_signal(screen, name)
+            if signal is None:
+                # Экран уже удалён Qt — его соединения разорваны вместе с ним.
+                continue
+            try:
+                signal.disconnect(self._on_screen_metrics_changed)
+            except (AttributeError, RuntimeError, TypeError):  # noqa: BLE001
+                continue
+
+    def _forget_screen_metrics(self) -> None:
+        """Забыть подписку, НЕ обращаясь к объекту экрана.
+
+        Нужно ровно для отключения монитора: QScreen в этот момент уже идёт
+        под снос, и любой вызов его метода из Python — обращение к удалённому
+        объекту Qt. Разрушение QScreen само рвёт все его соединения, поэтому
+        отписываться не от чего.
+        """
+        self._metrics_screen = None
+        self._metrics_signal_names = []
+
+    def _on_screen_metrics_changed(self, *args) -> None:  # noqa: ANN002
+        """Экран сообщил о новых метриках — свести всплеск сигналов в один
+        пересчёт (см. комментарий у _metrics_relayout_timer)."""
+        del args
+        self._metrics_relayout_timer.start()
+
+    def _relayout_after_metrics_change(self) -> None:
+        """Пересчитать плашку под новый масштаб того же монитора.
+
+        ensure_visible=True обязателен: при смене масштаба рабочая область
+        монитора меняет размер в независимых пикселях, и плашка, стоявшая у
+        края, оказалась бы за границей — даже если её собственный размер
+        не изменился.
+        """
+        self._relayout_for_screen(ensure_visible=True)
+
+    def _on_screens_changed(self) -> None:
+        """Состав мониторов изменился: вернуть плашку в видимую область и
+        переподписаться на масштаб экрана, на котором она теперь оказалась."""
+        self._ensure_visible_on_screen()
+        self._bind_screen_metrics_signals()
 
     def showEvent(self, event) -> None:  # noqa: ANN001
         super().showEvent(event)
@@ -557,9 +689,11 @@ class RecordingOverlay(QWidget):
         починка точечная, только для плашки (решение владельца продукта).
         """
         del screen
+        # TASK-386: подписка на масштаб переезжает вместе с плашкой.
+        self._bind_screen_metrics_signals()
         self._relayout_for_screen()
 
-    def _relayout_for_screen(self) -> None:
+    def _relayout_for_screen(self, *, ensure_visible: bool = False) -> None:
         # Пересчёт двигает и меняет размер окна, а это снова может увести
         # плашку на соседний монитор и вызвать screenChanged. Без защиты
         # от повторного входа на стыке экранов с разным масштабом плашка
@@ -568,11 +702,11 @@ class RecordingOverlay(QWidget):
             return
         self._relayout_in_progress = True
         try:
-            self._apply_screen_relayout()
+            self._apply_screen_relayout(ensure_visible=ensure_visible)
         finally:
             self._relayout_in_progress = False
 
-    def _apply_screen_relayout(self) -> None:
+    def _apply_screen_relayout(self, *, ensure_visible: bool = False) -> None:
         before = self.size()
         self._resize_to_content(compact=self._compact)
         if self._drag_start is not None:
@@ -584,7 +718,7 @@ class RecordingOverlay(QWidget):
                 min(self._drag_start.y(), max(0, self.height() - 1)),
             )
             return
-        if self.size() != before:
+        if ensure_visible or self.size() != before:
             self._ensure_visible_on_screen()
 
     def _on_screen_removed(self, screen) -> None:  # noqa: ANN001
@@ -593,7 +727,13 @@ class RecordingOverlay(QWidget):
         Сохранённую привязку намеренно НЕ перезаписываем: вернут монитор —
         плашка снова окажется там, где её оставили.
         """
-        del screen
+        # TASK-386: подписку на масштаб удаляемого экрана снимаем БЕЗ
+        # обращения к нему — объект Qt вот-вот будет удалён, и вызов его
+        # метода из Python означал бы обращение к удалённому объекту.
+        # Сравнение по идентичности до C++ не доходит и потому безопасно.
+        if screen is None or screen is self._metrics_screen:
+            self._forget_screen_metrics()
+        self._metrics_relayout_timer.stop()
         self._screen_refresh_timer.start()
 
 
