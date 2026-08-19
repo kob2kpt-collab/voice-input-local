@@ -675,3 +675,52 @@ class LlmConnectionCheckWorker(QThread):
         except Exception as exc:  # noqa: BLE001
             log.exception("LlmConnectionCheckWorker failed")
             self.result.emit(False, f"Сбой проверки: {exc}", [])
+
+
+class StartupCloudCheckWorker(QThread):
+    """US-072: одна попытка стартовой проверки облачных подключений.
+
+    Проверяет ВСЕ переданные эндпоинты (цели строит cloud_startup.build_targets
+    из cfg.cloud_connections) и при успехе сразу забирает списки моделей — всё
+    в фоновом потоке, чтобы гейт готовности сети и HTTP не морозили окно.
+
+    Эмитит result(list[cloud_startup.CheckOutcome]) — по одному результату на
+    цель. Решение «повторить или показать сообщение» принимает UI: воркер
+    ничего не показывает и ничего не переключает.
+    """
+
+    result = Signal(list)
+
+    def __init__(self, targets, attempt: int = 1) -> None:
+        super().__init__()
+        self.targets = list(targets or [])
+        self.attempt = int(attempt)
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """US-049: выход не должен ждать оставшиеся цели."""
+        self._cancelled = True
+
+    def run(self) -> None:
+        outcomes = []
+        try:
+            from . import cloud_startup
+        except Exception as exc:  # noqa: BLE001
+            log.exception("cloud_startup import failed")
+            self.result.emit([])
+            return
+        for target in self.targets:
+            if self._cancelled:
+                log.info("Стартовая проверка: попытка %d прервана (выход)", self.attempt)
+                return
+            try:
+                outcomes.append(cloud_startup.run_check(target, attempt=self.attempt))
+            except Exception as exc:  # noqa: BLE001
+                log.exception("StartupCloudCheckWorker: сбой проверки %s", getattr(target, "title", target))
+                outcome = cloud_startup.CheckOutcome(target=target)
+                outcome.kind = cloud_startup.FAIL_UNKNOWN
+                outcome.detail = f"{type(exc).__name__}: {exc}"
+                outcomes.append(outcome)
+        if self._cancelled:
+            return
+        self.result.emit(outcomes)
