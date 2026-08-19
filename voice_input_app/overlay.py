@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
-from PySide6.QtCore import QPoint, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -30,6 +31,180 @@ class HotkeySafeComboBox(QComboBox):
             event.ignore()
             return
         super().keyPressEvent(event)
+
+
+# US-077: выбор монитора для плашки
+#
+# Позицию плашки нельзя ограничивать «основным» монитором. Прежняя версия
+# искала экран через availableGeometry().contains(левый верхний угол плашки)
+# и при промахе откатывалась на primaryScreen. Промах — обычное дело: полоса
+# панели задач, стык мониторов разной высоты, монитор правее или ниже
+# основного. Из-за этого плашка при перетаскивании к стыку прыгала на
+# основной монитор (отчёт владельца продукта).
+#
+# Целевой монитор выбирается в таком порядке:
+#   1. идёт перетаскивание — монитор ПОД КУРСОРОМ, по ПОЛНОЙ геометрии;
+#      именно полной, иначе курсор над панелью задач не попал бы никуда и
+#      мы вернулись бы к тому же дефекту;
+#   2. иначе — монитор с наибольшим пересечением с прямоугольником плашки:
+#      плашка «принадлежит» тому экрану, где её видно больше всего;
+#   3. пересечений нет вовсе (монитор отключили) — БЛИЖАЙШИЙ монитор,
+#      а не основной.
+#
+# Логика вынесена в модульные функции над снимками ScreenInfo, потому что
+# реальные мониторы в headless-тестах не эмулируются, а проверять правила
+# нужно (tests/test_us077_overlay_monitors.py).
+
+SCREEN_MARGIN = 8
+
+
+@dataclass(frozen=True)
+class ScreenInfo:
+    """Снимок монитора: имя и геометрия.
+
+    name — QScreen.name(): к нему привязывается сохранённая позиция плашки.
+    geometry — полная геометрия монитора (вместе с панелью задач).
+    available — рабочая область: в неё плашка втаскивается целиком.
+    """
+
+    name: str
+    geometry: QRect
+    available: QRect
+
+
+def screen_infos(screens) -> list[ScreenInfo]:
+    """Собрать снимки мониторов из QScreen-объектов (или готовых ScreenInfo)."""
+    infos: list[ScreenInfo] = []
+    for screen in screens or []:
+        if isinstance(screen, ScreenInfo):
+            infos.append(screen)
+            continue
+        try:
+            geometry = QRect(screen.geometry())
+            available = QRect(screen.availableGeometry())
+            name = str(screen.name() or "")
+        except Exception:  # noqa: BLE001
+            continue
+        if not available.isValid():
+            available = geometry
+        infos.append(ScreenInfo(name=name, geometry=geometry, available=available))
+    return infos
+
+
+def _axis_gap(low: int, high: int, value: int) -> int:
+    if value < low:
+        return low - value
+    if value > high:
+        return value - high
+    return 0
+
+
+def _distance_to_rect(rect: QRect, point: QPoint) -> int:
+    """Квадрат расстояния от точки до прямоугольника (0 — точка внутри)."""
+    dx = _axis_gap(rect.left(), rect.right(), point.x())
+    dy = _axis_gap(rect.top(), rect.bottom(), point.y())
+    return dx * dx + dy * dy
+
+
+def pick_target_screen(
+    infos: list[ScreenInfo],
+    rect: QRect,
+    cursor: QPoint | None = None,
+) -> ScreenInfo | None:
+    """Монитор, границы которого применяются к плашке (см. комментарий выше)."""
+    if not infos:
+        return None
+    if cursor is not None:
+        for info in infos:
+            if info.geometry.contains(cursor):
+                return info
+        return min(infos, key=lambda i: _distance_to_rect(i.geometry, cursor))
+
+    best: ScreenInfo | None = None
+    best_area = 0
+    for info in infos:
+        overlap = info.geometry.intersected(rect)
+        area = max(0, overlap.width()) * max(0, overlap.height())
+        if area > best_area:
+            best_area = area
+            best = info
+    if best is not None:
+        return best
+    return min(infos, key=lambda i: _distance_to_rect(i.geometry, rect.center()))
+
+
+def clamp_rect_into(rect: QRect, area: QRect, margin: int = SCREEN_MARGIN) -> QPoint:
+    """Втащить прямоугольник целиком в рабочую область монитора."""
+    min_x = area.x() + margin
+    min_y = area.y() + margin
+    max_x = area.x() + area.width() - rect.width() - margin
+    max_y = area.y() + area.height() - rect.height() - margin
+    if max_x < min_x:
+        max_x = min_x
+    if max_y < min_y:
+        max_y = min_y
+    return QPoint(min(max(rect.x(), min_x), max_x), min(max(rect.y(), min_y), max_y))
+
+
+def clamp_overlay_rect(
+    infos: list[ScreenInfo],
+    rect: QRect,
+    cursor: QPoint | None = None,
+    margin: int = SCREEN_MARGIN,
+) -> "tuple[QPoint, ScreenInfo | None]":
+    """Видимая целиком позиция плашки и монитор, к которому её привели."""
+    target = pick_target_screen(infos, rect, cursor)
+    if target is None:
+        return QPoint(rect.x(), rect.y()), None
+    return clamp_rect_into(rect, target.available, margin), target
+
+
+def screen_binding(
+    infos: list[ScreenInfo],
+    rect: QRect,
+    cursor: QPoint | None = None,
+) -> "tuple[str, int, int] | None":
+    """Привязка позиции плашки к монитору: (имя, dx, dy).
+
+    Смещение отсчитывается от левого верхнего угла ПОЛНОЙ геометрии монитора,
+    а не рабочей области: рабочая область съезжает вместе с панелью задач,
+    начало координат монитора — нет.
+    """
+    target = pick_target_screen(infos, rect, cursor)
+    if target is None or not target.name:
+        return None
+    origin = target.geometry.topLeft()
+    return target.name, rect.x() - origin.x(), rect.y() - origin.y()
+
+
+def position_from_binding(
+    infos: list[ScreenInfo],
+    name: str,
+    dx: "int | None",
+    dy: "int | None",
+    hint: "QPoint | None" = None,
+) -> "QPoint | None":
+    """Абсолютная точка по сохранённой привязке. None — такого монитора нет.
+
+    hint — прежняя абсолютная позиция плашки. Она нужна только для одного
+    случая: Windows отдаёт в QScreen.name() модель монитора («PHL 278B1»),
+    поэтому два ОДИНАКОВЫХ монитора называются одинаково, и по имени их не
+    различить. Тогда из одноимённых выбирается тот, к которому прежняя
+    позиция ближе. Монитор один — hint не используется вовсе.
+    """
+    if not name or dx is None or dy is None:
+        return None
+    try:
+        offset_x, offset_y = int(dx), int(dy)
+    except (TypeError, ValueError):
+        return None
+    matches = [info for info in infos if info.name == name]
+    if not matches:
+        return None
+    if len(matches) > 1 and hint is not None:
+        matches.sort(key=lambda i: _distance_to_rect(i.geometry, hint))
+    origin = matches[0].geometry.topLeft()
+    return QPoint(origin.x() + offset_x, origin.y() + offset_y)
 
 
 class AudioLevelWaveform(QWidget):
@@ -88,7 +263,9 @@ class RecordingOverlay(QWidget):
     """
 
     copy_requested = Signal(str)
-    position_changed = Signal(int, int)
+    # US-077: позиция сохраняется вместе с монитором —
+    # (x, y, имя экрана, dx, dy от левого верхнего угла этого экрана).
+    position_changed = Signal(int, int, str, int, int)
     # US-019: выбор облачной модели через overlay при конфликте локальных задач.
     model_selected = Signal(str)      # пользователь выбрал модель (ключ)
     settings_requested = Signal()     # из пустого состояния пикера — «Открыть настройки»
@@ -122,6 +299,13 @@ class RecordingOverlay(QWidget):
             self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setWindowTitle("Индикатор Voice Input Local")
         self._drag_start: QPoint | None = None
+        # US-077: текущий режим компоновки (компактная плашка или превью)
+        # и окно, за сменой монитора которого мы следим. Режим нужен,
+        # чтобы пересчитать размеры при переезде на монитор с другим
+        # масштабом изображения, не гадая о состоянии плашки.
+        self._compact = True
+        self._screen_signal_window = None
+        self._relayout_in_progress = False
         self._hotkey = "Ctrl+Alt+Space"
         self._result_text = ""
         # _idle управляет только быстрым выбором модели по правому клику.
@@ -255,8 +439,22 @@ class RecordingOverlay(QWidget):
         self.card_layout.addWidget(self.picker_hint)
 
         outer.addWidget(self.card)
+        # US-077: перерисовывать плашку прямо в обработчике screenRemoved
+        # нельзя — на этот момент Qt ещё не обновил список экранов.
+        # Нулевой таймер откладывает её на следующий проход цикла событий.
+        self._screen_refresh_timer = QTimer(self)
+        self._screen_refresh_timer.setSingleShot(True)
+        self._screen_refresh_timer.setInterval(0)
+        self._screen_refresh_timer.timeout.connect(self._ensure_visible_on_screen)
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.screenRemoved.connect(self._on_screen_removed)
+            except (AttributeError, RuntimeError):  # noqa: BLE001
+                pass
         self._place_default()
         self.show_idle()
+        self._bind_screen_signals()
 
     def _place_default(self) -> None:
         screen = QApplication.primaryScreen()
@@ -266,50 +464,143 @@ class RecordingOverlay(QWidget):
         geo = screen.availableGeometry()
         self._resize_to_content(compact=True)
         self.move(geo.right() - self.width() - 32, geo.top() + 32)
-    def restore_position(self, x: int | None, y: int | None) -> None:
-        """Restore the saved overlay position, clamping it to a visible screen."""
-        if x is None or y is None:
-            return
-        try:
-            point = QPoint(int(x), int(y))
-        except Exception:
-            return
-        self.move(self._clamp_point_to_screens(point))
 
-    def _clamp_point_to_screens(self, point: QPoint) -> QPoint:
-        screens = QApplication.screens()
-        if not screens:
-            return point
-        margin = 8
+    # ── US-077: позиция плашки на нескольких мониторах ────────────────────
+
+    def _screen_infos(self) -> list[ScreenInfo]:
+        return screen_infos(QApplication.screens())
+
+    def _current_rect(self) -> QRect:
+        """Прямоугольник плашки на виртуальном рабочем столе."""
         size = self.size() if self.size().isValid() else self.sizeHint()
         width = max(size.width(), self.COMPACT_MIN_WIDTH)
         height = max(size.height(), self.COMPACT_HEIGHT)
+        pos = self.pos()
+        return QRect(pos.x(), pos.y(), width, height)
 
-        target_geo = None
-        for screen in screens:
-            geo = screen.availableGeometry()
-            if geo.contains(point):
-                target_geo = geo
-                break
-        if target_geo is None:
-            primary = QApplication.primaryScreen()
-            target_geo = (primary or screens[0]).availableGeometry()
+    def restore_position(
+        self,
+        x: int | None,
+        y: int | None,
+        screen_name: str = "",
+        screen_dx: int | None = None,
+        screen_dy: int | None = None,
+    ) -> None:
+        """Вернуть плашку туда, где её оставили (US-077).
 
-        min_x = target_geo.left() + margin
-        min_y = target_geo.top() + margin
-        max_x = target_geo.right() - width - margin
-        max_y = target_geo.bottom() - height - margin
-        if max_x < min_x:
-            max_x = min_x
-        if max_y < min_y:
-            max_y = min_y
-        return QPoint(min(max(point.x(), min_x), max_x), min(max(point.y(), min_y), max_y))
+        Сначала пробуем привязку к монитору: имя экрана + смещение внутри
+        него. Монитора нет (отключили, переименовали) или конфиг старого
+        формата без привязки — берём абсолютные координаты, а общий кламп сам
+        положит плашку на ближайший оставшийся монитор целиком в видимую
+        область.
+        """
+        infos = self._screen_infos()
+        try:
+            saved = None if x is None or y is None else QPoint(int(x), int(y))
+        except (TypeError, ValueError):
+            saved = None
+        point = position_from_binding(infos, screen_name, screen_dx, screen_dy, saved)
+        if point is None:
+            if saved is None:
+                return
+            point = saved
+        rect = self._current_rect()
+        rect.moveTo(point)
+        clamped, _ = clamp_overlay_rect(infos, rect)
+        self.move(clamped)
 
-    def _ensure_visible_on_screen(self) -> None:
-        self.move(self._clamp_point_to_screens(self.pos()))
+    def current_screen_binding(self) -> "tuple[str, int, int] | None":
+        """Текущая привязка позиции к монитору — (имя, dx, dy) или None."""
+        return screen_binding(self._screen_infos(), self._current_rect())
+
+    def _clamp_point_to_screens(self, point: QPoint, cursor: QPoint | None = None) -> QPoint:
+        """Точка, при которой плашка видна целиком.
+
+        cursor задаётся при перетаскивании: границы применяются к монитору
+        ПОД КУРСОРОМ, а не к основному — иначе плашка у стыка мониторов
+        перескакивала на основной экран.
+        """
+        rect = self._current_rect()
+        rect.moveTo(point)
+        clamped, _ = clamp_overlay_rect(self._screen_infos(), rect, cursor)
+        return clamped
+
+    def _ensure_visible_on_screen(self, cursor: QPoint | None = None) -> None:
+        self.move(self._clamp_point_to_screens(self.pos(), cursor))
+
+    def _bind_screen_signals(self) -> None:
+        """Подписаться на переезд окна между мониторами (US-077).
+
+        QWindow появляется только после создания окна, поэтому подписку
+        обновляем при каждом показе, а не один раз в конструкторе.
+        """
+        handle = self.windowHandle()
+        if handle is None or handle is self._screen_signal_window:
+            return
+        try:
+            handle.screenChanged.connect(self._on_window_screen_changed)
+        except (AttributeError, RuntimeError):  # noqa: BLE001
+            return
+        self._screen_signal_window = handle
+
+    def showEvent(self, event) -> None:  # noqa: ANN001
+        super().showEvent(event)
+        self._bind_screen_signals()
+
+    def _on_window_screen_changed(self, screen) -> None:  # noqa: ANN001
+        """Плашка переехала на монитор с другим масштабом изображения.
+
+        Размеры плашки заданы фиксированными пикселями, а метрики шрифта Qt
+        считает под DPI того экрана, где виджет находился. Без пересчёта
+        плашка на соседнем мониторе выглядит другого размера, а текст статуса
+        обрезается. Масштабирование всего приложения при этом не трогаем —
+        починка точечная, только для плашки (решение владельца продукта).
+        """
+        del screen
+        self._relayout_for_screen()
+
+    def _relayout_for_screen(self) -> None:
+        # Пересчёт двигает и меняет размер окна, а это снова может увести
+        # плашку на соседний монитор и вызвать screenChanged. Без защиты
+        # от повторного входа на стыке экранов с разным масштабом плашка
+        # могла бы задрожать между ними.
+        if self._relayout_in_progress:
+            return
+        self._relayout_in_progress = True
+        try:
+            self._apply_screen_relayout()
+        finally:
+            self._relayout_in_progress = False
+
+    def _apply_screen_relayout(self) -> None:
+        before = self.size()
+        self._resize_to_content(compact=self._compact)
+        if self._drag_start is not None:
+            # Во время перетаскивания плашка не должна ни прыгать по границам,
+            # ни выскальзывать из-под курсора: точку захвата ужимаем под новый
+            # размер, а кламп откладываем до отпускания кнопки.
+            self._drag_start = QPoint(
+                min(self._drag_start.x(), max(0, self.width() - 1)),
+                min(self._drag_start.y(), max(0, self.height() - 1)),
+            )
+            return
+        if self.size() != before:
+            self._ensure_visible_on_screen()
+
+    def _on_screen_removed(self, screen) -> None:  # noqa: ANN001
+        """Монитор отключили — плашка обязана остаться в видимой области.
+
+        Сохранённую привязку намеренно НЕ перезаписываем: вернут монитор —
+        плашка снова окажется там, где её оставили.
+        """
+        del screen
+        self._screen_refresh_timer.start()
 
 
     def _resize_to_content(self, *, compact: bool = False) -> None:
+        # US-077: режим запоминается, чтобы пересчитать размеры при
+        # переезде плашки на монитор с другим масштабом.
+        self._compact = compact
         if compact:
             self.preview_label.setVisible(False)
             self.copy_btn.setVisible(False)
@@ -598,16 +889,22 @@ class RecordingOverlay(QWidget):
 
     def mouseMoveEvent(self, event) -> None:  # noqa: ANN001
         if self._drag_start is not None and event.buttons() & Qt.LeftButton:
+            # US-077: во время перетаскивания плашка едет строго за курсором.
+            # Границы применяются при отпускании — и к монитору под курсором.
             self.move(event.globalPosition().toPoint() - self._drag_start)
             event.accept()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: ANN001
+        dragged = self._drag_start is not None
         self._drag_start = None
         if event.button() == Qt.RightButton:
             event.accept()
             return
-        self._ensure_visible_on_screen()
-        self.position_changed.emit(self.pos().x(), self.pos().y())
+        cursor = event.globalPosition().toPoint() if dragged else None
+        self._ensure_visible_on_screen(cursor)
+        binding = screen_binding(self._screen_infos(), self._current_rect(), cursor)
+        name, dx, dy = binding if binding is not None else ("", 0, 0)
+        self.position_changed.emit(self.pos().x(), self.pos().y(), name, dx, dy)
         event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: ANN001

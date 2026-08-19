@@ -167,8 +167,20 @@ class AppConfig:
     audio_meeting_compatibility: bool = True  # prefer WASAPI shared/fallbacks during online meetings
     save_audio_debug: bool = False
     overlay_enabled: bool = True
+    # Абсолютная позиция плашки на виртуальном рабочем столе. Остаётся
+    # запасным вариантом: по ней плашка восстанавливается, если монитора
+    # из overlay_screen_name уже нет.
     overlay_x: int | None = None
     overlay_y: int | None = None
+    # US-077: позиция плашки вместе с монитором. overlay_screen_name —
+    # QScreen.name(), overlay_screen_dx/dy — смещение от левого верхнего
+    # угла ПОЛНОЙ геометрии этого монитора (не рабочей области: та
+    # съезжает вместе с панелью задач). Пустое имя = старый config.json
+    # без привязки, работает как раньше по overlay_x/overlay_y;
+    # привязка дописывается при первом сохранении новой позиции.
+    overlay_screen_name: str = ""
+    overlay_screen_dx: int | None = None
+    overlay_screen_dy: int | None = None
     autostart_enabled: bool = False
     hf_token: str = ""  # optional Hugging Face token for authenticated model downloads
     updates_enabled: bool = True
