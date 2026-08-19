@@ -1373,32 +1373,55 @@ class MainWindow(QMainWindow):
 
     # ── US-037: выбор подключения для функций (постобработка и др.) ──────
     def _fill_llm_model_combo(self, combo, conn, current: str = "") -> None:
-        """Заполнить combo моделями подключения, отфильтрованными до text→text."""
-        models = []
+        """Заполнить combo моделями подключения, пригодными для текстовых функций.
+
+        Два НЕЗАВИСИМЫХ отбора, и в журнале они считаются раздельно:
+        (1) TASK-387 — по назначению модели (metadata.type): эмбеддинги,
+            реранкеры и guardrails не годятся для текста, даже если модель
+            внутренняя;
+        (2) US-073 — по размещению (фильтр «только модели Cloud.ru»).
+        """
+        try:
+            from .cloud_llm import is_text_to_text_model as _text_ok
+        except Exception:  # noqa: BLE001
+            def _text_ok(_model_id, _model_type=""):  # запасной вариант: не отсеиваем
+                return True
+
+        def _suitable(model_id: str) -> bool:
+            # Тип берётся так же, как на стороне диктовки: сохранённый в
+            # подключении признак сервиса, иначе — снимок последнего ответа.
+            return bool(_text_ok(model_id, cloud_placement.connection_model_type(conn, model_id)))
+
+        models: list = []
         if conn is not None:
-            try:
-                from .cloud_llm import _is_text_io_model
-                models = [m for m in (conn.discovered_models or []) if _is_text_io_model(m)]
-            except Exception:  # noqa: BLE001
-                models = list(conn.discovered_models or [])
-            # US-073 (AC 3): улучшение расшифровки и суммаризация — тоже списки
-            # моделей подключения, внешние модели в них не показываем.
+            source = list(getattr(conn, "discovered_models", None) or [])
+            skipped_type: list = []
+            for m in source:
+                (models if _suitable(m) else skipped_type).append(m)
             models, hidden = cloud_placement.filter_connection_models(conn, models)
-            if any(hidden.values()):
-                log.info("US-073: список LLM-моделей подключения %s — скрыто %s",
-                         getattr(conn, "id", "?"), hidden)
-        hidden_current = bool(
-            conn is not None and current and cloud_placement.connection_hidden_reason(conn, current)
-        )
+            log.info(
+                "TASK-387 llm list: connection %s — available %d of %d, skipped by type %d %s, "
+                "hidden by Cloud.ru filter %d %s",
+                getattr(conn, "id", "?"), len(models), len(source),
+                len(skipped_type), skipped_type[:15] or "-",
+                sum(hidden.values()), hidden,
+            )
+        # Сохранённая в настройках модель не подставляется в поле, если она не
+        # подходит: иначе непригодная или внешняя модель осталась бы выбранной
+        # в обход обоих отборов.
+        current_bad = ""
+        if conn is not None and current:
+            if not _suitable(current):
+                current_bad = "тип модели не подходит для текстовых функций (TASK-387)"
+            elif cloud_placement.connection_hidden_reason(conn, current):
+                current_bad = "модель скрыта фильтром подключения (US-073)"
         combo.blockSignals(True)
         combo.clear()
         for m in models:
             combo.addItem(m)
-        if hidden_current:
-            # US-073: сохранённая модель скрыта фильтром — не подставляем её в
-            # поле, иначе внешняя модель осталась бы выбранной в обход фильтра.
+        if current_bad:
             combo.setCurrentText("")
-            log.warning("US-073: модель %s скрыта фильтром подключения и не подставлена в список", current)
+            log.warning("Модель %s не подставлена в список: %s", current, current_bad)
         elif current:
             combo.setCurrentText(current)
         combo.blockSignals(False)
@@ -1413,17 +1436,29 @@ class MainWindow(QMainWindow):
             self._fill_llm_model_combo(self.postprocess_model_combo, conn, getattr(self.cfg, "postprocess_model_id", "") or "")
         if hasattr(self, "postprocess_warn_label"):
             need = bool(getattr(self, "postprocess_enabled_check", None) and self.postprocess_enabled_check.isChecked())
-            # US-073: если сохранённая модель скрыта фильтром «только Cloud.ru»,
-            # её пропажа из списка не должна выглядеть случайностью.
+            # US-073/TASK-387: если сохранённая модель пропала из списка —
+            # скрыта фильтром размещения или не годится по назначению, —
+            # это не должно выглядеть случайностью.
             hidden_model = ""
+            hidden_why = ""
             if conn is not None:
                 _saved = getattr(self.cfg, "postprocess_model_id", "") or ""
-                if _saved and cloud_placement.connection_hidden_reason(conn, _saved):
-                    hidden_model = _saved
+                if _saved:
+                    _declared = cloud_placement.connection_model_type(conn, _saved)
+                    try:
+                        from .cloud_llm import is_text_to_text_model as _text_ok
+                    except Exception:  # noqa: BLE001
+                        _text_ok = None
+                    if _text_ok is not None and not _text_ok(_saved, _declared):
+                        hidden_model = _saved
+                        hidden_why = (f"не подходит для работы с текстом (тип модели: {_declared})"
+                                      if _declared else "не подходит для работы с текстом")
+                    elif cloud_placement.connection_hidden_reason(conn, _saved):
+                        hidden_model = _saved
+                        hidden_why = "скрыта фильтром подключения (размещена вне Cloud.ru)"
             if hidden_model:
                 self.postprocess_warn_label.setText(
-                    f"Модель «{hidden_model}» скрыта фильтром подключения "
-                    f"(размещена вне Cloud.ru). Выберите другую модель."
+                    f"Модель «{hidden_model}» {hidden_why}. Выберите другую модель."
                 )
                 self.postprocess_warn_label.setVisible(True)
             else:
@@ -2087,14 +2122,15 @@ class MainWindow(QMainWindow):
             self.summary_mode_combo.blockSignals(False)
             self.summary_base_url_edit.setText(getattr(self.cfg, "summary_base_url", "") or "https://api.openai.com/v1")
             self.summary_key_edit.setText(getattr(self.cfg, "summary_api_key", "") or "")
-            _smodel = getattr(self.cfg, "summary_model_id", "") or ""
-            self.summary_model_combo.blockSignals(True)
-            self.summary_model_combo.clear()
-            if _smodel:
-                self.summary_model_combo.addItem(_smodel, _smodel)
-                self.summary_model_combo.setCurrentIndex(0)
-            self.summary_model_combo.setEditText(_smodel)
-            self.summary_model_combo.blockSignals(False)
+            # TASK-387/US-073: сохранённый id подставляется в поле ТОЛЬКО через
+            # общий отбор. Иначе восстановление настроек возвращало в поле
+            # модель, которую списки уже скрыли (эмбеддинги, guard, внешняя),
+            # и оба фильтра оказывались обойдены при каждом запуске.
+            self._fill_llm_model_combo(
+                self.summary_model_combo,
+                self.cfg.connection_by_id(getattr(self.cfg, "summary_connection_id", "") or ""),
+                getattr(self.cfg, "summary_model_id", "") or "",
+            )
             self.summary_reasoning_check.setChecked(bool(getattr(self.cfg, "summary_reasoning", False)))
             _s_eff = getattr(self.cfg, "summary_reasoning_effort", "low") or "low"
             _s_eff_idx = self.summary_reasoning_effort_combo.findData(_s_eff)
@@ -2150,14 +2186,13 @@ class MainWindow(QMainWindow):
             self.postprocess_enabled_check.setChecked(bool(getattr(self.cfg, "postprocess_enabled", False)))
             self.postprocess_base_url_edit.setText(getattr(self.cfg, "postprocess_base_url", "") or "https://api.openai.com/v1")
             self.postprocess_key_edit.setText(getattr(self.cfg, "postprocess_api_key", "") or "")
-            _pp_model = getattr(self.cfg, "postprocess_model_id", "") or ""
-            self.postprocess_model_combo.blockSignals(True)
-            self.postprocess_model_combo.clear()
-            if _pp_model:
-                self.postprocess_model_combo.addItem(_pp_model, _pp_model)
-                self.postprocess_model_combo.setCurrentIndex(0)
-            self.postprocess_model_combo.setEditText(_pp_model)
-            self.postprocess_model_combo.blockSignals(False)
+            # TASK-387/US-073: см. комментарий у поля модели суммаризации —
+            # подстановка сохранённого id идёт через общий отбор.
+            self._fill_llm_model_combo(
+                self.postprocess_model_combo,
+                self.cfg.connection_by_id(getattr(self.cfg, "postprocess_connection_id", "") or ""),
+                getattr(self.cfg, "postprocess_model_id", "") or "",
+            )
             _pp_prompt = getattr(self.cfg, "postprocess_system_prompt", None)
             self.postprocess_prompt_edit.setPlainText(
                 _pp_prompt if _pp_prompt is not None else DEFAULT_POSTPROCESS_SYSTEM_PROMPT
@@ -2391,19 +2426,38 @@ class MainWindow(QMainWindow):
         )
 
     def _llm_model_hidden_by_placement(self, connection_attr: str, model_attr: str) -> str:
-        """US-073: скрыта ли фильтром модель LLM-функции (постобработка,
-        суммаризация). Возвращает id модели, если скрыта, иначе "".
+        """Пригодна ли сохранённая модель LLM-функции (постобработка,
+        суммаризация). Возвращает id модели, если использовать её нельзя,
+        иначе "". Точная причина уходит в журнал.
 
-        Нужен потому, что сохранённый в настройках id модели переживает
-        включение фильтра: списки её уже не показывают, но сама функция без
-        этой проверки продолжила бы отправлять текст внешней модели.
+        Две причины, обе проверяются здесь, потому что сохранённый в
+        настройках id переживает и включение фильтра, и обновление
+        программы: списки её уже не показывают, но сама функция без этой
+        проверки продолжила бы отправлять текст.
+
+        * US-073 — модель скрыта фильтром размещения (внешняя);
+        * TASK-387 — модель не годится по назначению (эмбеддинги, реранкер,
+          guardrail), даже если она внутренняя.
         """
         try:
             conn = self.cfg.connection_by_id(getattr(self.cfg, connection_attr, "") or "")
             model_id = (getattr(self.cfg, model_attr, "") or "").strip()
             if conn is None or not model_id:
                 return ""
-            return model_id if cloud_placement.connection_hidden_reason(conn, model_id) else ""
+            declared = cloud_placement.connection_model_type(conn, model_id)
+            try:
+                from .cloud_llm import is_text_to_text_model as _text_ok
+            except Exception:  # noqa: BLE001
+                _text_ok = None
+            if _text_ok is not None and not _text_ok(model_id, declared):
+                log.warning("TASK-387: модель %s не подходит для текстовой функции (тип %r)",
+                            model_id, declared or "не сообщён")
+                return model_id
+            reason = cloud_placement.connection_hidden_reason(conn, model_id)
+            if reason:
+                log.warning("US-073: модель %s скрыта фильтром подключения (%s)", model_id, reason)
+                return model_id
+            return ""
         except Exception:  # noqa: BLE001
             return ""
 
@@ -4648,7 +4702,8 @@ class MainWindow(QMainWindow):
         if _hidden:
             log.warning("US-073: постобработка пропущена — модель %s скрыта фильтром подключения", _hidden)
             self._on_dictation_postprocess_failed(
-                f"Модель «{_hidden}» скрыта фильтром подключения (размещена вне Cloud.ru)",
+                f"Модель «{_hidden}» недоступна для постобработки "
+                f"(фильтр подключения или неподходящий тип модели)",
                 text, duration, wav_path,
             )
             return
@@ -5164,7 +5219,8 @@ class MainWindow(QMainWindow):
             _hidden = self._llm_model_hidden_by_placement("summary_connection_id", "summary_model_id")
             if _hidden:
                 self._on_cloud_summary_failed(
-                    f"модель «{_hidden}» скрыта фильтром подключения (размещена вне Cloud.ru)"
+                    f"модель «{_hidden}» недоступна для облачной суммаризации "
+                    f"(фильтр подключения или неподходящий тип модели)"
                 )
                 return
             self.status_label.setText("Облачная суммаризация…")

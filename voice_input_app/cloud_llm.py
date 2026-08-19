@@ -10,7 +10,7 @@
 Модуль предоставляет:
 - post_process_text — прогнать текст через chat-completions
 - verify_connection — проверка ключа/доступности LLM-провайдера
-- discover_chat_models — список доступных моделей у провайдера
+- discover_chat_models — список text→text моделей у провайдера (по metadata.type)
 
 Переиспользует типы ошибок и charset-валидацию из cloud_stt, чтобы UI
 обрабатывал сбои единообразно с облачным STT.
@@ -432,12 +432,37 @@ NON_TEXT_IO_MODEL_KEYWORDS = (
 
 
 def _is_text_io_model(model_id: str) -> bool:
-    """True, если модель пригодна для текстовой постобработки (текст→текст).
+    """Догадка по имени модели. Оставлена ТОЛЬКО как запасной вариант для
+    сервисов, которые не сообщают metadata.type (см. is_text_to_text_model).
+
     Эвристика по id: исключаем известные не-текстовые семейства (STT, TTS,
     embeddings, image, moderation, rerank, realtime-audio). Неизвестные имена
-    оставляем (лучше показать лишнюю модель, чем скрыть рабочую)."""
+    оставляем (у такого сервиса иначе опустеет весь список)."""
     low = model_id.lower()
     return not any(kw in low for kw in NON_TEXT_IO_MODEL_KEYWORDS)
+
+
+def is_text_to_text_model(model_id: str, model_type: str = "") -> bool:
+    """TASK-387: годится ли модель для текстовых функций (улучшение
+    расшифровки, суммаризация). Симметрична cloud_stt.is_stt_model.
+
+    Приоритет — явный признак сервиса `metadata.type`: разрешены только
+    значения из cloud_placement.TEXT_TO_TEXT_MODEL_TYPES. Эмбеддинги
+    (`embedder`), реранкеры (`rerank`), guardrails (`guard`), распознавание
+    речи (`audio-to-text`) и любое НЕЗНАКОМОЕ значение отсекаются: разбор
+    имени их не ловит (в `BAAI/bge-m3` нет слова embed, а слова guard нет и
+    в самом списке ключевых слов), а модель при этом непригодна.
+
+    Отбор по типу ОРТОГОНАЛЕН фильтру размещения US-073: внутренняя модель
+    Cloud.ru типа `guard` для постобработки всё равно не годится.
+
+    Если сервис тип не сообщает (сторонние OpenAI-совместимые прокси вроде
+    Groq) — падаем обратно на разбор имени, иначе их список опустеет.
+    """
+    declared = (model_type or "").strip().lower()
+    if declared:
+        return declared in cloud_placement.TEXT_TO_TEXT_MODEL_TYPES
+    return _is_text_io_model(model_id)
 
 
 def discover_chat_models(
@@ -448,10 +473,10 @@ def discover_chat_models(
 ) -> list[str]:
     """Список текстовых (text→text) моделей провайдера для постобработки.
 
-    Из ответа /v1/models исключаются модели, не умеющие текст-на-входе И
-    текст-на-выходе (STT/Whisper, TTS, embeddings, image, moderation, rerank,
-    realtime-audio) — см. NON_TEXT_IO_MODEL_KEYWORDS. Мультимодальные чат-модели
-    (text+audio, vision) остаются. Возвращаем отфильтрованные id (отсортированные).
+    TASK-387: пригодность определяется признаком сервиса `metadata.type` из
+    того же ответа /v1/models (второй запрос не нужен) — см.
+    is_text_to_text_model. Сервисам, которые тип не сообщают, остаётся
+    прежний разбор имени. Возвращаем отфильтрованные id (отсортированные).
     При ошибке — пустой список, пользователь вписывает id вручную в combo.
     """
     if not api_key:
@@ -488,16 +513,31 @@ def discover_chat_models(
     # эндпоинта, даже если этот вызов пришёл не из диалога подключения.
     infos = cloud_placement.parse_models_payload(payload)
     cloud_placement.remember_endpoint_models(base, infos)
-    all_ids = sorted(i.id for i in infos)
-    text_ids = [mid for mid in all_ids if _is_text_io_model(mid)]
-    excluded = [mid for mid in all_ids if mid not in text_ids]
-    log.info("discover_llm: got %d models, %d text-capable; excluded %d (first 30: %s)",
-             len(all_ids), len(text_ids), len(excluded), ", ".join(excluded[:30]))
-    # US-073: внешние модели не должны попадать и в списки постобработки и
-    # суммаризации (AC 2/AC 3).
+    # TASK-387: тип модели берём из ЭТОГО же ответа — у infos он уже разобран.
+    infos_by_id = {i.id: i for i in infos}
+    all_ids = sorted(infos_by_id)
+    text_ids = []
+    skipped_typed = []   # отсеяны по признаку сервиса (metadata.type)
+    skipped_named = []   # отсеяны разбором имени (сервис тип не сообщил)
+    for mid in all_ids:
+        declared = (infos_by_id[mid].model_type or "").strip().lower()
+        if is_text_to_text_model(mid, declared):
+            text_ids.append(mid)
+        elif declared:
+            skipped_typed.append(f"{mid} ({declared})")
+        else:
+            skipped_named.append(mid)
+    log.info(
+        "TASK-387 llm list: endpoint %s — available %d of %d, skipped by service type %d %s, "
+        "skipped by name %d %s",
+        base, len(text_ids), len(all_ids),
+        len(skipped_typed), skipped_typed[:15] or "-",
+        len(skipped_named), skipped_named[:15] or "-",
+    )
+    # US-073: фильтр размещения ОРТОГОНАЛЕН отбору по типу и считается отдельно.
     text_ids, hidden = cloud_placement.filter_ids_by_policy(base, text_ids)
     if hidden:
-        log.info("discover_llm: скрыто фильтром Cloud.ru %d моделей (US-073)", hidden)
+        log.info("TASK-387 llm list: endpoint %s — hidden by Cloud.ru filter %d (US-073)", base, hidden)
     _discover_cache[ck] = list(text_ids)
     return text_ids
 
