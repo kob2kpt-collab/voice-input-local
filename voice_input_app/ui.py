@@ -606,7 +606,25 @@ class MainWindow(QMainWindow):
         self._hotkey_error_message = ""
         self.record_blink = False
         self.overlay = RecordingOverlay()
-        self.overlay.restore_position(self.cfg.overlay_x, self.cfg.overlay_y)
+        # US-077: позиция восстанавливается вместе с монитором. Старый
+        # config.json без привязки открывается как раньше — по абсолютным
+        # overlay_x/overlay_y; привязку дописываем в конфиг тут же, чтобы
+        # она ушла на диск при первом же сохранении настроек.
+        self.overlay.restore_position(
+            self.cfg.overlay_x,
+            self.cfg.overlay_y,
+            self.cfg.overlay_screen_name,
+            self.cfg.overlay_screen_dx,
+            self.cfg.overlay_screen_dy,
+        )
+        if not self.cfg.overlay_screen_name:
+            _binding = self.overlay.current_screen_binding()
+            if _binding is not None:
+                (
+                    self.cfg.overlay_screen_name,
+                    self.cfg.overlay_screen_dx,
+                    self.cfg.overlay_screen_dy,
+                ) = _binding
         self.overlay.copy_requested.connect(self.copy_overlay_result)
         self.overlay.position_changed.connect(self.on_overlay_position_changed)
         # US-019: автоматический выбор облачной модели через overlay-пикер.
@@ -4503,9 +4521,25 @@ class MainWindow(QMainWindow):
         self.stop_escape_watch()
         self.status_label.setText("Текст скопирован. Готово.")
 
-    def on_overlay_position_changed(self, x: int, y: int) -> None:
+    def on_overlay_position_changed(
+        self,
+        x: int,
+        y: int,
+        screen_name: str = "",
+        screen_dx: int = 0,
+        screen_dy: int = 0,
+    ) -> None:
+        # US-077: сохраняем и абсолютную позицию, и привязку к монитору.
+        # Абсолютная нужна как запасной вариант, если монитор отключат.
         self.cfg.overlay_x = int(x)
         self.cfg.overlay_y = int(y)
+        self.cfg.overlay_screen_name = str(screen_name or "")
+        if self.cfg.overlay_screen_name:
+            self.cfg.overlay_screen_dx = int(screen_dx)
+            self.cfg.overlay_screen_dy = int(screen_dy)
+        else:
+            self.cfg.overlay_screen_dx = None
+            self.cfg.overlay_screen_dy = None
         self.cfg.save()
 
     # ── US-019: выбор облачной модели через overlay ──────────────────────
