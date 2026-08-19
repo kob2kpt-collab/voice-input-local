@@ -597,6 +597,11 @@ class ModelManager:
         После успешного verify в UI вызывается set_cloud_models() — он
         регистрирует все обнаруженные модели напрямую из ответа воркера.
         """
+        # US-073: присваивание ПЕРВЫМ оператором обязательно. Дальше метод
+        # разбирает подключения из config.json (файл правят руками), и
+        # исключение в середине не должно оставить менеджер без конфига:
+        # без него чокпоинт _register_cloud_model отвергает ВСЁ (fail-closed),
+        # и облачные модели просто исчезли бы из списков.
         self._last_cfg = cfg
         _CLOUD_MODELS_REGISTRY.clear()
 
@@ -677,8 +682,14 @@ class ModelManager:
         if conn_obj is not None:
             self._log_cloud_registration(conn_obj, registered, skipped)
         else:
-            log.info("US-073 registry: connection %s — available %d, skipped %s",
-                     connection_id, registered, skipped or "none")
+            # US-073: подключение не найдено в конфиге — чокпоинт отверг всё
+            # (fail-closed). Это предупреждение, а не информация: списки
+            # облачных моделей в таком состоянии окажутся пустыми.
+            log.warning(
+                "US-073 registry: connection %s NOT FOUND in config — available %d, "
+                "rejected without connection %d (fail-closed)",
+                connection_id, registered, int(skipped.get("no-connection", 0)),
+            )
         # US-037 ВАЖНО: НЕ перезаписываем cc.discovered_models здесь. Это кэш
         # ПОЛНОГО списка моделей подключения (его ведёт диалог подключения через
         # discover_all_models). Старый стартовый STT-discover вызывает
@@ -694,11 +705,14 @@ class ModelManager:
         external = int(skipped.get("external", 0))
         unknown = int(skipped.get("unknown", 0))
         non_stt = int(skipped.get("non-stt", 0))
+        no_conn = int(skipped.get("no-connection", 0))
         log.info(
             "US-073 registry: connection %r (%s) — available %d, hidden by Cloud.ru filter %d "
-            "(external %d, placement unknown %d), skipped as non-STT %d",
+            "(external %d, placement unknown %d), skipped as non-STT %d, "
+            "rejected without connection %d",
             getattr(conn, "name", "") or getattr(conn, "id", "?"),
-            getattr(conn, "id", "?"), registered, external + unknown, external, unknown, non_stt,
+            getattr(conn, "id", "?"), registered, external + unknown, external, unknown,
+            non_stt, no_conn,
         )
 
     def _register_cloud_model(self, connection_id: str, conn_type: str, model_id: str) -> str:
@@ -714,7 +728,8 @@ class ModelManager:
 
         Возвращает "" — модель зарегистрирована; иначе причину отказа:
         "external"/"unknown" — фильтр размещения, "non-stt" — модель не
-        распознаёт речь, "bad" — пустые аргументы или неизвестный тип.
+        распознаёт речь, "bad" — пустые аргументы или неизвестный тип,
+        "no-connection" — подключение не найдено (fail-closed, см. ниже).
         """
         if not model_id or not connection_id:
             return "bad"
@@ -732,6 +747,23 @@ class ModelManager:
                 conn = self._last_cfg.connection_by_id(connection_id)
             except Exception:  # noqa: BLE001
                 conn = None
+        if conn is None:
+            # US-073 FAIL-CLOSED. Без подключения неизвестны ни размещение
+            # модели, ни состояние флажка «только модели Cloud.ru», поэтому
+            # регистрировать нельзя: молча открыть внешнюю модель хуже, чем
+            # не показать её вовсе (требование ИТ-директора, 152-ФЗ).
+            # Случай реален: если refresh_cloud_models упал на битой записи
+            # в config.json, приложение продолжает работу с _last_cfg=None, и
+            # стартовая проверка соединения через 1.5 с зарегистрировала бы
+            # модели вообще без фильтра. Модели несуществующего подключения
+            # всё равно неработоспособны — resolve_cloud_connection не найдёт
+            # для них ни ключа, ни адреса.
+            log.warning(
+                "US-073 registry: connection %s not resolved (cfg loaded: %s) — model %r NOT registered "
+                "(fail-closed: placement and filter state unknown)",
+                connection_id, self._last_cfg is not None, model_id,
+            )
+            return "no-connection"
         # US-073: внешние модели (metadata.provider = external) в списки не попадают.
         reason = cloud_placement.connection_hidden_reason(conn, model_id)
         if reason:

@@ -623,6 +623,76 @@ def test_set_cloud_models_cannot_bypass_filter():
     assert mgr._register_cloud_model(conn.id, conn.type, "openai/whisper-large-v3") == ""
 
 
+def test_registry_fails_closed_without_connection():
+    """Дефект стыка: при нерезолвящемся подключении чокпоинт пускал модели
+    в реестр вообще без фильтра.
+
+    Случай реален: если refresh_cloud_models упадёт на битой записи в
+    config.json (файл правят руками), приложение продолжает работу с
+    _last_cfg=None, а стартовая проверка соединения через 1.5 с зовёт
+    set_cloud_models напрямую — и внешние модели попадали в списки.
+    """
+    _reset_state()
+    conn = _cloudru_connection()
+    ids = list(conn.discovered_models)
+
+    # (а) refresh_cloud_models не вызывали — конфига у менеджера нет.
+    mgr = ModelManager()
+    mgr.set_cloud_models("conn-1", "openai", ids)
+    assert models_module._CLOUD_MODELS_REGISTRY == {}, (
+        "без конфига реестр наполнился в обход фильтра: "
+        f"{sorted(models_module._CLOUD_MODELS_REGISTRY)}"
+    )
+    assert mgr._register_cloud_model("conn-1", "openai", "openai/whisper-large-v3") == "no-connection"
+    # Легаси-форма вызова тоже ничего не регистрирует.
+    mgr.set_cloud_models("openai", ids)
+    assert models_module._CLOUD_MODELS_REGISTRY == {}
+
+    # (б) конфиг есть, но подключения с таким id в нём нет.
+    mgr2 = ModelManager()
+    mgr2.refresh_cloud_models(_cfg_with(conn))
+    before = sorted(models_module._CLOUD_MODELS_REGISTRY)
+    mgr2.set_cloud_models("conn-неизвестное", "openai", ids)
+    assert sorted(models_module._CLOUD_MODELS_REGISTRY) == before, "чужой id наполнил реестр"
+    assert mgr2._register_cloud_model("conn-неизвестное", "openai", "vendor/whisper-turbo-v9") == "no-connection"
+
+    # (в) штатный порядок вызовов не сломан: внутренняя модель регистрируется.
+    mgr2.set_cloud_models(conn.id, conn.type, ids)
+    assert _registry_model_ids(conn) == ["openai/whisper-large-v3"]
+
+    # (г) отказ виден в журнале.
+    records: list = []
+
+    class _Catcher(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Catcher()
+    models_module.log.addHandler(handler)
+    try:
+        ModelManager().set_cloud_models("conn-1", "openai", ids)
+    finally:
+        models_module.log.removeHandler(handler)
+    assert any("fail-closed" in m for m in records), f"отказ не записан в журнал: {records}"
+    assert any("rejected without connection" in m for m in records), records
+
+
+def test_last_cfg_assigned_before_parsing_connections():
+    """Статический guard: self._last_cfg присваивается ПЕРВЫМ оператором
+    refresh_cloud_models. Иначе исключение при разборе подключений оставит
+    менеджер без конфига, а fail-closed чокпоинт скроет вообще все модели."""
+    tree = ast.parse(MODELS_PATH.read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "refresh_cloud_models")
+    body = [n for n in fn.body if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
+    first = body[0]
+    assert isinstance(first, ast.Assign), f"первым оператором стало {type(first).__name__}"
+    target = first.targets[0]
+    assert isinstance(target, ast.Attribute) and target.attr == "_last_cfg", (
+        "self._last_cfg больше не присваивается первым оператором refresh_cloud_models"
+    )
+
+
 # ---------- совместимость сигнатур (контракт между агентами) ----------
 
 
@@ -680,6 +750,8 @@ def _run():
         test_llm_combo_hides_external_and_drops_hidden_current,
         test_registry_write_only_inside_checkpoint,
         test_set_cloud_models_cannot_bypass_filter,
+        test_registry_fails_closed_without_connection,
+        test_last_cfg_assigned_before_parsing_connections,
         test_public_discover_signatures_unchanged,
     ]
     for t in tests:
