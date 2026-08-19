@@ -69,6 +69,7 @@ from .cloud_security_dialog import (
 from .paths import app_icon_path, logs_dir, models_dir
 from .updater import UpdateInfo, launch_update_file, normalize_repo, updates_disabled_by_policy
 from . import busy_marker, update_signal
+from . import cloud_startup
 from .workers import CloudConnectionCheckWorker, ConnectionVerifyWorker, LlmConnectionCheckWorker, PostProcessWorker, DownloadWorker, FileProgress, FileTranscribeWorker, FileTranscriptBlock, MicrophoneAutodetectWorker, MicrophoneAutodetectResult, PreloadWorker, SummarizeWorker, TranscribeWorker, UpdateCheckWorker, UpdateDownloadWorker
 try:
     from .summarizer import DEFAULT_SUMMARY_PROMPT
@@ -5000,53 +5001,70 @@ class MainWindow(QMainWindow):
         self.schedule_settings_autosave()
 
     def start_initial_cloud_discover(self) -> None:
-        """TASK-045: при старте программы — фоновая проверка соединения и
-        автозагрузка списка моделей для каждого настроенного cloud-провайдера.
-        При успехе тихо обновляет реестр; при ошибке (401/403/таймаут) — лог +
-        статус-бар + трей-уведомление; если cfg.selected_model был cloud и
-        discover упал — переключаемся на cfg.cloud_fallback_model_key."""
+        """US-072: стартовая проверка облачных подключений с повторами.
+
+        При автозапуске вместе с Windows сеть и корпоративный прокси ещё
+        поднимаются. Раньше выполнялась ОДНА попытка, она почти всегда падала,
+        и пользователь получал «Неверный API-ключ» на исправном ключе. Теперь:
+
+        * проверяются ВСЕ подключения реестра cfg.cloud_connections (AC 6),
+          а не только те, на которые ссылаются устаревшие поля openai_stt_*;
+        * запрос не уходит, пока не поднимается TCP до хоста (AC 1);
+        * неудача повторяется через 5, 10 и 20 секунд (cloud_startup.RETRY_DELAYS_MS);
+        * уведомление в трее и статус-строка — ТОЛЬКО когда лестница
+          исчерпана (AC 2), а текст соответствует настоящей причине (AC 3);
+        * выбранная модель НЕ подменяется запасной (решение владельца
+          продукта): если связи не будет и к моменту диктовки, сработает
+          штатный transcribe_with_fallback — подмена по факту работы, а не по
+          факту загрузки Windows (AC 5).
+        """
         try:
             import requests  # noqa: F401
         except ImportError:
-            log.warning("Initial cloud discover skipped: requests not installed")
+            log.warning("Стартовая проверка пропущена: не установлен requests")
             return
-        self._initial_cloud_check_workers: list = []
-        if self.cfg.openai_stt_api_key:
-            w = CloudConnectionCheckWorker(
-                "openai",
-                self.cfg.openai_stt_api_key,
-                self.cfg.openai_stt_base_url or "https://api.openai.com/v1",
-            )
-            w.result.connect(lambda ok, msg, models, p="openai": self._on_initial_cloud_check_done(p, ok, msg, models))
-            self._initial_cloud_check_workers.append(w)
-            w.start()
-            log.info("Initial cloud discover: started for openai")
-        if self.cfg.elevenlabs_stt_api_key:
-            w = CloudConnectionCheckWorker("elevenlabs", self.cfg.elevenlabs_stt_api_key, "")
-            w.result.connect(lambda ok, msg, models, p="elevenlabs": self._on_initial_cloud_check_done(p, ok, msg, models))
-            self._initial_cloud_check_workers.append(w)
-            w.start()
-            log.info("Initial cloud discover: started for elevenlabs")
-        # US-034: стартовая проверка LLM постобработки, если включено «Улучшение расшифровки».
-        if getattr(self.cfg, "postprocess_enabled", False) and getattr(self.cfg, "postprocess_api_key", ""):
-            wp = LlmConnectionCheckWorker(
-                self.cfg.postprocess_api_key,
-                self.cfg.postprocess_base_url or "https://api.openai.com/v1",
-            )
-            wp.result.connect(self._on_initial_postprocess_check_done)
-            self._initial_cloud_check_workers.append(wp)
-            wp.start()
-            log.info("Initial cloud discover: started for postprocess LLM")
-        # US-036: стартовая проверка LLM суммаризации (способ — облако и задан ключ).
-        if (getattr(self.cfg, "summary_mode", "local") or "local") == "cloud" and getattr(self.cfg, "summary_api_key", ""):
-            ws = LlmConnectionCheckWorker(
-                self.cfg.summary_api_key,
-                self.cfg.summary_base_url or "https://api.openai.com/v1",
-            )
-            ws.result.connect(self._on_initial_summary_check_done)
-            self._initial_cloud_check_workers.append(ws)
-            ws.start()
-            log.info("Initial cloud discover: started for summary LLM")
+        targets = cloud_startup.build_targets(self.cfg)
+        if not targets:
+            log.info("Стартовая проверка: облачных подключений с ключом нет — пропуск")
+            return
+        self._startup_check_attempt = 0
+        self._startup_check_targets = list(targets)
+        log.info("Стартовая проверка: подключений к проверке %d (%s)",
+                 len(targets), ", ".join(t.title for t in targets))
+        self._run_startup_cloud_check()
+
+    def _run_startup_cloud_check(self) -> None:
+        """Одна попытка по всем ещё не прошедшим целям (повторы — по лестнице)."""
+        if getattr(self, "_quitting", False):
+            return  # US-049: выход важнее отложенного повтора
+        targets = list(getattr(self, "_startup_check_targets", None) or [])
+        if not targets:
+            return
+        self._startup_check_attempt = int(getattr(self, "_startup_check_attempt", 0)) + 1
+        self._spawn_startup_check_worker(targets, self._startup_check_attempt)
+
+    def _spawn_startup_check_worker(self, targets, attempt: int) -> None:
+        """Запустить воркер попытки.
+
+        Отдельный метод — точка подмены в тестах (сеть при проверке лестницы
+        дёргать нельзя). Ссылка на воркер живёт в атрибуте: анти-GC и доступ
+        из _shutdown_workers при выходе (US-049).
+        """
+        from .workers import StartupCloudCheckWorker
+
+        worker = StartupCloudCheckWorker(targets, attempt=attempt)
+        worker.result.connect(self._on_startup_cloud_check_done)
+        previous = getattr(self, "_startup_check_worker", None)
+        if previous is not None:
+            # Прошлая попытка к этому моменту уже отдала результат, но ссылку
+            # нельзя ронять на ещё живом QThread — уничтожение работающего
+            # потока роняет процесс. Ожидание формальное (обычно мгновенное).
+            try:
+                previous.wait(100)
+            except Exception:  # noqa: BLE001
+                pass
+        self._startup_check_worker = worker
+        worker.start()
 
     def _on_initial_postprocess_check_done(self, ok: bool, message: str, models: list) -> None:
         """US-034: результат стартовой проверки LLM постобработки. Тихо обновляет
@@ -5131,37 +5149,122 @@ class MainWindow(QMainWindow):
             combo.setCurrentIndex(combo.count() - 1)
         combo.blockSignals(False)
 
-    def _on_initial_cloud_check_done(self, provider: str, ok: bool, message: str, models: list) -> None:
-        """Результат стартовой проверки cloud. Тихо при успехе; уведомление при сбое."""
-        prefix = "OpenAI" if provider == "openai" else "ElevenLabs"
-        log.info("Initial cloud discover [%s]: ok=%s msg=%s models=%d", provider, ok, message, len(models))
-        if ok:
-            try:
-                self.models.set_cloud_models(provider, list(models))
-                self.refresh_available_models_combo()
-                self._apply_cloud_models_to_settings_combo(provider, list(models))
-            except Exception as exc:  # noqa: BLE001
-                log.warning("Initial set_cloud_models failed: %s", exc)
+    def _on_startup_cloud_check_done(self, outcomes) -> None:
+        """US-072: разбор одной попытки стартовой проверки.
+
+        Успех — тихо (реестр моделей и списки обновляются сами, AC 4).
+        Неудача — повтор по лестнице; сообщение показывается только когда
+        повторы исчерпаны (AC 2). cfg.selected_model не трогается ни в одной
+        ветке (AC 5): подменять выбранную модель из-за того, что при загрузке
+        Windows ещё не поднялась сеть, — это менять настройку пользователя за
+        него. Не хватит связи и к моменту диктовки — сработает
+        transcribe_with_fallback (штатный путь on_cloud_fallback_applied).
+        """
+        outcomes = list(outcomes or [])
+        attempt = int(getattr(self, "_startup_check_attempt", 1))
+        succeeded = [o for o in outcomes if o.ok]
+        failed = [o for o in outcomes if not o.ok]
+        for outcome in succeeded:
+            self._apply_startup_success(outcome)
+        # Повторяем ТОЛЬКО то, что ещё не прошло.
+        self._startup_check_targets = [o.target for o in failed]
+        if not failed:
+            log.info("Стартовая проверка: все подключения доступны (попытка %d); решение: повторов не нужно",
+                     attempt)
             return
-        # Ошибка: уведомляем + проверяем не нужно ли fallback
-        self.status_label.setText(f"{prefix}: {message} (стартовая проверка)")
+        delay = cloud_startup.next_retry_delay_ms(attempt)
+        if delay is not None:
+            log.info("Стартовая проверка: неудачных целей %d из %d (попытка %d); решение: повтор через %d мс",
+                     len(failed), len(outcomes), attempt, delay)
+            timer = getattr(self, "_startup_check_timer", None)
+            if timer is None:
+                # US-049: таймер обязан быть АТРИБУТОМ окна — really_quit гасит
+                # все QTimer обходом self.__dict__, иначе висящий таймер помешал
+                # бы выходу.
+                timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.timeout.connect(self._run_startup_cloud_check)
+                self._startup_check_timer = timer
+            timer.stop()
+            timer.start(delay)
+            return
+        self._notify_startup_check_failed(failed)
+
+    def _apply_startup_success(self, outcome) -> None:
+        """Тихо применить успешную проверку: реестр моделей + списки в UI (AC 4)."""
+        target = outcome.target
+        models = list(getattr(outcome, "stt_models", None) or [])
         try:
-            self.tray.showMessage("Voice Input Local", f"{prefix}: {message}", QSystemTrayIcon.Warning, 5000)
+            if models:
+                # Регистрация — ТОЛЬКО через ModelManager (контракт US-073:
+                # обязательный фильтр моделей нельзя обходить).
+                if target.connection_ids:
+                    for conn_id in target.connection_ids:
+                        self.models.set_cloud_models(conn_id, target.ctype, models)
+                else:
+                    # Реестр подключений пуст (config правился руками) — старый
+                    # вызов по типу провайдера.
+                    self.models.set_cloud_models(target.ctype, models)
+                self.refresh_available_models_combo()
+            else:
+                # Пустой ответ discover НЕ затирает уже известные модели: разовый
+                # сбой ответа очистил бы пользователю список моделей диктовки.
+                log.info("Стартовая проверка: %s — STT-моделей не найдено, реестр не тронут", target.title)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Стартовая проверка: обновление реестра моделей не удалось: %s", exc)
+        # Combo устаревшего раздела настроек — только если это тот же эндпоинт.
+        try:
+            legacy_key = (getattr(self.cfg, "openai_stt_api_key", "") if target.ctype == "openai"
+                          else getattr(self.cfg, "elevenlabs_stt_api_key", ""))
+            if models and legacy_key and legacy_key == target.api_key:
+                self._apply_cloud_models_to_settings_combo(target.ctype, models)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Стартовая проверка: обновление combo настроек не удалось: %s", exc)
+        chat_models = list(getattr(outcome, "chat_models", None) or [])
+        if cloud_startup.ROLE_POSTPROCESS in target.roles:
+            try:
+                self._on_initial_postprocess_check_done(True, "стартовая проверка", chat_models)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Стартовая проверка: обновление моделей постобработки не удалось: %s", exc)
+        if cloud_startup.ROLE_SUMMARY in target.roles:
+            try:
+                self._on_initial_summary_check_done(True, "стартовая проверка", chat_models)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Стартовая проверка: обновление моделей суммаризации не удалось: %s", exc)
+        self._clear_startup_check_error()
+
+    def _clear_startup_check_error(self) -> None:
+        """AC 4: успешная попытка снимает ранее показанное сообщение об ошибке."""
+        if not getattr(self, "_startup_check_error_shown", False):
+            return
+        self._startup_check_error_shown = False
+        try:
+            self.status_label.setText("Облачные подключения доступны.")
         except Exception:  # noqa: BLE001
             pass
-        # Если в cfg выбрана cloud-модель этого провайдера — переключаемся на fallback
-        if is_cloud_model_key(self.cfg.selected_model) and cloud_provider_of(self.cfg.selected_model) == provider:
-            fallback_key = self.cfg.cloud_fallback_model_key or DEFAULT_MODEL_KEY
-            if not self.models.is_available(fallback_key):
-                fallback_key = DEFAULT_MODEL_KEY
-            old = self.cfg.selected_model
-            self.cfg.selected_model = fallback_key
-            try:
-                self.cfg.save()
-            except Exception:  # noqa: BLE001
-                pass
-            log.warning("Initial cloud discover failed for selected model %s → switched to fallback %s", old, fallback_key)
-            self.refresh_available_models_combo(force_current=True)
+        log.info("Стартовая проверка: связь появилась; решение: снять сообщение об ошибке")
+
+    def _notify_startup_check_failed(self, failed) -> None:
+        """AC 2 и AC 3: одно сообщение после исчерпания повторов, с настоящей причиной.
+
+        «Неверный API-ключ» стоит в тексте только тогда, когда сервис ответил
+        отказом на запрос с ключом (HTTP 401/403) — за это отвечает
+        cloud_startup.failure_text, решающий по машинному признаку причины,
+        а не по разбору русской строки.
+        """
+        summary = cloud_startup.summarize_failures(failed)
+        msg = (f"Облако недоступно после {cloud_startup.total_attempts()} попыток "
+               f"(повторы через 5, 10 и 20 секунд). {summary}")
+        self._startup_check_error_shown = True
+        log.warning("Стартовая проверка: повторы исчерпаны; решение: показать причину — %s", summary)
+        try:
+            self.status_label.setText(msg)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.tray.showMessage("Voice Input Local", msg[:250], QSystemTrayIcon.Warning, 7000)
+        except Exception:  # noqa: BLE001
+            pass
 
     def on_reset_postprocess_prompt(self) -> None:
         """US-034: сбросить системный промпт постобработки к дефолту."""
@@ -5639,6 +5742,7 @@ class MainWindow(QMainWindow):
             "update_check_worker", "update_download_worker", "live_worker",
             "_postprocess_worker", "_llm_check_worker", "_cloud_check_worker",
             "_check_worker", "_summary_check_worker",
+            "_startup_check_worker",  # US-072
         )
         running = []
         for _name in worker_attrs:
@@ -5674,6 +5778,7 @@ class MainWindow(QMainWindow):
             "update_check_worker", "update_download_worker", "live_worker",
             "_postprocess_worker", "_llm_check_worker", "_cloud_check_worker",
             "_check_worker", "_summary_check_worker",
+            "_startup_check_worker",  # US-072
         )
         running = []
         for _name in worker_attrs:
