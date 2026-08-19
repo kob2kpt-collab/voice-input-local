@@ -47,6 +47,13 @@ EXTERNAL_PROVIDER_VALUES = ("external",)
 # TASK-365: значение metadata.type для моделей распознавания речи.
 STT_MODEL_TYPE = "audio-to-text"
 
+# TASK-387: типы, пригодные для ТЕКСТОВЫХ функций — улучшение расшифровки
+# (постобработка) и суммаризация. Список РАЗРЕШАЮЩИЙ и симметричен
+# STT_MODEL_TYPE: всё, чего в нём нет, для текстовых функций не годится —
+# и embedder/rerank/guard, и любое НЕЗНАКОМОЕ значение. Мультимодальная
+# image+text-to-text принимает текст и возвращает текст, поэтому остаётся.
+TEXT_TO_TEXT_MODEL_TYPES = ("llm", "image+text-to-text")
+
 
 @dataclass
 class CloudModelInfo:

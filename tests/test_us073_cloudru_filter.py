@@ -92,6 +92,29 @@ PAYLOAD_WITHOUT_PLACEMENT = {
     ],
 }
 
+# TASK-387: типы моделей для текстовых функций. Все модели ВНУТРЕННИЕ —
+# так проверяется, что отбор по назначению не зависит от фильтра размещения.
+# Состав повторяет прогон владельца на боевом ключе.
+LLM_TYPES_PAYLOAD = {
+    "object": "list",
+    "data": [
+        {"id": "openai/gpt-oss-120b", "metadata": {"provider": "cloud.ru", "type": "llm"}},
+        {"id": "google/gemma-3-27b-it",
+         "metadata": {"provider": "cloud.ru", "type": "image+text-to-text"}},
+        {"id": "meta-llama/Llama-Guard-4-12B", "metadata": {"provider": "cloud.ru", "type": "guard"}},
+        {"id": "google/shieldgemma-9b", "metadata": {"provider": "cloud.ru", "type": "guard"}},
+        # В именах этих двух моделей нет слова embed — разбор имени их не ловил.
+        {"id": "BAAI/bge-m3", "metadata": {"provider": "cloud.ru", "type": "embedder"}},
+        {"id": "deepvk/USER-bge-m3", "metadata": {"provider": "cloud.ru", "type": "embedder"}},
+        {"id": "Qwen/Qwen3-Reranker-8B", "metadata": {"provider": "cloud.ru", "type": "rerank"}},
+        {"id": "openai/whisper-large-v3", "metadata": {"provider": "cloud.ru", "type": "audio-to-text"}},
+        {"id": "vendor/mystery-model", "metadata": {"provider": "cloud.ru", "type": "brand-new-type"}},
+    ],
+}
+
+# Модели, которые ДОЛЖНЫ остаться в списке текстовых функций.
+LLM_TYPES_EXPECTED = ["google/gemma-3-27b-it", "openai/gpt-oss-120b"]
+
 # Сторонний OpenAI-совместимый сервис: ни provider, ни type (AC 5, TASK-365).
 THIRD_PARTY_PAYLOAD = {
     "object": "list",
@@ -581,6 +604,197 @@ def test_llm_combo_hides_external_and_drops_hidden_current():
     assert "openai/gpt-oss-20b" in items and combo.currentText() == "openai/gpt-oss-20b"
 
 
+# ---------- TASK-387: отбор моделей текстовых функций по типу ----------
+
+
+def _llm_connection(payload=None, **overrides):
+    """Подключение с сохранёнными признаками из ответа сервиса."""
+    conn = CloudConnection(name="Cloud.ru LLM", type=CONNECTION_TYPE_OPENAI,
+                           base_url=CLOUDRU_URL, api_key="KEY")
+    infos = cloud_placement.parse_models_payload(payload or LLM_TYPES_PAYLOAD)
+    snap = cloud_placement.snapshot_from_infos(infos)
+    conn.discovered_models = [i.id for i in infos]
+    conn.model_placement = dict(snap.placement)
+    conn.model_types = dict(snap.types)
+    conn.reports_model_placement = snap.reports_placement
+    for k, v in overrides.items():
+        setattr(conn, k, v)
+    return conn
+
+
+def _fill_combo(conn, current):
+    """Прогнать _fill_llm_model_combo и вернуть содержимое списка."""
+    from PySide6.QtWidgets import QComboBox
+
+    from voice_input_app.ui import MainWindow
+
+    _qt_app()
+    combo = QComboBox()
+    combo.setEditable(True)
+    MainWindow._fill_llm_model_combo(types.SimpleNamespace(), combo, conn, current)
+    return sorted(combo.itemText(i) for i in range(combo.count()))
+
+
+def test_llm_type_filter_six_cases():
+    """Случаи из прогона владельца: тип от сервиса главнее имени модели."""
+    _reset_state()
+    cases = [
+        ("openai/gpt-oss-120b", "llm", True),
+        ("google/gemma-3-27b-it", "image+text-to-text", True),
+        ("meta-llama/Llama-Guard-4-12B", "guard", False),
+        ("google/shieldgemma-9b", "guard", False),
+        ("BAAI/bge-m3", "embedder", False),
+        ("deepvk/USER-bge-m3", "embedder", False),
+        ("Qwen/Qwen3-Reranker-8B", "rerank", False),
+        ("openai/whisper-large-v3", "audio-to-text", False),
+    ]
+    for model_id, model_type, expected in cases:
+        got = cloud_llm.is_text_to_text_model(model_id, model_type)
+        assert got is expected, f"{model_id} (тип {model_type}): ожидалось {expected}, получено {got}"
+
+    # Именно эти случаи разбор имени НЕ ловил — фиксируем причину задачи.
+    assert cloud_llm._is_text_io_model("meta-llama/Llama-Guard-4-12B") is True
+    assert cloud_llm._is_text_io_model("BAAI/bge-m3") is True
+
+
+def test_llm_unknown_type_is_hidden():
+    """Незнакомое значение типа скрывается — симметрия со стороной диктовки."""
+    _reset_state()
+    assert cloud_llm.is_text_to_text_model("vendor/mystery-model", "brand-new-type") is False
+    assert cloud_stt.is_stt_model("vendor/mystery-model", "brand-new-type") is False
+
+
+def test_llm_type_fallback_when_service_is_silent():
+    """Сервис типов не сообщает — работает прежний разбор имени, список не пуст."""
+    _reset_state()
+    assert cloud_llm.is_text_to_text_model("gpt-4o-mini", "") is True
+    assert cloud_llm.is_text_to_text_model("llama-3.3-70b-versatile", "") is True
+    assert cloud_llm.is_text_to_text_model("whisper-large-v3", "") is False
+
+    got = _with_fake_models_endpoint(
+        THIRD_PARTY_PAYLOAD,
+        lambda: cloud_llm.discover_chat_models("KEY", OTHER_URL, use_cache=False),
+    )
+    assert got == ["gpt-4o-mini"], f"у сервиса без типов список сломался: {got}"
+
+
+def test_discover_chat_models_uses_service_type():
+    """Сетевой путь (проверка соединения, стартовая проверка) отбирает по типу."""
+    _reset_state()
+    got = _with_fake_models_endpoint(
+        LLM_TYPES_PAYLOAD,
+        lambda: cloud_llm.discover_chat_models("KEY", CLOUDRU_URL, use_cache=False),
+    )
+    assert sorted(got) == LLM_TYPES_EXPECTED, f"список моделей текстовых функций неверен: {got}"
+    for banned in ("meta-llama/Llama-Guard-4-12B", "google/shieldgemma-9b", "BAAI/bge-m3",
+                   "deepvk/USER-bge-m3", "Qwen/Qwen3-Reranker-8B", "openai/whisper-large-v3",
+                   "vendor/mystery-model"):
+        assert banned not in got, f"{banned} осталась в списке текстовых функций"
+
+
+def test_llm_type_and_placement_are_orthogonal():
+    """Внутренняя модель типа guard скрыта, даже когда фильтр размещения выключен."""
+    _reset_state()
+    conn = _llm_connection()
+    assert cloud_placement.connection_hidden_reason(conn, "meta-llama/Llama-Guard-4-12B") == "", (
+        "модель внутренняя — фильтр размещения её скрывать не должен"
+    )
+    declared = cloud_placement.connection_model_type(conn, "meta-llama/Llama-Guard-4-12B")
+    assert declared == "guard"
+    assert cloud_llm.is_text_to_text_model("meta-llama/Llama-Guard-4-12B", declared) is False
+
+    # Фильтр размещения выключен — отбор по назначению продолжает работать.
+    conn.only_internal_models = False
+    assert _fill_combo(conn, "") == LLM_TYPES_EXPECTED
+
+    # И наоборот: внешняя text→text модель скрывается фильтром размещения.
+    mixed = _llm_connection()
+    mixed.model_placement["openai/gpt-oss-120b"] = cloud_placement.PLACEMENT_EXTERNAL
+    assert _fill_combo(mixed, "") == ["google/gemma-3-27b-it"]
+
+
+def test_llm_combo_drops_unsuitable_saved_model():
+    """Поле постобработки и суммаризации не подставляет непригодную модель."""
+    from PySide6.QtWidgets import QComboBox
+
+    from voice_input_app.ui import MainWindow
+
+    _qt_app()
+    _reset_state()
+    conn = _llm_connection()
+    combo = QComboBox()
+    combo.setEditable(True)
+    MainWindow._fill_llm_model_combo(types.SimpleNamespace(), combo, conn, "BAAI/bge-m3")
+    items = sorted(combo.itemText(i) for i in range(combo.count()))
+    assert items == LLM_TYPES_EXPECTED, items
+    assert combo.currentText() == "", "непригодная модель осталась выбранной в поле"
+
+    # Пригодная модель подставляется как раньше.
+    MainWindow._fill_llm_model_combo(types.SimpleNamespace(), combo, conn, "openai/gpt-oss-120b")
+    assert combo.currentText() == "openai/gpt-oss-120b"
+
+
+def test_llm_runtime_gate_refuses_unsuitable_type():
+    """Сохранённая непригодная модель не получает текст расшифровки."""
+    from voice_input_app.ui import MainWindow
+
+    _reset_state()
+    conn = _llm_connection()
+    cfg = _cfg_with(conn)
+    cfg.postprocess_connection_id = conn.id
+    cfg.postprocess_model_id = "BAAI/bge-m3"       # внутренняя, но эмбеддинги
+    cfg.summary_connection_id = conn.id
+    cfg.summary_model_id = "openai/gpt-oss-120b"   # внутренняя text→text
+    fake = types.SimpleNamespace(cfg=cfg)
+    assert MainWindow._llm_model_hidden_by_placement(
+        fake, "postprocess_connection_id", "postprocess_model_id") == "BAAI/bge-m3"
+    assert MainWindow._llm_model_hidden_by_placement(
+        fake, "summary_connection_id", "summary_model_id") == ""
+
+
+def test_llm_type_filter_is_logged():
+    """Владелец должен видеть в журнале, сколько моделей отсеяно и почему."""
+    _reset_state()
+    records: list = []
+
+    class _Catcher(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Catcher()
+    logging.getLogger("voice_input.cloud_llm").addHandler(handler)
+    try:
+        _with_fake_models_endpoint(
+            LLM_TYPES_PAYLOAD,
+            lambda: cloud_llm.discover_chat_models("KEY", CLOUDRU_URL, use_cache=False),
+        )
+    finally:
+        logging.getLogger("voice_input.cloud_llm").removeHandler(handler)
+    line = [m for m in records if "TASK-387 llm list" in m]
+    assert line, f"в журнале нет строки об отборе по типу: {records}"
+    assert "skipped by service type 7" in line[0], line[0]
+
+
+def test_settings_restore_does_not_bypass_llm_filters():
+    """Восстановление настроек не возвращает в поле скрытую модель.
+
+    Дефект, найденный дымовым прогоном: _load_settings_into_ui заполнял поля
+    постобработки и суммаризации сохранённым id НАПРЯМУЮ, поэтому при каждом
+    запуске оба отбора (тип модели и размещение) оказывались обойдены.
+    """
+    src = _method_source(UI_PATH, "_load_settings_into_ui")
+    for combo in ("postprocess_model_combo", "summary_model_combo"):
+        assert f"self.{combo}.addItem" not in src, (
+            f"{combo} снова заполняется в обход _fill_llm_model_combo"
+        )
+        assert f"self.{combo}.setEditText" not in src, (
+            f"{combo} снова получает сохранённый id в обход отбора"
+        )
+    assert src.count("_fill_llm_model_combo") >= 2, (
+        "поля моделей текстовых функций больше не проходят общий отбор"
+    )
+
+
 # ---------- контракт: фильтр стоит чокпоинтом в реестре ----------
 
 
@@ -748,6 +962,15 @@ def _run():
         test_type_filter_keeps_llm_out_of_dictation_list,
         test_connection_dialog_gates_checkboxes,
         test_llm_combo_hides_external_and_drops_hidden_current,
+        test_llm_type_filter_six_cases,
+        test_llm_unknown_type_is_hidden,
+        test_llm_type_fallback_when_service_is_silent,
+        test_discover_chat_models_uses_service_type,
+        test_llm_type_and_placement_are_orthogonal,
+        test_llm_combo_drops_unsuitable_saved_model,
+        test_llm_runtime_gate_refuses_unsuitable_type,
+        test_llm_type_filter_is_logged,
+        test_settings_restore_does_not_bypass_llm_filters,
         test_registry_write_only_inside_checkpoint,
         test_set_cloud_models_cannot_bypass_filter,
         test_registry_fails_closed_without_connection,
