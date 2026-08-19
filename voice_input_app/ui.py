@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import autostart
+from . import cloud_placement
 from .audio_recorder import AudioRecorder, list_input_devices
 from .audio_files import SUPPORTED_AUDIO_EXTENSIONS, format_duration, is_supported_audio_file
 from . import __version__
@@ -285,6 +286,14 @@ class ConnectionDialog(QDialog):
         self._conn = connection
         self._discovered = list(connection.discovered_models) if connection else []
         self._check_worker = None
+        # US-073: признаки размещения моделей (metadata.provider) и их типы
+        # (metadata.type). Берутся из сохранённого подключения и обновляются
+        # ТОЛЬКО успешной проверкой соединения — иначе правка названия стирала
+        # бы сведения, по которым работает фильтр без обращения к сети.
+        self._placement = dict(getattr(connection, "model_placement", None) or {}) if connection else {}
+        self._model_types = dict(getattr(connection, "model_types", None) or {}) if connection else {}
+        self._reports_placement = bool(getattr(connection, "reports_model_placement", False)) if connection else False
+        self._placement_lost = False  # сервис перестал сообщать размещение (AC 7)
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -311,6 +320,25 @@ class ConnectionDialog(QDialog):
         self.key_edit.setEchoMode(QLineEdit.Password)
         self.key_edit.setPlaceholderText("sk-…")
         form.addRow("API Key", self.key_edit)
+
+        # US-073: фильтр внешних моделей. Включён по умолчанию — сотрудник не
+        # должен иметь возможности выбрать модель, при работе с которой данные
+        # уходят за пределы инфраструктуры Cloud.ru (152-ФЗ). Задаётся отдельно
+        # для каждого подключения (AC 4).
+        self.only_internal_check = QCheckBox("Показывать только модели, размещённые в Cloud.ru")
+        self.only_internal_check.setToolTip(
+            "Признак размещения приходит от самого сервиса (metadata.provider в списке моделей). "
+            "Пока флажок включён, модели со значением external не попадают ни в один список выбора."
+        )
+        self.only_internal_check.setChecked(
+            bool(getattr(connection, "only_internal_models", True)) if connection else True
+        )
+        self.only_internal_check.toggled.connect(self._update_safe_enabled)
+        form.addRow("", self.only_internal_check)
+        self.placement_hint = QLabel("")
+        self.placement_hint.setWordWrap(True)
+        self.placement_hint.setObjectName("Subtitle")
+        form.addRow("", self.placement_hint)
 
         # US-018 (per-connection): пометка безопасного внутреннего эндпоинта Cloud.ru.
         # Активна только если тип OpenAI-совместимый и Base URL содержит домен cloud.ru.
@@ -347,9 +375,32 @@ class ConnectionDialog(QDialog):
             self.url_edit.setText("https://api.openai.com/v1")
         self._update_safe_enabled()
 
+    def _fresh_reports_placement(self) -> bool:
+        """US-073: сообщал ли эндпоинт размещение в последнем ответе /v1/models."""
+        snap = cloud_placement.endpoint_snapshot(self.url_edit.text().strip())
+        return bool(snap and snap.reports_placement)
+
     def _update_safe_enabled(self) -> None:
         is_openai = self.type_combo.currentData() == CONNECTION_TYPE_OPENAI
-        ok = is_openai and host_is_cloudru(self.url_edit.text().strip())
+        # US-073 (AC 5): фильтр возможен только там, где сервис сообщает
+        # размещение моделей. Иначе флажок недоступен, а рядом — почему.
+        reports = bool(self._reports_placement) or self._fresh_reports_placement()
+        self.only_internal_check.setEnabled(is_openai and reports)
+        if is_openai and reports:
+            self.placement_hint.setText(
+                "Внешние модели этого подключения не попадут ни в один список выбора: диктовка, "
+                "расшифровка файлов, улучшение расшифровки, суммаризация, быстрый выбор в плашке."
+            )
+        else:
+            self.placement_hint.setText(
+                "Этот сервис не сообщает, где размещены модели, — отобрать внутренние невозможно. "
+                "Нажмите «Проверить соединение», чтобы обновить сведения. Предупреждение о передаче "
+                "данных провайдеру продолжает работать."
+            )
+        # US-073 (AC 8, пересматривает US-018): пометить эндпоинт безопасным
+        # можно только пока внешние модели действительно отсечены фильтром.
+        only_internal_on = self.only_internal_check.isChecked() and self.only_internal_check.isEnabled()
+        ok = is_openai and host_is_cloudru(self.url_edit.text().strip()) and only_internal_on
         self.safe_endpoint_check.setEnabled(ok)
         if not ok and self.safe_endpoint_check.isChecked():
             self.safe_endpoint_check.setChecked(False)
@@ -375,12 +426,53 @@ class ConnectionDialog(QDialog):
 
     def _on_test_result(self, ok: bool, message: str, models: list) -> None:
         self.test_btn.setEnabled(True)
-        if ok:
-            self._discovered = list(models or [])
-            extra = f" Найдено моделей: {len(self._discovered)}." if self._discovered else ""
-            self.status_label.setText(f"✓ Соединение успешно.{extra}")
-        else:
+        if not ok:
             self.status_label.setText(f"✗ {message}")
+            return
+        self._discovered = list(models or [])
+        extra = f" Найдено моделей: {len(self._discovered)}." if self._discovered else ""
+        note = self._absorb_placement_snapshot()
+        self.status_label.setText(f"✓ Соединение успешно.{extra}{note}")
+        self._update_safe_enabled()
+
+    def _absorb_placement_snapshot(self) -> str:
+        """US-073: забрать признаки размещения/типа из разбора ответа /v1/models.
+
+        Снимок наполняет discover (cloud_placement.remember_endpoint_models),
+        поэтому сигнатура воркера проверки соединения не менялась.
+
+        Если сервис ПЕРЕСТАЛ сообщать размещение — прежняя карта СОХРАНЯЕТСЯ,
+        а пользователю показывается предупреждение: список моделей не должен
+        молча расшириться внешними (AC 7).
+        """
+        snap = cloud_placement.endpoint_snapshot(self.url_edit.text().strip())
+        if snap is None:
+            return ""
+        if snap.types:
+            self._model_types.update(snap.types)
+        if snap.reports_placement:
+            self._placement = dict(snap.placement)
+            self._reports_placement = True
+            self._placement_lost = False
+            hidden = sum(
+                1 for m in self._discovered
+                if snap.placement.get(m) != cloud_placement.PLACEMENT_INTERNAL
+            )
+            tail = f" При включённом фильтре скрыто: {hidden}." if self.only_internal_check.isChecked() else ""
+            return (f" Внутренних моделей Cloud.ru: {snap.internal_count()}, "
+                    f"внешних: {snap.external_count()}.{tail}")
+        if self._reports_placement:
+            self._placement_lost = True
+            return (" ⚠ Сервис больше не сообщает размещение моделей. Прежний список внутренних "
+                    "моделей сохранён, новые модели скрыты — внешние модели не открываются молча.")
+        return " Сервис не сообщает размещение моделей — фильтр Cloud.ru недоступен."
+
+    def _apply_placement_to(self, conn) -> None:
+        """US-073: сохранить в подключение флажок и признаки размещения."""
+        conn.only_internal_models = bool(self.only_internal_check.isChecked())
+        conn.reports_model_placement = bool(self._reports_placement)
+        conn.model_placement = dict(self._placement)
+        conn.model_types = dict(self._model_types)
 
     def _on_accept(self) -> None:
         if not self.name_edit.text().strip():
@@ -402,9 +494,11 @@ class ConnectionDialog(QDialog):
             self._conn.base_url = url
             self._conn.api_key = key
             self._conn.discovered_models = list(self._discovered)
+            self._apply_placement_to(self._conn)  # US-073
             return self._conn
         c = CloudConnection(name=name, type=ctype, base_url=url, api_key=key)
         c.discovered_models = list(self._discovered)
+        self._apply_placement_to(c)  # US-073
         return c
 
 
@@ -1286,11 +1380,25 @@ class MainWindow(QMainWindow):
                 models = [m for m in (conn.discovered_models or []) if _is_text_io_model(m)]
             except Exception:  # noqa: BLE001
                 models = list(conn.discovered_models or [])
+            # US-073 (AC 3): улучшение расшифровки и суммаризация — тоже списки
+            # моделей подключения, внешние модели в них не показываем.
+            models, hidden = cloud_placement.filter_connection_models(conn, models)
+            if any(hidden.values()):
+                log.info("US-073: список LLM-моделей подключения %s — скрыто %s",
+                         getattr(conn, "id", "?"), hidden)
+        hidden_current = bool(
+            conn is not None and current and cloud_placement.connection_hidden_reason(conn, current)
+        )
         combo.blockSignals(True)
         combo.clear()
         for m in models:
             combo.addItem(m)
-        if current:
+        if hidden_current:
+            # US-073: сохранённая модель скрыта фильтром — не подставляем её в
+            # поле, иначе внешняя модель осталась бы выбранной в обход фильтра.
+            combo.setCurrentText("")
+            log.warning("US-073: модель %s скрыта фильтром подключения и не подставлена в список", current)
+        elif current:
             combo.setCurrentText(current)
         combo.blockSignals(False)
 
@@ -1304,7 +1412,22 @@ class MainWindow(QMainWindow):
             self._fill_llm_model_combo(self.postprocess_model_combo, conn, getattr(self.cfg, "postprocess_model_id", "") or "")
         if hasattr(self, "postprocess_warn_label"):
             need = bool(getattr(self, "postprocess_enabled_check", None) and self.postprocess_enabled_check.isChecked())
-            self.postprocess_warn_label.setVisible(need and conn is None)
+            # US-073: если сохранённая модель скрыта фильтром «только Cloud.ru»,
+            # её пропажа из списка не должна выглядеть случайностью.
+            hidden_model = ""
+            if conn is not None:
+                _saved = getattr(self.cfg, "postprocess_model_id", "") or ""
+                if _saved and cloud_placement.connection_hidden_reason(conn, _saved):
+                    hidden_model = _saved
+            if hidden_model:
+                self.postprocess_warn_label.setText(
+                    f"Модель «{hidden_model}» скрыта фильтром подключения "
+                    f"(размещена вне Cloud.ru). Выберите другую модель."
+                )
+                self.postprocess_warn_label.setVisible(True)
+            else:
+                self.postprocess_warn_label.setText("Заполните параметры подключения.")
+                self.postprocess_warn_label.setVisible(need and conn is None)
         if autosave:
             self.schedule_settings_autosave()
 
@@ -1368,6 +1491,14 @@ class MainWindow(QMainWindow):
             status = "Ключ задан" if c.api_key else "Нет ключа"
             if c.discovered_models:
                 status += f" · моделей: {len(c.discovered_models)}"
+                # US-073 (AC 9): сколько моделей скрыто фильтром — видно и в UI,
+                # и в журнале (см. ModelManager._log_cloud_registration).
+                _allowed, _hidden = cloud_placement.filter_connection_models(c, c.discovered_models)
+                _hidden_total = sum(_hidden.values())
+                if _hidden_total:
+                    status += f" · скрыто фильтром Cloud.ru: {_hidden_total}"
+            if getattr(c, "only_internal_models", False) and cloud_placement.connection_reports_placement(c):
+                status += " · только Cloud.ru"
             tbl.setItem(r, 2, QTableWidgetItem(status))
         if hasattr(self, "connections_empty_hint"):
             self.connections_empty_hint.setVisible(not conns)
@@ -2202,8 +2333,145 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             combo.setCurrentIndex(idx)
 
+    def _placement_hidden_reason(self, key: str) -> str:
+        """US-073: скрыта ли модель фильтром «только модели Cloud.ru».
+
+        "" — не скрыта (локальные модели, выключенный фильтр, подключение без
+        признака размещения); "external" — сервис сказал, что модель внешняя;
+        "unknown" — признака у модели нет, хотя сервис его сообщает (AC 7).
+        """
+        key = str(key or "")
+        if not is_cloud_model_key(key):
+            return ""
+        try:
+            from .models import cloud_model_id_of, resolve_cloud_connection
+            conn = resolve_cloud_connection(self.cfg, key)
+            return cloud_placement.connection_hidden_reason(conn, cloud_model_id_of(key))
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _cloud_model_label(self, key: str) -> str:
+        """US-073: читаемое имя облачной модели «Подключение — модель».
+
+        model_display_name для незарегистрированного ключа выводит средний
+        сегмент как провайдера, а с US-037 там лежит id подключения — служебная
+        строка, которую пользователю показывать нельзя.
+        """
+        try:
+            from .models import cloud_model_id_of, resolve_cloud_connection
+            model_id = cloud_model_id_of(key) or key
+            conn = resolve_cloud_connection(self.cfg, key)
+            name = getattr(conn, "name", "") if conn is not None else ""
+            return f"{name} — {model_id}" if name else model_id
+        except Exception:  # noqa: BLE001
+            return key
+
+    def _placement_hidden_message(self, key: str) -> str:
+        """US-073: текст для пользователя про модель, скрытую фильтром."""
+        reason = self._placement_hidden_reason(key)
+        if not reason:
+            return ""
+        try:
+            from .models import resolve_cloud_connection
+            conn = resolve_cloud_connection(self.cfg, key)
+        except Exception:  # noqa: BLE001
+            conn = None
+        name = getattr(conn, "name", "") or "облачное подключение"
+        why = ("размещена вне Cloud.ru" if reason == "external"
+               else "сервис не сообщает, где она размещена")
+        # Ключ модели содержит id подключения, поэтому общий model_display_name
+        # показал бы служебный идентификатор — берём id модели и имя подключения.
+        return (
+            f"Модель «{self._cloud_model_label(key)}» скрыта фильтром подключения «{name}»: {why}.\n\n"
+            "В подключении включён режим «Показывать только модели, размещённые в Cloud.ru», "
+            "поэтому расшифровка на этой модели не запускается.\n\n"
+            "Выберите другую модель или снимите флажок в карточке подключения "
+            "(вкладка «Модели» → «Облачные модели»)."
+        )
+
+    def _llm_model_hidden_by_placement(self, connection_attr: str, model_attr: str) -> str:
+        """US-073: скрыта ли фильтром модель LLM-функции (постобработка,
+        суммаризация). Возвращает id модели, если скрыта, иначе "".
+
+        Нужен потому, что сохранённый в настройках id модели переживает
+        включение фильтра: списки её уже не показывают, но сама функция без
+        этой проверки продолжила бы отправлять текст внешней модели.
+        """
+        try:
+            conn = self.cfg.connection_by_id(getattr(self.cfg, connection_attr, "") or "")
+            model_id = (getattr(self.cfg, model_attr, "") or "").strip()
+            if conn is None or not model_id:
+                return ""
+            return model_id if cloud_placement.connection_hidden_reason(conn, model_id) else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _open_cloud_connections_tab(self) -> None:
+        """US-073: открыть карточки облачных подключений (единственное место,
+        где снимается фильтр)."""
+        try:
+            show = getattr(self, "show_from_tray", None)
+            if callable(show):
+                show()
+            else:
+                self.show()
+            self.tabs.setCurrentIndex(2)  # 0 Диктовка,1 Файлы,2 Модели,3 Настройки
+            subtabs = getattr(self, "models_subtabs", None)
+            if subtabs is not None:
+                subtabs.setCurrentIndex(1)  # Облачные модели
+        except Exception:  # noqa: BLE001
+            log.exception("US-073: не удалось открыть вкладку облачных подключений")
+
+    def _show_placement_block_dialog(self, title: str, message: str) -> None:
+        """US-073 (AC 6): окно жёсткой блокировки. Обхода «продолжить всё
+        равно» здесь нет намеренно — снять фильтр можно только в карточке
+        подключения (решение владельца продукта)."""
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setIcon(QMessageBox.Warning)
+        box.setText(message)
+        open_btn = box.addButton("Открыть настройки", QMessageBox.ActionRole)
+        box.addButton("Закрыть", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            self._open_cloud_connections_tab()
+
+    def _notify_selected_model_hidden(self) -> None:
+        """US-073: сообщить, что выбранная модель попала под фильтр подключения
+        (в т.ч. после обновления программы, когда фильтр включился)."""
+        if getattr(self, "_placement_notice_shown", False):
+            return
+        message = self._placement_hidden_message(self.cfg.selected_model)
+        if not message:
+            return
+        self._placement_notice_shown = True
+        self._show_placement_block_dialog("Выбранная модель недоступна", message)
+
+    def _block_if_model_hidden_by_placement(self, key: str, action: str) -> bool:
+        """US-073 (AC 6): True — запуск запрещён, пользователю показано окно."""
+        message = self._placement_hidden_message(key)
+        if not message:
+            return False
+        log.warning("US-073: %s не запущена — модель %s скрыта фильтром подключения", action, key)
+        try:
+            self.status_label.setText(
+                "Выбранная модель скрыта фильтром подключения. Откройте карточку подключения."
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        self._show_placement_block_dialog("Модель скрыта фильтром подключения", message)
+        return True
+
     def ensure_selected_model_available(self) -> None:
         if self.models.is_available(self.cfg.selected_model):
+            return
+        # US-073: модель, скрытую фильтром подключения, НЕ подменяем молча на
+        # локальную — пользователь должен узнать, что его выбор заблокирован
+        # (решение владельца продукта: жёсткая блокировка + прямое сообщение).
+        if self._placement_hidden_reason(self.cfg.selected_model):
+            log.warning("US-073: выбранная модель %s скрыта фильтром подключения — выбор сохранён, "
+                        "запуск заблокирован", self.cfg.selected_model)
+            QTimer.singleShot(1400, self._notify_selected_model_hidden)
             return
         log.info("Selected model is unavailable; fallback to default: %s -> %s", self.cfg.selected_model, DEFAULT_MODEL_KEY)
         self.cfg.selected_model = DEFAULT_MODEL_KEY
@@ -2225,8 +2493,8 @@ class MainWindow(QMainWindow):
             item.setData(QIcon(), Qt.DecorationRole)
             std_model.appendRow(item)
 
-        def add_model_row(key: str, *, disabled: bool = False, suffix: str = "") -> None:
-            label = model_display_name(key) + suffix
+        def add_model_row(key: str, *, disabled: bool = False, suffix: str = "", label: str = "") -> None:
+            label = (label or model_display_name(key)) + suffix
             item = QStandardItem(label)
             item.setData(key, Qt.UserRole)
             if disabled:
@@ -2242,7 +2510,14 @@ class MainWindow(QMainWindow):
 
         # ── Облачные ──
         cloud_keys = self.models.cloud_model_keys()
-        if cloud_keys:
+        # US-073 (AC 6): выбранная модель, скрытая фильтром подключения, не
+        # исчезает молча — показываем её отдельной НЕДОСТУПНОЙ строкой, чтобы
+        # было видно, что именно выбрано и почему не запускается.
+        hidden_key = ""
+        _target = str(target_key or "")
+        if _target and _target not in cloud_keys and self._placement_hidden_reason(_target):
+            hidden_key = _target
+        if cloud_keys or hidden_key:
             add_header("── Облачные ──")
             for key in cloud_keys:
                 available = self.models.is_available(key)
@@ -2250,6 +2525,9 @@ class MainWindow(QMainWindow):
                     add_model_row(key)
                 else:
                     add_model_row(key, disabled=True, suffix=" (не настроено)")
+            if hidden_key:
+                add_model_row(hidden_key, disabled=True, suffix=" (скрыта фильтром подключения)",
+                              label=self._cloud_model_label(hidden_key))
 
         combo.setModel(std_model)
         # Восстановить выбор. Поиск по UserRole.
@@ -2265,20 +2543,31 @@ class MainWindow(QMainWindow):
 
         TASK-051 (US-017): file_model_combo теперь тоже с группами Локальные/Облачные.
         """
-        current = self.cfg.selected_model if self.models.is_available(self.cfg.selected_model) else DEFAULT_MODEL_KEY
+        # US-073: модель, скрытую фильтром подключения, оставляем текущей —
+        # в списке она показывается недоступной строкой, а запуск диктовки и
+        # расшифровки файла заблокирован с объяснением (AC 6).
+        current = (
+            self.cfg.selected_model
+            if (self.models.is_available(self.cfg.selected_model)
+                or self._placement_hidden_reason(self.cfg.selected_model))
+            else DEFAULT_MODEL_KEY
+        )
 
         # file_model_combo (файлы) — теперь с группами и cloud-моделями (US-017).
         # Поле для расшифровки файлов хранится в cfg.file_selected_model отдельно от диктовки.
         fcombo = getattr(self, "file_model_combo", None)
         if fcombo is not None:
             file_current = getattr(self.cfg, "file_selected_model", None) or current
-            if not self.models.is_available(file_current):
-                file_current = current if self.models.is_available(current) else DEFAULT_MODEL_KEY
+            if not self.models.is_available(file_current) and not self._placement_hidden_reason(file_current):
+                file_current = current if (self.models.is_available(current)
+                                           or self._placement_hidden_reason(current)) else DEFAULT_MODEL_KEY
             previous = file_current if force_current else (fcombo.currentData() or file_current)
+            _prev_ok = bool(previous) and (self.models.is_available(str(previous))
+                                           or bool(self._placement_hidden_reason(str(previous))))
             fcombo.blockSignals(True)
             self._populate_model_combo_with_groups(
                 fcombo,
-                target_key=str(previous) if (previous and self.models.is_available(str(previous))) else file_current,
+                target_key=str(previous) if _prev_ok else file_current,
             )
             fcombo.blockSignals(False)
 
@@ -2287,7 +2576,9 @@ class MainWindow(QMainWindow):
         if mcombo is not None:
             previous = current if force_current else (mcombo.currentData() or current)
             mcombo.blockSignals(True)
-            target_key = previous if (previous and self.models.is_available(str(previous))) else current
+            _prev_ok = bool(previous) and (self.models.is_available(str(previous))
+                                           or bool(self._placement_hidden_reason(str(previous))))
+            target_key = previous if _prev_ok else current
             self._populate_model_combo_with_groups(mcombo, target_key=str(target_key))
             mcombo.blockSignals(False)
 
@@ -2586,12 +2877,28 @@ class MainWindow(QMainWindow):
         }.get(provider, provider)
 
     def _endpoint_marked_safe(self, endpoint: str) -> bool:
-        """True, если пользователь пометил этот эндпоинт безопасным (и это cloud.ru)."""
+        """True, если пользователь пометил этот эндпоинт безопасным (и это cloud.ru).
+
+        US-073 (AC 8, пересматривает US-018): «безопасно» показывается только
+        пока внешние модели этого подключения действительно отсечены фильтром
+        «Показывать только модели, размещённые в Cloud.ru». Снят флажок —
+        возвращается обычное предупреждение о передаче данных провайдеру.
+        """
         norm = normalize_endpoint(endpoint)
         if not norm or not host_is_cloudru(endpoint):
             return False
         saved = {normalize_endpoint(e) for e in getattr(self.cfg, "cloud_internal_safe_endpoints", [])}
-        return norm in saved
+        if norm not in saved:
+            return False
+        for conn in (getattr(self.cfg, "cloud_connections", None) or []):
+            if normalize_endpoint(getattr(conn, "base_url", "")) != norm:
+                continue
+            if getattr(conn, "only_internal_models", False) and cloud_placement.connection_reports_placement(conn):
+                return True
+            log.info("US-073: эндпоинт %s помечен безопасным, но фильтр Cloud.ru не действует — "
+                     "показываем обычное предупреждение", norm)
+            return False
+        return True
 
     def _confirm_cloud_endpoint(self, label: str, endpoint: str, sess_prefix: str) -> bool:
         """US-018: показать нужное уведомление для конкретного облачного ЭНДПОИНТА.
@@ -3248,6 +3555,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Файл", "Формат файла пока не поддерживается. Выберите wav, mp3, m4a, mp4, webm, ogg или flac.")
             return
         key = str(self.file_model_combo.currentData() or self.cfg.file_selected_model or self.cfg.selected_model)
+        # US-073 (AC 6): скрытая фильтром модель не запускает расшифровку файла.
+        if self._block_if_model_hidden_by_placement(key, "расшифровка файла"):
+            return
         if not self.models.is_available(key):
             QMessageBox.information(self, "Модели", "Выбранная модель ещё не загружена. Сначала загрузите её во вкладке «Модели».")
             self.refresh_available_models_combo()
@@ -3940,6 +4250,12 @@ class MainWindow(QMainWindow):
             # v3.4: keep the shipped app stable. Live transcription is disabled
             # until a proper streaming pipeline is implemented.
             self.cfg.live_transcription = False
+            # US-073 (AC 6): модель, скрытая фильтром подключения, блокирует
+            # диктовку жёстко — без «продолжить всё равно» и без выключения
+            # фильтра отсюда. Проверка стоит ПЕРЕД общей проверкой доступности,
+            # иначе пользователь получил бы неверное «модель не загружена».
+            if self._block_if_model_hidden_by_placement(self.cfg.selected_model, "диктовка"):
+                return
             if not self.models.is_available(self.cfg.selected_model):
                 QMessageBox.information(self, "Модели", "Активная модель не загружена. Выберите загруженную модель во вкладке «Диктовка» или загрузите её во вкладке «Модели».")
                 self.ensure_selected_model_available()
@@ -4324,6 +4640,17 @@ class MainWindow(QMainWindow):
 
     def _start_dictation_postprocess(self, text: str, duration: float, wav_path: Path) -> None:
         """US-034: запустить постобработку текста диктовки облачной LLM."""
+        # US-073: модель, скрытая фильтром подключения, не получает текст
+        # расшифровки. Доставляем сырой текст тем же путём, что и при сбое LLM —
+        # пользователь видит «Постобработка недоступна», причина в журнале.
+        _hidden = self._llm_model_hidden_by_placement("postprocess_connection_id", "postprocess_model_id")
+        if _hidden:
+            log.warning("US-073: постобработка пропущена — модель %s скрыта фильтром подключения", _hidden)
+            self._on_dictation_postprocess_failed(
+                f"Модель «{_hidden}» скрыта фильтром подключения (размещена вне Cloud.ru)",
+                text, duration, wav_path,
+            )
+            return
         if self.cfg.overlay_enabled:
             self.overlay.show_processing("Улучшаю текст…")
         self.status_label.setText("Улучшаю текст через облачную LLM…")
@@ -4831,6 +5158,14 @@ class MainWindow(QMainWindow):
         mode = getattr(self.cfg, "summary_mode", "local") or "local"
         cloud_key = (getattr(self.cfg, "summary_api_key", "") or "").strip()
         if mode == "cloud" and cloud_key:
+            # US-073: скрытая фильтром модель текст не получает. Обрабатываем как
+            # недоступное облако — пользователю предлагается локальная модель.
+            _hidden = self._llm_model_hidden_by_placement("summary_connection_id", "summary_model_id")
+            if _hidden:
+                self._on_cloud_summary_failed(
+                    f"модель «{_hidden}» скрыта фильтром подключения (размещена вне Cloud.ru)"
+                )
+                return
             self.status_label.setText("Облачная суммаризация…")
             worker = SummarizeWorker(
                 text,
