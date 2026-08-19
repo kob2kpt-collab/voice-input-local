@@ -397,6 +397,37 @@ def test_hidden_selected_model_is_blocked():
     )
 
 
+def test_llm_functions_refuse_hidden_model():
+    """AC 2/AC 6 для облачных LLM-функций: сохранённая в настройках внешняя
+    модель не получает текст расшифровки, даже если списки её уже не показывают."""
+    from voice_input_app.ui import MainWindow
+
+    _reset_state()
+    conn = _cloudru_connection()
+    cfg = _cfg_with(conn)
+    cfg.postprocess_connection_id = conn.id
+    cfg.postprocess_model_id = "openai/gpt-oss-20b"   # внешняя
+    cfg.summary_connection_id = conn.id
+    cfg.summary_model_id = "openai/gpt-oss-120b"      # внутренняя
+    fake = types.SimpleNamespace(cfg=cfg)
+
+    hidden = MainWindow._llm_model_hidden_by_placement(fake, "postprocess_connection_id", "postprocess_model_id")
+    assert hidden == "openai/gpt-oss-20b", f"внешняя модель постобработки не распознана: {hidden!r}"
+    assert MainWindow._llm_model_hidden_by_placement(fake, "summary_connection_id", "summary_model_id") == "", (
+        "внутренняя модель суммаризации ошибочно объявлена скрытой"
+    )
+
+    # Флажок снят — прежнее поведение.
+    conn.only_internal_models = False
+    assert MainWindow._llm_model_hidden_by_placement(fake, "postprocess_connection_id", "postprocess_model_id") == ""
+
+    for method in ("_start_dictation_postprocess", "_dispatch_summary"):
+        src = _method_source(UI_PATH, method)
+        assert "_llm_model_hidden_by_placement" in src, (
+            f"{method} снова отправляет текст модели, скрытой фильтром"
+        )
+
+
 # ---------- AC 8: «безопасно» только при включённом фильтре ----------
 
 
@@ -639,6 +670,7 @@ def _run():
         test_lost_placement_signal_does_not_expand_list,
         test_migration_enables_filter_for_existing_connections,
         test_hidden_selected_model_is_blocked,
+        test_llm_functions_refuse_hidden_model,
         test_safe_endpoint_requires_filter,
         test_hidden_count_is_logged_per_connection,
         test_model_type_replaces_name_guess,

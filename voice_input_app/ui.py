@@ -2371,6 +2371,23 @@ class MainWindow(QMainWindow):
             "(вкладка «Модели» → «Облачные модели»)."
         )
 
+    def _llm_model_hidden_by_placement(self, connection_attr: str, model_attr: str) -> str:
+        """US-073: скрыта ли фильтром модель LLM-функции (постобработка,
+        суммаризация). Возвращает id модели, если скрыта, иначе "".
+
+        Нужен потому, что сохранённый в настройках id модели переживает
+        включение фильтра: списки её уже не показывают, но сама функция без
+        этой проверки продолжила бы отправлять текст внешней модели.
+        """
+        try:
+            conn = self.cfg.connection_by_id(getattr(self.cfg, connection_attr, "") or "")
+            model_id = (getattr(self.cfg, model_attr, "") or "").strip()
+            if conn is None or not model_id:
+                return ""
+            return model_id if cloud_placement.connection_hidden_reason(conn, model_id) else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _open_cloud_connections_tab(self) -> None:
         """US-073: открыть карточки облачных подключений (единственное место,
         где снимается фильтр)."""
@@ -4605,6 +4622,17 @@ class MainWindow(QMainWindow):
 
     def _start_dictation_postprocess(self, text: str, duration: float, wav_path: Path) -> None:
         """US-034: запустить постобработку текста диктовки облачной LLM."""
+        # US-073: модель, скрытая фильтром подключения, не получает текст
+        # расшифровки. Доставляем сырой текст тем же путём, что и при сбое LLM —
+        # пользователь видит «Постобработка недоступна», причина в журнале.
+        _hidden = self._llm_model_hidden_by_placement("postprocess_connection_id", "postprocess_model_id")
+        if _hidden:
+            log.warning("US-073: постобработка пропущена — модель %s скрыта фильтром подключения", _hidden)
+            self._on_dictation_postprocess_failed(
+                f"Модель «{_hidden}» скрыта фильтром подключения (размещена вне Cloud.ru)",
+                text, duration, wav_path,
+            )
+            return
         if self.cfg.overlay_enabled:
             self.overlay.show_processing("Улучшаю текст…")
         self.status_label.setText("Улучшаю текст через облачную LLM…")
@@ -5096,6 +5124,14 @@ class MainWindow(QMainWindow):
         mode = getattr(self.cfg, "summary_mode", "local") or "local"
         cloud_key = (getattr(self.cfg, "summary_api_key", "") or "").strip()
         if mode == "cloud" and cloud_key:
+            # US-073: скрытая фильтром модель текст не получает. Обрабатываем как
+            # недоступное облако — пользователю предлагается локальная модель.
+            _hidden = self._llm_model_hidden_by_placement("summary_connection_id", "summary_model_id")
+            if _hidden:
+                self._on_cloud_summary_failed(
+                    f"модель «{_hidden}» скрыта фильтром подключения (размещена вне Cloud.ru)"
+                )
+                return
             self.status_label.setText("Облачная суммаризация…")
             worker = SummarizeWorker(
                 text,
