@@ -66,7 +66,7 @@ Voice Input Local использует библиотеки с открытым 
 | PyYAML | 6.0.3 | MIT | https://pyyaml.org/ |
 | requests | 2.34.2 | Apache-2.0 | https://pypi.org/project/requests/ |
 | rich | 15.0.0 | MIT | https://pypi.org/project/rich/ |
-| setuptools | 82.0.1 | MIT | https://pypi.org/project/setuptools/ |
+| setuptools | 84.0.0 | MIT | https://pypi.org/project/setuptools/ |
 | shellingham | 1.5.4 | ISC License | https://github.com/sarugaku/shellingham |
 | shiboken6 | 6.11.1 | LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only | https://pypi.org/project/shiboken6/ |
 | sounddevice | 0.5.5 | MIT | https://pypi.org/project/sounddevice/ |

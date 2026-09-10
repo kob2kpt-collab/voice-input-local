@@ -9,7 +9,8 @@
 Проверяет:
 
 1. Замок существует, все версии закреплены `==` и у каждой есть хэш (AC 1).
-2. Всё, что просит requirements.txt, есть в замке (AC 1).
+2. Всё, что просит requirements.txt, есть в замке (AC 1), и сам замок читается
+   любым средством анализа состава — в нём только ASCII.
 3. install.ps1 ставит из замка с проверкой хэшей и НЕ откатывается на
    диапазоны молча (AC 2).
 4. В релизном сценарии закреплены версии Python и Inno Setup, а действия
@@ -95,6 +96,28 @@ def test_lock_covers_requirements():
     assert not missing, "в замке нет пакетов из requirements.txt: %s" % ", ".join(missing)
 
 
+def test_lock_is_ascii_only():
+    """Замок читают ЧУЖИЕ средства, а они декодируют его по локали.
+
+    pip_requirements_parser (его использует pip-audit) читает requirements-файл
+    в кодировке системы: под русской Windows это cp1251, и кириллица в
+    комментарии роняет анализатор UnicodeDecodeError. Мы обещали службе ИБ
+    ПРОВЕРЯЕМЫЙ состав — значит файл обязан читаться без PYTHONUTF8 и прочих
+    переменных окружения. Отсюда единственное место в проекте, где комментарии
+    пишутся по-английски.
+    """
+    raw = LOCKFILE.read_bytes()
+    non_ascii = sorted({b for b in raw if b > 127})
+    assert not non_ascii, (
+        "в замке есть не-ASCII байты %s — сторонние анализаторы состава не прочитают файл "
+        "на машине с не-UTF-8 локалью" % non_ascii[:8])
+    # И генератор не должен снова начать писать шапку по-русски.
+    generator = (REPO_ROOT / "scripts" / "make_lockfile.py").read_text(encoding="utf-8")
+    header = generator.split("lines = [", 1)[1].split("]", 1)[0]
+    bad = sorted({ch for ch in header if ord(ch) > 127})
+    assert not bad, "шапка замка в make_lockfile.py снова содержит не-ASCII: %s" % bad
+
+
 def test_install_uses_lock():
     """AC 2: установка из исходников даёт тот же состав, что и релиз."""
     src = INSTALL_PS1.read_text(encoding="utf-8")
@@ -175,6 +198,7 @@ def _run():
     tests = [
         test_lock_exists_and_is_pinned,
         test_lock_covers_requirements,
+        test_lock_is_ascii_only,
         test_install_uses_lock,
         test_workflow_pins_toolchain_and_actions,
         test_workflow_runs_tests_before_build,

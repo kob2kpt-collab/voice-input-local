@@ -15,12 +15,17 @@
    словаря остался (AC 6).
 3. Резервная копия настроек до переноса сохранена.
 4. Термины видны в таблице вкладки «Словарь».
-5. Повторный запуск не дублирует записи (AC 2).
-6. Подмена файла настроек чужим словарём не меняет словарь пользователя (AC 3).
+Повторный перенос (AC 2) и защита от подмены настроек (AC 3) проверяются на
+уровне хранилища в tests/test_us076_dictionary_file.py: там та же логика, но без
+Qt. ЗДЕСЬ окно строится РОВНО ОДИН раз. Раньше их было три, и процесс изредка
+падал уже ПОСЛЕ печати «ALL PASS» — у каждого окна остаются свои таймеры и
+стартовая проверка облака в отдельном потоке, а тест завершает процесс через
+os._exit. Случайное падение в релизном гейте хуже отсутствия проверки: оно
+блокирует выпуск без причины. Гасить таймеры и потоки руками пробовали — стало
+только хуже (сегфолт в 4 прогонах из 5), поэтому уменьшено само количество окон.
 
 Тест поднимает Qt в режиме offscreen на ВРЕМЕННОМ профиле, поэтому настройки и
-словарь пользователя не трогает. Идёт заметно дольше остальных (несколько
-десятков секунд): главное окно строится трижды.
+словарь пользователя не трогает.
 
 Запуск: python tests/test_us076_migration_e2e.py
 """
@@ -58,6 +63,10 @@ LEGACY_CONFIG = {
 EXPECTED_TERMS = ["Термин-один", "Термин-два"]
 
 
+# Окно теста: нужно на выходе, чтобы дождаться его потока предзагрузки.
+_WINDOWS: list = []
+
+
 def _dictionary() -> dict:
     return json.loads(DICTIONARY.read_text(encoding="utf-8"))
 
@@ -71,6 +80,7 @@ def test_migration_end_to_end():
 
     from PySide6.QtWidgets import QApplication
 
+    from voice_input_app import glossary
     from voice_input_app.ui import MainWindow
     from voice_input_app.ui_window_constraints import apply_patches
 
@@ -100,17 +110,40 @@ def test_migration_end_to_end():
     ]
     assert shown == EXPECTED_TERMS, shown
 
-    # 5. Повторный запуск не дублирует записи.
-    MainWindow()
+    # Повторный перенос и подмена настроек — на уровне хранилища, без второго
+    # окна: tests/test_us076_dictionary_file.py, test_migration_from_config и
+    # test_config_replacement_keeps_user_dictionary.
+    assert glossary.migrate_from_config() == 0, "повторный перенос сработал ещё раз"
     assert [e["term"] for e in _dictionary()["entries"]] == EXPECTED_TERMS, _dictionary()
 
-    # 6. Подложили чужой файл настроек со СВОИМ словарём — словарь остался нашим.
-    CONFIG.write_text(
-        json.dumps({"postprocess_glossary": [{"term": "Чужой-термин"}]}, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    MainWindow()
-    assert [e["term"] for e in _dictionary()["entries"]] == EXPECTED_TERMS, _dictionary()
+    _WINDOWS.append(window)
+
+
+def _wait_for_preload() -> None:
+    """Дождаться потока предзагрузки модели перед завершением процесса.
+
+    MainWindow при создании начинает готовить выбранную модель в отдельном
+    потоке (start_preload_selected_model). Whisper Small доступен из кэша
+    faster-whisper, поэтому в тесте реально грузится модель — нативным кодом
+    CTranslate2. Тест завершает процесс через os._exit, и если поток в этот
+    момент внутри загрузки, процесс падает: отдельные прогоны проходили, а под
+    scripts/run_tests.py (машина занята, попадание вероятнее) тест изредка
+    засчитывался упавшим уже ПОСЛЕ печати «ALL PASS».
+
+    Ждём ЕСТЕСТВЕННОГО конца потока и НИЧЕГО ему не делаем: попытка гасить его
+    quit()/wait() вместе с обходом таймеров окна давала сегфолт в четырёх
+    прогонах из пяти. Ожидание ограничено по времени — если модель почему-то
+    грузится дольше, тест всё равно завершится, просто с прежним риском.
+    """
+    for window in _WINDOWS:
+        worker = getattr(window, "preload_worker", None)
+        if worker is None:
+            continue
+        try:
+            if worker.isRunning():
+                worker.wait(60000)
+        except RuntimeError:
+            pass
 
 
 def _run():
@@ -122,6 +155,8 @@ def _run():
 
 if __name__ == "__main__":
     _run()
-    # Qt-приложение с трея/таймерами не всегда завершается само.
+    _wait_for_preload()
+    # Qt-приложение с треем и таймерами не всегда завершается само.
     sys.stdout.flush()
+    sys.stderr.flush()
     os._exit(0)
