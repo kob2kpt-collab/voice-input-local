@@ -20,10 +20,14 @@ av>=12.0
 #   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 # The app works without it — summarization will be unavailable.
 
-# API server (API-01..04)
-fastapi>=0.111
-uvicorn>=0.29
-python-multipart>=0.0.9
+# API server (API-01..04) — ВЫКЛЮЧЕН в поставке (US-086, решение владельца 10.09.2026).
+# Рубильник: voice_input_app/features.py, API_SERVER_ENABLED = False. Код api_server.py
+# сохранён ради будущего серверного режима (US-087); зависимости не ставятся и вырезаны
+# из exe (build_exe.bat: --exclude-module).
+# Возврат: раскомментировать три строки ниже, снять --exclude-module, включить рубильник.
+# fastapi>=0.111
+# uvicorn>=0.29
+# python-multipart>=0.0.9
 
 # Cloud STT (US-015, US-016, US-032): OpenAI-compatible API + ElevenLabs
 requests>=2.31

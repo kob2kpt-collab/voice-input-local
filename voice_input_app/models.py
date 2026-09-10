@@ -25,6 +25,7 @@ except Exception:
     pass
 
 from . import cloud_placement
+from . import policy
 from .config import AppConfig
 from .logger import get_logger
 from .paths import models_dir
@@ -622,7 +623,10 @@ class ModelManager:
                 base = cloud_placement.elevenlabs_endpoint_key()
             cloud_placement.set_endpoint_policy(
                 base,
-                only_internal=bool(getattr(conn, "only_internal_models", False)),
+                # US-088: действующее значение, а не поле подключения — иначе
+                # discover-функции расширяли бы промежуточные списки внешними
+                # моделями там, где фильтр включён машинной политикой.
+                only_internal=cloud_placement.connection_only_internal(conn),
                 reports=cloud_placement.connection_reports_placement(conn),
             )
         for conn in connections:
@@ -706,13 +710,15 @@ class ModelManager:
         unknown = int(skipped.get("unknown", 0))
         non_stt = int(skipped.get("non-stt", 0))
         no_conn = int(skipped.get("no-connection", 0))
+        # US-088: отказы по машинной политике администратора.
+        by_policy = int(skipped.get("policy-cloud", 0)) + int(skipped.get("policy-endpoint", 0))
         log.info(
             "US-073 registry: connection %r (%s) — available %d, hidden by Cloud.ru filter %d "
             "(external %d, placement unknown %d), skipped as non-STT %d, "
-            "rejected without connection %d",
+            "rejected without connection %d, rejected by machine policy %d",
             getattr(conn, "name", "") or getattr(conn, "id", "?"),
             getattr(conn, "id", "?"), registered, external + unknown, external, unknown,
-            non_stt, no_conn,
+            non_stt, no_conn, by_policy,
         )
 
     def _register_cloud_model(self, connection_id: str, conn_type: str, model_id: str) -> str:
@@ -726,13 +732,25 @@ class ModelManager:
         через этот метод, значит внешняя модель не может попасть в списки в
         обход фильтра. Не переносить эти проверки в вызывающий код.
 
+        US-088: здесь же применяются машинные политики администратора
+        (DisableCloud, AllowedEndpoints). Тот же довод, что и у US-073: чокпоинт
+        один, поэтому новый путь регистрации не может открыть облако мимо
+        политики по забывчивости. ForceInternalModelsOnly действует ниже — через
+        cloud_placement.connection_only_internal.
+
         Возвращает "" — модель зарегистрирована; иначе причину отказа:
         "external"/"unknown" — фильтр размещения, "non-stt" — модель не
         распознаёт речь, "bad" — пустые аргументы или неизвестный тип,
-        "no-connection" — подключение не найдено (fail-closed, см. ниже).
+        "no-connection" — подключение не найдено (fail-closed, см. ниже),
+        "policy-cloud"/"policy-endpoint" — запрет машинной политикой (US-088).
         """
         if not model_id or not connection_id:
             return "bad"
+        if policy.cloud_disabled():
+            # US-088: облако запрещено администратором целиком. Проверка стоит
+            # ДО разбора подключения: запрет не зависит ни от адреса, ни от
+            # того, разрешилось ли подключение.
+            return "policy-cloud"
         if conn_type == "openai":
             engine = CLOUD_OPENAI_ENGINE
             display = "OpenAI"
@@ -764,6 +782,15 @@ class ModelManager:
                 connection_id, self._last_cfg is not None, model_id,
             )
             return "no-connection"
+        # US-088: белый список адресов администратора. Модель подключения,
+        # адрес которого вне списка, не регистрируется — значит её нельзя
+        # выбрать ни в диктовке, ни в расшифровке файла.
+        if not policy.endpoint_allowed(policy.connection_endpoint(conn)):
+            log.warning(
+                "US-088 registry: адрес %r подключения %s вне списка AllowedEndpoints — модель %r НЕ зарегистрирована",
+                policy.connection_endpoint(conn), connection_id, model_id,
+            )
+            return "policy-endpoint"
         # US-073: внешние модели (metadata.provider = external) в списки не попадают.
         reason = cloud_placement.connection_hidden_reason(conn, model_id)
         if reason:

@@ -1,20 +1,23 @@
 #define MyAppName "Voice Input Local"
 #define MyAppExeName "VoiceInputLocal.exe"
 #ifndef MyAppVersion
-#define MyAppVersion "4.21.0"
+#define MyAppVersion "4.22.0"
 #endif
 
 [Setup]
 AppId={{E2F24D29-1774-4F64-9A34-4D2B6E9F4C41}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-AppPublisher=Voice Input Local
+AppPublisher=АО «Телеофис»
+; US-090: лицензионные условия показываются в мастере установки.
+LicenseFile=..\LICENSE
 ; US-056: версия в метаданных установщика, иначе «Версия файла» = 0.0.0.0.
 ; {#MyAppVersion} должен быть числовым x.x.x (Inno дополнит до x.x.x.0).
 VersionInfoVersion={#MyAppVersion}
 VersionInfoProductVersion={#MyAppVersion}
 VersionInfoProductName={#MyAppName}
-VersionInfoCompany=Voice Input Local
+VersionInfoCompany=АО «Телеофис»
+VersionInfoCopyright=Copyright (C) 2026 АО «Телеофис»
 DefaultDirName={autopf}\VoiceInputLocal
 DefaultGroupName=Voice Input Local
 DisableProgramGroupPage=yes
@@ -39,6 +42,12 @@ Name: "desktopicon"; Description: "Создать ярлык на рабочем
 
 [Files]
 Source: "..\dist\VoiceInputLocal\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; US-090: лицензия, перечень чужих компонентов и полные тексты лицензий,
+; требующих приложения (LGPL/GPL), устанавливаются рядом с программой —
+; иначе условия распространения этих библиотек не соблюдены.
+Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
+Source: "..\THIRD-PARTY-LICENSES.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\Voice Input Local"; Filename: "{app}\{#MyAppExeName}"

@@ -1,5 +1,14 @@
 name: Build Windows Release
 
+# US-089: состав выпуска закреплён и проверяем.
+#   * действия закреплены по SHA коммита, а не по плавающему тегу v5 — тег
+#     можно передвинуть на другой код, SHA нельзя;
+#   * версии Python и Inno Setup заданы точно, а не «последняя»;
+#   * зависимости ставятся из requirements.lock.txt с проверкой хэшей;
+#   * тесты прогоняются ДО сборки: упали — выпуска не будет;
+#   * к выпуску прикладываются перечень состава (SBOM) и отчёт проверки
+#     зависимостей на известные уязвимости.
+
 on:
   push:
     tags:
@@ -8,25 +17,44 @@ on:
 permissions:
   contents: write
 
+env:
+  # Точные версии инструментов сборки: «latest» означал бы, что один и тот же
+  # тег, собранный через месяц, собран другим набором.
+  PYTHON_VERSION: "3.11.9"
+  # В пакете Chocolatey «innosetup» на 10.09.2026 старшая версия — 6.7.1
+  # (7.x там ещё нет). На машине разработчика стоит Inno Setup 7; скрипт
+  # installer\VoiceInputLocal.iss собирается обеими, но у выпуска должна быть
+  # ровно одна известная версия компилятора, поэтому она задана явно.
+  INNOSETUP_VERSION: "6.7.1"
+
 jobs:
   build-windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install Python dependencies
+      - name: Install pinned dependencies
         shell: cmd
         run: |
           python -m venv .venv
           .venv\Scripts\python.exe -m pip install --upgrade pip
-          .venv\Scripts\pip.exe install -r requirements.txt
+          .venv\Scripts\python.exe -m pip install --require-hashes -r requirements.lock.txt
+
+      - name: Run tests
+        shell: cmd
+        run: .venv\Scripts\python.exe scripts\run_tests.py
+
+      - name: Check that the lock matches requirements.txt
+        shell: cmd
+        continue-on-error: true
+        run: .venv\Scripts\python.exe scripts\make_lockfile.py --check
 
       - name: Build portable app
         shell: cmd
@@ -34,11 +62,38 @@ jobs:
 
       - name: Install Inno Setup
         shell: powershell
-        run: choco install innosetup --yes --no-progress
+        run: choco install innosetup --version=${{ env.INNOSETUP_VERSION }} --yes --no-progress --allow-downgrade
 
       - name: Build installer
         shell: cmd
         run: build_installer.bat
+
+      - name: Generate SBOM
+        shell: cmd
+        run: .venv\Scripts\python.exe scripts\make_sbom.py --output sbom-%GITHUB_REF_NAME%.json
+
+      - name: Audit dependencies for known vulnerabilities
+        shell: cmd
+        # Отчёт нужен службе информационной безопасности при согласовании
+        # выпуска, поэтому он прикладывается всегда. Найденная уязвимость в
+        # зависимости НЕ блокирует публикацию: решение «выпускать или нет»
+        # принимает человек по отчёту, иначе новая запись в базе CVE
+        # останавливала бы срочное исправление, к ней не относящееся.
+        continue-on-error: true
+        run: |
+          .venv\Scripts\python.exe -m pip install pip-audit
+          .venv\Scripts\python.exe -m pip_audit -r requirements.lock.txt --format json --output pip-audit-%GITHUB_REF_NAME%.json --progress-spinner off
+
+      - name: Upload build reports
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: release-reports
+          path: |
+            sbom-*.json
+            pip-audit-*.json
+            requirements.lock.txt
+          if-no-files-found: warn
 
       - name: Pack portable ZIP
         shell: powershell
@@ -53,4 +108,8 @@ jobs:
         run: |
           $version = "${env:GITHUB_REF_NAME}".TrimStart("v")
           $setup = Get-ChildItem -Path release -Filter "VoiceInputLocalSetup-*.exe" | Select-Object -First 1
-          gh release create "${env:GITHUB_REF_NAME}" $setup.FullName "VoiceInputLocal-portable-$version.zip" --title "Voice Input Local $version" --notes "Voice Input Local $version"
+          $files = @($setup.FullName, "VoiceInputLocal-portable-$version.zip")
+          foreach ($extra in @("sbom-${env:GITHUB_REF_NAME}.json", "pip-audit-${env:GITHUB_REF_NAME}.json", "requirements.lock.txt")) {
+            if (Test-Path -LiteralPath $extra) { $files += $extra }
+          }
+          gh release create "${env:GITHUB_REF_NAME}" $files --title "Voice Input Local $version" --notes "Voice Input Local $version"

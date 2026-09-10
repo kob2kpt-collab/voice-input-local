@@ -25,9 +25,21 @@ recordings/
 
 # Internal project management (not for public release)
 project-dashboard.html
+project-dashboard.bat
 project-data.json
 CLAUDE.md
 docs/testing/
 
 # Backups created during AI-assisted edits (see CLAUDE.md, incident 2026-05-24)
 *.bak
+
+# Отчёты, собираемые к выпуску (US-089): в репозитории не хранятся,
+# создаются скриптами и прикладываются к релизу как файлы выпуска.
+sbom*.json
+pip-audit*.json
+
+# Локальные настройки сессии Claude Code
+.claude/
+
+# PyInstaller перегенерирует спек каждой сборкой; источник истины — build_exe.bat
+VoiceInputLocal.spec

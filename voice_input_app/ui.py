@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -52,6 +53,9 @@ from .audio_recorder import AudioRecorder, list_input_devices
 from .audio_files import SUPPORTED_AUDIO_EXTENSIONS, format_duration, is_supported_audio_file
 from . import __version__
 from .config import AppConfig, CloudConnection, CONNECTION_TYPE_OPENAI, CONNECTION_TYPE_ELEVENLABS, DEFAULT_OPENAI_INITIAL_PROMPT, DEFAULT_POSTPROCESS_SYSTEM_PROMPT, DEFAULT_SUMMARY_SYSTEM_PROMPT
+from .features import API_SERVER_ENABLED
+from . import glossary as glossary_store
+from . import policy
 from .history import HistoryItem, HistoryStore
 from . import export as history_export
 from .hotkeys import VK_ESCAPE, HotkeyService, normalize_hotkey
@@ -68,7 +72,7 @@ from .cloud_security_dialog import (
     normalize_endpoint,
 )
 from .paths import app_icon_path, logs_dir, models_dir
-from .updater import UpdateInfo, launch_update_file, normalize_repo, updates_disabled_by_policy
+from .updater import UpdateInfo, launch_update_file, normalize_repo, repo_hint, updates_disabled_by_policy
 from . import busy_marker, update_signal
 from . import cloud_startup
 from .workers import CloudConnectionCheckWorker, ConnectionVerifyWorker, LlmConnectionCheckWorker, PostProcessWorker, DownloadWorker, FileProgress, FileTranscribeWorker, FileTranscriptBlock, MicrophoneAutodetectWorker, MicrophoneAutodetectResult, PreloadWorker, SummarizeWorker, TranscribeWorker, UpdateCheckWorker, UpdateDownloadWorker
@@ -92,6 +96,27 @@ QPushButton:disabled { background: #1f1f23; color: #71717a; border-color: #2b2b3
 QPushButton#Primary { background: #f4f4f5; color: #111113; font-weight: 700; }
 QPushButton#Primary:hover { background: #ffffff; }
 QPushButton#Primary:pressed { background: #d4d4d8; color: #111113; }
+/* US-084: кнопка обновления в шапке оформлена как пометка версии рядом с
+   названием — тот же кегль и тот же приглушённый цвет, без рамки и заливки.
+   Полноценная кнопка перетягивала на себя внимание в строке заголовка.
+   HeaderUpdate — состояние «есть новая версия»: тот же плоский вид, но
+   зелёный и полужирный, чтобы отличаться от обычной проверки. */
+QPushButton#HeaderLink {
+    background: transparent; border: none; border-radius: 0;
+    padding: 2px 4px; color: #a1a1aa; font-size: 14px; font-weight: 400;
+    text-align: left;
+}
+QPushButton#HeaderLink:hover { color: #e4e4e7; background: transparent; }
+QPushButton#HeaderLink:pressed { color: #ffffff; background: transparent; padding: 2px 4px; }
+QPushButton#HeaderLink:disabled { color: #52525b; background: transparent; border: none; }
+QPushButton#HeaderUpdate {
+    background: transparent; border: none; border-radius: 0;
+    padding: 2px 4px; color: #4ade80; font-size: 14px; font-weight: 700;
+    text-align: left;
+}
+QPushButton#HeaderUpdate:hover { color: #86efac; background: transparent; }
+QPushButton#HeaderUpdate:pressed { color: #22c55e; background: transparent; padding: 2px 4px; }
+QPushButton#HeaderUpdate:disabled { color: #52525b; background: transparent; border: none; }
 QPushButton#Danger { background: #451a1a; border-color: #7f1d1d; }
 QPushButton#Danger:hover { background: #5f2020; }
 QPushButton#Danger:pressed { background: #7f1d1d; }
@@ -271,6 +296,91 @@ class NoScrollSlider(QSlider):
         )
 
 
+class UpdateDialog(QDialog):
+    """US-084: экран обновления. Открывается ТОЛЬКО по кнопке в шапке.
+
+    Описание версии («Что нового») свёрнуто: пользователь запускает программу,
+    чтобы диктовать, и стена текста при обновлении ему не нужна — но прочитать
+    её должно быть можно в один клик. Свой диалог, а не QMessageBox с
+    setDetailedText: у того кнопка называется «Show Details...» и не
+    переводится без установленного переводчика Qt.
+    """
+
+    def __init__(self, parent, info) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Доступно обновление")
+        self.setModal(True)
+        self.setMinimumWidth(520)
+        self._info = info
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        head = QLabel("Voice Input Local %s" % info.latest_version)
+        head.setStyleSheet("font-size: 18px; font-weight: 700;")
+        layout.addWidget(head)
+
+        facts = QLabel(
+            "Установлена версия %s.\nФайл обновления: %s"
+            % (info.current_version, info.asset_name)
+        )
+        facts.setObjectName("Subtitle")
+        facts.setWordWrap(True)
+        layout.addWidget(facts)
+
+        notes = (info.release_notes or "").strip()
+        self.notes_btn = QToolButton()
+        self.notes_btn.setText("Что нового")
+        self.notes_btn.setCheckable(True)
+        self.notes_btn.setChecked(False)
+        self.notes_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.notes_btn.setArrowType(Qt.RightArrow)
+        self.notes_btn.setFocusPolicy(Qt.NoFocus)
+        self.notes_btn.setAutoRaise(True)
+        self.notes_view = QTextEdit()
+        self.notes_view.setReadOnly(True)
+        self.notes_view.setPlainText(notes or "Описание версии не приложено.")
+        self.notes_view.setMinimumHeight(180)
+        self.notes_view.setVisible(False)
+        self.notes_btn.toggled.connect(self._toggle_notes)
+        layout.addWidget(self.notes_btn)
+        layout.addWidget(self.notes_view)
+
+        buttons = QHBoxLayout()
+        later_btn = QPushButton("Позже")
+        later_btn.setFocusPolicy(Qt.NoFocus)
+        later_btn.setAutoDefault(False)
+        later_btn.clicked.connect(self.reject)
+        update_btn = QPushButton("Обновить")
+        update_btn.setObjectName("Primary")
+        update_btn.setFocusPolicy(Qt.NoFocus)
+        update_btn.setAutoDefault(False)
+        update_btn.clicked.connect(self.accept)
+        buttons.addStretch(1)
+        buttons.addWidget(later_btn)
+        buttons.addWidget(update_btn)
+        layout.addLayout(buttons)
+
+    def _toggle_notes(self, shown: bool) -> None:
+        self.notes_view.setVisible(shown)
+        self.notes_btn.setArrowType(Qt.DownArrow if shown else Qt.RightArrow)
+        self.adjustSize()
+
+
+class _PolicyEndpointProbe:
+    """US-088: минимальный объект «подключение» для проверки адреса политикой.
+
+    Нужен, чтобы спросить policy.connection_block_reason ДО того, как
+    CloudConnection создан: policy работает по утиной типизации (base_url/type).
+    """
+
+    __slots__ = ("type", "base_url")
+
+    def __init__(self, conn_type: str, base_url: str) -> None:
+        self.type = conn_type
+        self.base_url = base_url
+
+
 class ConnectionDialog(QDialog):
     """US-037: диалог создания/редактирования облачного подключения.
 
@@ -334,12 +444,23 @@ class ConnectionDialog(QDialog):
         self.only_internal_check.setChecked(
             bool(getattr(connection, "only_internal_models", True)) if connection else True
         )
+        # US-088: машинная политика ForceInternalModelsOnly важнее выбора
+        # пользователя. Флажок принимает её состояние и гаснет, рядом — пометка.
+        self._forced_only_internal = policy.force_internal_models_only()
+        if self._forced_only_internal is not None:
+            self.only_internal_check.setChecked(bool(self._forced_only_internal))
         self.only_internal_check.toggled.connect(self._update_safe_enabled)
         form.addRow("", self.only_internal_check)
         self.placement_hint = QLabel("")
         self.placement_hint.setWordWrap(True)
         self.placement_hint.setObjectName("Subtitle")
         form.addRow("", self.placement_hint)
+        # US-088: пометка о машинной политике — видно, почему флажок погашен.
+        self.policy_hint = QLabel("Управляется системным администратором.")
+        self.policy_hint.setWordWrap(True)
+        self.policy_hint.setObjectName("Subtitle")
+        self.policy_hint.setVisible(False)
+        form.addRow("", self.policy_hint)
 
         # US-018 (per-connection): пометка безопасного внутреннего эндпоинта Cloud.ru.
         # Активна только если тип OpenAI-совместимый и Base URL содержит домен cloud.ru.
@@ -386,7 +507,24 @@ class ConnectionDialog(QDialog):
         # US-073 (AC 5): фильтр возможен только там, где сервис сообщает
         # размещение моделей. Иначе флажок недоступен, а рядом — почему.
         reports = bool(self._reports_placement) or self._fresh_reports_placement()
-        self.only_internal_check.setEnabled(is_openai and reports)
+        # US-088: политика задана — состояние флажка принудительное и погашенное
+        # (AC 2), пользователь не может его снять или поставить.
+        forced = getattr(self, "_forced_only_internal", None)
+        if forced is not None:
+            self.only_internal_check.blockSignals(True)
+            self.only_internal_check.setChecked(bool(forced))
+            self.only_internal_check.blockSignals(False)
+            self.only_internal_check.setEnabled(False)
+        else:
+            self.only_internal_check.setEnabled(is_openai and reports)
+        if hasattr(self, "policy_hint"):
+            self.policy_hint.setVisible(forced is not None)
+            if forced is not None:
+                self.policy_hint.setText(
+                    "Фильтр внутренних моделей Cloud.ru "
+                    + ("включён" if forced else "выключен")
+                    + " системным администратором. Изменить его на этой машине нельзя."
+                )
         if is_openai and reports:
             self.placement_hint.setText(
                 "Внешние модели этого подключения не попадут ни в один список выбора: диктовка, "
@@ -481,6 +619,19 @@ class ConnectionDialog(QDialog):
             return
         if not self.key_edit.text().strip():
             self.status_label.setText("Введите API Key.")
+            return
+        # US-088 (AC 3, AC 4): подключение к запрещённому администратором адресу
+        # не создаётся вовсе. Проверка здесь, а не при сохранении настроек, —
+        # чтобы человек увидел причину сразу в том окне, где вводил адрес.
+        ctype = self.type_combo.currentData()
+        probe = _PolicyEndpointProbe(
+            ctype,
+            self.url_edit.text().strip() if ctype == CONNECTION_TYPE_OPENAI else "",
+        )
+        blocked = policy.connection_block_reason(probe)
+        if blocked:
+            self.status_label.setText(blocked)
+            log.warning("US-088: подключение не создано — %s", blocked)
             return
         self.accept()
 
@@ -635,7 +786,23 @@ class MainWindow(QMainWindow):
         if not self.app_icon.isNull():
             self.setWindowIcon(self.app_icon)
 
+        # US-076: словарь переезжает из config.json в отдельный файл ДО чтения
+        # настроек — поля postprocess_glossary в AppConfig больше нет, и после
+        # переноса ближайшее сохранение настроек уберёт ключ из config.json.
+        self._glossary_migrated = glossary_store.migrate_from_config()
         self.cfg = AppConfig.load()
+        # Словарь читается один раз при старте; таблица и сохранение работают
+        # с этим списком. Повреждённый файл не мешает запуску (AC 5) — причина
+        # показывается на вкладке «Словарь».
+        self._glossary_load = glossary_store.load()
+        self._glossary_entries = list(self._glossary_load.entries)
+        if self._glossary_migrated:
+            # AC 1: поля postprocess_glossary в AppConfig больше нет, поэтому
+            # сохранение перезаписывает config.json без него. Делаем это сразу
+            # после переноса, а не ждём первой правки настроек: иначе ключ мог
+            # бы месяцами лежать в файле и путать при разборе.
+            self.cfg.save()
+            log.info("US-076: словарь перенесён в отдельный файл, записей %d", self._glossary_migrated)
         self.history = HistoryStore()
         self.models = ModelManager()
         # US-015, US-016: построить реестр cloud-моделей из сохранённых ключей.
@@ -800,7 +967,16 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(900, self.maybe_start_first_microphone_autodetect)
         QTimer.singleShot(1500, self.start_initial_cloud_discover)  # TASK-045
         QTimer.singleShot(1800, lambda: self.check_for_updates(manual=False))
-        if self.cfg.api_enabled:
+        # US-084 (AC 4): обновление могло выйти, пока программа открыта. Тихая
+        # повторная проверка меняет кнопку в шапке без перезапуска. Таймер —
+        # АТРИБУТ окна: really_quit гасит таймеры обходом self.__dict__ (US-049).
+        self._update_recheck_timer = QTimer(self)
+        self._update_recheck_timer.setInterval(4 * 60 * 60 * 1000)  # 4 часа
+        self._update_recheck_timer.timeout.connect(lambda: self.check_for_updates(manual=False))
+        self._update_recheck_timer.start()
+        # US-086: рубильник поставки проверяется ПЕРВЫМ — настройка
+        # пользователя в config.json его не обходит.
+        if API_SERVER_ENABLED and self.cfg.api_enabled:
             QTimer.singleShot(2500, self._start_api_server)
 
         self.timer = QTimer(self)
@@ -827,7 +1003,27 @@ class MainWindow(QMainWindow):
         title.setToolTip(f"Версия установленной программы: v{__version__}")
         subtitle = QLabel("Локальный голосовой ввод для Windows: горячая клавиша, индикатор записи, модели, буфер обмена и история.")
         subtitle.setObjectName("Subtitle")
-        root.addWidget(title)
+        # US-084: кнопка обновления стоит рядом с номером версии — там, где
+        # человек и ищет ответ на вопрос «какая у меня версия и есть ли новее».
+        # Название и версия остаются ОДНИМ rich-text QLabel (иначе версия
+        # съезжает с базовой линии), в ряд добавляется только кнопка.
+        self.header_update_btn = QPushButton("Проверить обновление")
+        self.header_update_btn.setObjectName("HeaderLink")
+        self.header_update_btn.setProperty("originalText", "Проверить обновление")
+        self.header_update_btn.setCursor(Qt.PointingHandCursor)
+        # TASK-047: Space — часть горячей клавиши, кнопка не должна её ловить.
+        self.header_update_btn.setFocusPolicy(Qt.NoFocus)
+        self.header_update_btn.setAutoDefault(False)
+        self.header_update_btn.clicked.connect(self.on_header_update_clicked)
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(8)
+        header_row.addWidget(title)
+        # Кнопка идёт СРАЗУ за версией и читается как продолжение той же строки.
+        # У правого края окна плоский текст выглядел бы оторванным ярлыком.
+        header_row.addWidget(self.header_update_btn, 0, Qt.AlignBottom)
+        header_row.addStretch(1)
+        root.addLayout(header_row)
         root.addWidget(subtitle)
 
         status_row = QHBoxLayout()
@@ -852,7 +1048,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._models_tab(), "Модели")
         self.tabs.addTab(self._settings_tab(), "Настройки")
         self.tabs.addTab(self._dictionary_tab(), "Словарь")  # US-044
-        self.tabs.addTab(self._api_tab(), "API-Сервер")
+        # US-086: вкладка REST API не создаётся, пока функция выключена
+        # в поставке (сам _api_tab и его хелперы сохранены).
+        if API_SERVER_ENABLED:
+            self.tabs.addTab(self._api_tab(), "API-Сервер")
         self.tabs.addTab(self._history_tab(), "История")
         root.addWidget(self.tabs, 1)
         self.setCentralWidget(central)
@@ -1533,8 +1732,12 @@ class MainWindow(QMainWindow):
                 _hidden_total = sum(_hidden.values())
                 if _hidden_total:
                     status += f" · скрыто фильтром Cloud.ru: {_hidden_total}"
-            if getattr(c, "only_internal_models", False) and cloud_placement.connection_reports_placement(c):
+            if cloud_placement.connection_only_internal(c) and cloud_placement.connection_reports_placement(c):
                 status += " · только Cloud.ru"
+            # US-088 (AC 3): причина запрета видна прямо в списке подключений.
+            _policy_reason = policy.connection_block_reason(c)
+            if _policy_reason:
+                status = "Запрещено администратором · " + _policy_reason
             tbl.setItem(r, 2, QTableWidgetItem(status))
         if hasattr(self, "connections_empty_hint"):
             self.connections_empty_hint.setVisible(not conns)
@@ -1667,8 +1870,14 @@ class MainWindow(QMainWindow):
         self.hf_token_edit.setToolTip("Необязательный Hugging Face token для авторизованной загрузки моделей. Также можно использовать переменные HF_TOKEN или HUGGINGFACE_HUB_TOKEN.")
         self.updates_enabled_check = QCheckBox("Проверять обновления автоматически")
         self.update_repo_edit = QLineEdit()
-        self.update_repo_edit.setPlaceholderText("owner/repo, например your-org/voice-input-local")
-        self.update_repo_edit.setToolTip("Публичный GitHub-репозиторий с релизами приложения. Используется для централизованных обновлений.")
+        self.update_repo_edit.setPlaceholderText(
+            "https://github.com/your-org/voice-input-local или https://gitlab.corp.teleofis.ru/group/voice-input-local"
+        )
+        self.update_repo_edit.setToolTip(
+            "Ссылка на открытый репозиторий с выпусками приложения. Подходят GitHub и GitLab, "
+            "включая внутренний GitLab компании. Сервис определяется по домену ссылки. "
+            "Прежняя короткая запись owner/repo продолжает работать как GitHub."
+        )
         # US-047: пометка при централизованном отключении обновлений машинной политикой.
         self.updates_policy_label = QLabel("Обновлениями управляет системный администратор. Встроенная проверка обновлений отключена.")
         self.updates_policy_label.setObjectName("Subtitle")
@@ -1727,7 +1936,7 @@ class MainWindow(QMainWindow):
         form.addRow("Автозагрузка", self.autostart_check)
         form.addRow("Hugging Face token", self.hf_token_edit)
         form.addRow("Обновления", self.updates_enabled_check)
-        form.addRow("GitHub repo", self.update_repo_edit)
+        form.addRow("Ссылка на репозиторий", self.update_repo_edit)
         form.addRow("", self.updates_policy_label)
         microphone_row = QWidget()
         microphone_layout = QHBoxLayout(microphone_row)
@@ -1817,13 +2026,11 @@ class MainWindow(QMainWindow):
         logs_btn.clicked.connect(self.open_logs_folder)
         models_dir_btn = QPushButton("Открыть папку моделей")
         models_dir_btn.clicked.connect(self.open_models_folder)
-        self.check_updates_btn = QPushButton("Проверить обновления")
-        self.check_updates_btn.setProperty("originalText", "Проверить обновления")
-        self.check_updates_btn.clicked.connect(lambda: self.check_for_updates(manual=True))
+        # US-084: кнопка «Проверить обновление» переехала в шапку окна
+        # (self.header_update_btn) — здесь её больше нет.
         buttons.addWidget(self.autodetect_mic_btn)
         buttons.addWidget(logs_btn)
         buttons.addWidget(models_dir_btn)
-        buttons.addWidget(self.check_updates_btn)
         self._refresh_updates_policy_state()
         buttons.addStretch(1)
         layout.addLayout(buttons)
@@ -2265,10 +2472,13 @@ class MainWindow(QMainWindow):
             self.summary_reasoning_effort_combo.currentIndexChanged.connect(self.schedule_settings_autosave)
         # TASK-061 (US-017): реактивность опций таймкодов/диаризации к смене модели файла.
         self.file_model_combo.currentIndexChanged.connect(self._update_file_options_for_model)
-        self.api_enabled_check.stateChanged.connect(self.schedule_settings_autosave)
-        self.api_host_edit.editingFinished.connect(self.schedule_settings_autosave)
-        self.api_port_edit.editingFinished.connect(self.schedule_settings_autosave)
-        self.api_key_edit.editingFinished.connect(self.schedule_settings_autosave)
+        # US-086: при выключенном рубильнике вкладки «API-Сервер» нет,
+        # значит нет и её виджетов — иначе падение на старте.
+        if hasattr(self, "api_enabled_check"):
+            self.api_enabled_check.stateChanged.connect(self.schedule_settings_autosave)
+            self.api_host_edit.editingFinished.connect(self.schedule_settings_autosave)
+            self.api_port_edit.editingFinished.connect(self.schedule_settings_autosave)
+            self.api_key_edit.editingFinished.connect(self.schedule_settings_autosave)
         # Cloud STT (US-015, US-016, US-032). Изменение ключа/URL/модели
         # триггерит autosave + перестроение реестра cloud-моделей.
         if hasattr(self, "openai_stt_key_edit"):
@@ -2501,6 +2711,22 @@ class MainWindow(QMainWindow):
             return
         self._placement_notice_shown = True
         self._show_placement_block_dialog("Выбранная модель недоступна", message)
+
+    def _cloud_blocked_by_policy(self, endpoint: str) -> str:
+        """US-088: причина, по которой облачный адрес запрещён политикой.
+
+        "" — разрешено. Это UI-обёртка над policy: сам запрет действует на
+        чокпоинте регистрации моделей (models._register_cloud_model), здесь
+        только объяснение пользователю и отказ до отправки текста.
+        """
+        if policy.cloud_disabled():
+            return ("Облачные модели запрещены системным администратором. "
+                    "Доступны локальные модели.")
+        if not policy.endpoint_allowed(endpoint):
+            shown = endpoint or "(адрес не задан)"
+            return (f"Адрес {shown} не входит в список адресов, "
+                    "разрешённых системным администратором.")
+        return ""
 
     def _block_if_model_hidden_by_placement(self, key: str, action: str) -> bool:
         """US-073 (AC 6): True — запуск запрещён, пользователю показано окно."""
@@ -2964,6 +3190,18 @@ class MainWindow(QMainWindow):
         подавляется в рамках сессии. Безопасность привязана к ЭНДПОИНТУ
         (base_url подключения), а не к провайдеру — работает per-connection.
         """
+        # US-088: машинная политика проверяется ПЕРВОЙ и не подавляется
+        # сессионными подтверждениями US-018: подтверждение пользователя не
+        # может открыть то, что запретил администратор.
+        blocked = self._cloud_blocked_by_policy(endpoint)
+        if blocked:
+            log.warning("US-088: переход на облако запрещён политикой — %s", blocked)
+            try:
+                self.status_label.setText(blocked)
+            except Exception:  # noqa: BLE001
+                pass
+            self._show_placement_block_dialog("Облачные модели запрещены администратором", blocked)
+            return False
         sess_key = f"{sess_prefix}|{normalize_endpoint(endpoint)}"
         if self._endpoint_marked_safe(endpoint):
             if sess_key not in self._cloud_safe_confirmed_session:
@@ -3897,9 +4135,22 @@ class MainWindow(QMainWindow):
         self.cfg.audio_input_device_id = str(self.microphone_combo.currentData() or "")
         self.cfg.hf_token = self.hf_token_edit.text().strip()
         self.cfg.updates_enabled = self.updates_enabled_check.isChecked()
-        self.cfg.update_repo = normalize_repo(self.update_repo_edit.text())
-        if self.update_repo_edit.text().strip() and self.update_repo_edit.text().strip() != self.cfg.update_repo:
+        # US-078: ссылка на репозиторий выпусков (GitHub или GitLab).
+        _repo_text = self.update_repo_edit.text().strip()
+        _repo_norm = normalize_repo(_repo_text)
+        if not _repo_text:
+            self.cfg.update_repo = ""
+        elif _repo_norm:
+            self.cfg.update_repo = _repo_norm
+            if _repo_text != _repo_norm:
+                self.update_repo_edit.setText(_repo_norm)
+        else:
+            # AC 6: ссылку не распознали — прежнее значение сохраняется, поле
+            # возвращается к нему, причина видна в статусной строке. Молча
+            # обнулять настройку нельзя: обновления перестали бы приходить.
+            log.warning("US-078: ссылка на репозиторий не распознана: %r", _repo_text)
             self.update_repo_edit.setText(self.cfg.update_repo)
+            self.status_label.setText(repo_hint(_repo_text))
         if hasattr(self, "file_stable_timestamps_check"):
             self.cfg.file_stable_timestamps_enabled = self.file_stable_timestamps_check.isChecked()
             self.cfg.file_diarization_enabled = self.file_diarization_check.isChecked()
@@ -4029,9 +4280,19 @@ class MainWindow(QMainWindow):
                 # сессионные подтверждения, чтобы предупреждение показалось снова.
                 self._cloud_warned_session = {k for k in self._cloud_warned_session if not k.startswith("postprocess|")}
                 self._cloud_safe_confirmed_session = {k for k in self._cloud_safe_confirmed_session if not k.startswith("postprocess|")}
-        # US-044: словарь терминов постобработки (данные из таблицы вкладки «Словарь»).
+        # US-044/US-076: словарь терминов лежит в своём файле, а не в настройках.
+        # Пишем только при РЕАЛЬНОМ изменении: сохранение настроек случается
+        # часто (автосохранение по каждому полю), а лишний раз трогать
+        # пользовательские данные незачем.
         if hasattr(self, "dictionary_table"):
-            self.cfg.postprocess_glossary = self._collect_dictionary_from_table()
+            _entries = self._collect_dictionary_from_table()
+            if _entries != getattr(self, "_glossary_entries", None):
+                self._glossary_entries = _entries
+                try:
+                    glossary_store.save(_entries)
+                except OSError as exc:
+                    log.warning("US-076: не удалось сохранить словарь: %s", exc)
+                    self.status_label.setText("Не удалось сохранить словарь: %s" % exc)
         # US-046: мастер-тумблер словаря.
         if hasattr(self, "postprocess_glossary_enabled_check"):
             self.cfg.postprocess_glossary_enabled = self.postprocess_glossary_enabled_check.isChecked()
@@ -4076,26 +4337,100 @@ class MainWindow(QMainWindow):
 
 
     def _update_repo_ready(self, manual: bool) -> str:
-        repo = normalize_repo(self.update_repo_edit.text() if hasattr(self, "update_repo_edit") else self.cfg.update_repo)
+        raw = self.update_repo_edit.text() if hasattr(self, "update_repo_edit") else self.cfg.update_repo
+        repo = normalize_repo(raw) or normalize_repo(self.cfg.update_repo)
         if not repo:
             if manual:
-                QMessageBox.information(
-                    self,
-                    "Обновления",
-                    "Укажите GitHub repo в настройках в формате owner/repo. Например: your-org/voice-input-local.",
-                )
+                QMessageBox.information(self, "Обновления", repo_hint(raw))
             return ""
         return repo
+
+    def _refresh_header_update_button(self) -> None:
+        """US-084: привести кнопку в шапке к текущему состоянию.
+
+        Есть найденное обновление — «Обновить до X» заметным стилем; нет —
+        обычная «Проверить обновление». Метод вызывается и после проверки, и
+        после отказа от обновления, поэтому кнопка не «залипает» ни в одном
+        из состояний (AC 3, AC 4, AC 7).
+        """
+        btn = getattr(self, "header_update_btn", None)
+        if btn is None:
+            return
+        info = getattr(self, "pending_update_info", None)
+        btn.setEnabled(True)
+        if info is not None:
+            text = "Обновить до %s" % info.latest_version
+            btn.setProperty("originalText", text)
+            btn.setText(text)
+            btn.setObjectName("HeaderUpdate")
+            btn.setToolTip("Доступна версия %s. Нажмите, чтобы посмотреть описание и обновиться." % info.latest_version)
+        else:
+            btn.setProperty("originalText", "Проверить обновление")
+            btn.setText("Проверить обновление")
+            btn.setObjectName("HeaderLink")
+            btn.setToolTip("Проверить, вышла ли новая версия программы.")
+        btn.setStyleSheet("")
+        # Смена objectName требует пересборки стиля — иначе QSS #Primary не применится.
+        btn.style().unpolish(btn)
+        btn.style().polish(btn)
+
+    def _set_header_link_busy(self, text: str) -> None:
+        """US-084: «Проверяю…»/«Скачиваю…» в шапке — текстом, без заливки.
+
+        Общие _set_button_busy/_flash_button_state красят фон и рамку, и кнопка
+        в шапке на секунду снова становилась кнопкой. Здесь меняется только
+        цвет текста, поэтому строка заголовка не «дёргается».
+        """
+        btn = getattr(self, "header_update_btn", None)
+        if btn is None:
+            return
+        btn.setEnabled(False)
+        btn.setText(text)
+        btn.setStyleSheet("color: #93c5fd;")
+
+    def _flash_header_link(self, text: str, color: str, seconds: int = 4) -> None:
+        """US-084: короткое сообщение в шапке, затем возврат к обычному виду."""
+        btn = getattr(self, "header_update_btn", None)
+        if btn is None:
+            return
+        btn.setEnabled(True)
+        btn.setText(text)
+        btn.setStyleSheet("color: %s;" % color)
+        QTimer.singleShot(max(1, seconds) * 1000, self._refresh_header_update_button)
+
+    def on_header_update_clicked(self) -> None:
+        """US-084 (AC 5): экран обновления открывается только по этой кнопке."""
+        info = getattr(self, "pending_update_info", None)
+        if info is not None:
+            self.open_update_dialog(info)
+            return
+        self.check_for_updates(manual=True)
+
+    def open_update_dialog(self, info) -> None:
+        """US-084 (AC 6, AC 7): показать экран обновления. Отказ ничего не ломает."""
+        dialog = UpdateDialog(self, info)
+        if dialog.exec() == QDialog.Accepted:
+            self.download_update(info)
+            return
+        # Отказ: обновление остаётся доступным, кнопка в шапке никуда не девается.
+        log.info("US-084: пользователь отложил обновление до %s", info.latest_version)
+        self.status_label.setText("Обновление отложено. Кнопка «Обновить» останется в шапке.")
+        self._refresh_header_update_button()
 
     def _refresh_updates_policy_state(self) -> None:
         # US-047: машинная политика (HKLM\SOFTWARE\Policies\VoiceInputLocal)
         # централизованно отключает встроенный апдейтер с приоритетом над
         # пользовательской настройкой. Блокируем контролы и показываем пометку.
         disabled = updates_disabled_by_policy()
-        for name in ("updates_enabled_check", "update_repo_edit", "check_updates_btn"):
+        for name in ("updates_enabled_check", "update_repo_edit"):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.setEnabled(not disabled)
+        # US-084 (AC 8): при машинной политике кнопки в шапке нет ВООБЩЕ —
+        # погашенная кнопка выглядела бы как поломка, а не как решение ИТ.
+        header_btn = getattr(self, "header_update_btn", None)
+        if header_btn is not None:
+            header_btn.setVisible(not disabled)
         label = getattr(self, "updates_policy_label", None)
         if label is not None:
             label.setVisible(disabled)
@@ -4119,8 +4454,8 @@ class MainWindow(QMainWindow):
             if manual:
                 self.status_label.setText("Проверка обновлений уже выполняется…")
             return
-        if hasattr(self, "check_updates_btn") and manual:
-            self._set_button_busy(self.check_updates_btn, "Проверяю…")
+        if hasattr(self, "header_update_btn") and manual:
+            self._set_header_link_busy("Проверяю…")
         self.status_label.setText("Проверяю обновления…")
         log.info("Update check started: repo=%s current=%s manual=%s", repo, __version__, manual)
         self.update_check_worker = UpdateCheckWorker(repo, __version__)
@@ -4132,47 +4467,40 @@ class MainWindow(QMainWindow):
         self.cfg.last_update_check_ts = time.time()
         self.cfg.save()
         if info is None:
+            self.pending_update_info = None
             self.status_label.setText("Установлена последняя версия." if manual else "Готово")
-            if manual and hasattr(self, "check_updates_btn"):
-                self._flash_button_state(self.check_updates_btn, "Обновлений нет ✓", kind="success", seconds=4)
+            if manual and hasattr(self, "header_update_btn"):
+                self._flash_header_link("Обновлений нет ✓", "#4ade80")
             return
         if not isinstance(info, UpdateInfo):
             self.status_label.setText("Неожиданный ответ проверки обновлений.")
-            if manual and hasattr(self, "check_updates_btn"):
-                self._flash_button_state(self.check_updates_btn, "Ошибка", kind="error", seconds=4)
+            if manual and hasattr(self, "header_update_btn"):
+                self._flash_header_link("Ошибка", "#f87171")
             return
+        # US-084 (AC 1, AC 3, AC 4): найденное обновление НЕ открывает экран
+        # само — оно только меняет кнопку в шапке. Это работает одинаково для
+        # проверки при запуске и для повторной проверки во время работы.
         self.pending_update_info = info
-        self.status_label.setText(f"Доступна версия {info.latest_version}.")
-        if hasattr(self, "check_updates_btn"):
-            self._flash_button_state(self.check_updates_btn, f"Доступна {info.latest_version}", kind="info", seconds=4)
-        notes = info.release_notes.strip()
-        if len(notes) > 900:
-            notes = notes[:900].rstrip() + "…"
-        message = (
-            f"Доступна новая версия Voice Input Local {info.latest_version}.\n"
-            f"Текущая версия: {info.current_version}.\n\n"
-            f"Файл: {info.asset_name}\n\n"
-            "Скачать и запустить обновление сейчас?"
-        )
-        if notes:
-            message += f"\n\nОписание релиза:\n{notes}"
-        answer = QMessageBox.question(self, "Обновление доступно", message, QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-        if answer == QMessageBox.Yes:
-            self.download_update(info)
+        self.status_label.setText("Доступна версия %s. Нажмите «Обновить» в шапке окна." % info.latest_version)
+        self._refresh_header_update_button()
+        if manual:
+            # Ручную проверку человек только что нажал — показываем экран сразу,
+            # иначе нажатие выглядело бы безрезультатным.
+            self.open_update_dialog(info)
 
     def on_update_check_failed(self, detail: str, *, manual: bool) -> None:
         log.error("Update check failed detail: %s", detail)
         self.status_label.setText("Не удалось проверить обновления.")
-        if manual and hasattr(self, "check_updates_btn"):
-            self._flash_button_state(self.check_updates_btn, "Ошибка проверки", kind="error", seconds=5)
+        if manual and hasattr(self, "header_update_btn"):
+            self._flash_header_link("Ошибка проверки", "#f87171", seconds=5)
             QMessageBox.warning(self, "Обновления", detail)
 
     def download_update(self, info: UpdateInfo) -> None:
         if self.update_download_worker and self.update_download_worker.isRunning():
             self.status_label.setText("Обновление уже скачивается…")
             return
-        if hasattr(self, "check_updates_btn"):
-            self._set_button_busy(self.check_updates_btn, "Скачиваю…")
+        if hasattr(self, "header_update_btn"):
+            self._set_header_link_busy("Скачиваю…")
         self.status_label.setText(f"Скачиваю обновление {info.latest_version}…")
         self.update_download_worker = UpdateDownloadWorker(info)
         self.update_download_worker.progress.connect(self.on_update_download_progress)
@@ -4184,15 +4512,15 @@ class MainWindow(QMainWindow):
         if total > 0:
             percent = int(max(0, min(100, done * 100 / total)))
             self.status_label.setText(f"Скачиваю обновление… {percent}%")
-            if hasattr(self, "check_updates_btn"):
-                self.check_updates_btn.setText(f"Скачиваю… {percent}%")
+            if hasattr(self, "header_update_btn"):
+                self.header_update_btn.setText("Скачиваю… %d%%" % percent)
         else:
             self.status_label.setText(f"Скачиваю обновление… {done // (1024 * 1024)} МБ")
 
     def on_update_download_done(self, path: str, info: UpdateInfo) -> None:
         self.status_label.setText("Обновление скачано.")
-        if hasattr(self, "check_updates_btn"):
-            self._flash_button_state(self.check_updates_btn, "Скачано ✓", kind="success", seconds=4)
+        if hasattr(self, "header_update_btn"):
+            self._flash_header_link("Скачано ✓", "#4ade80")
         if info.is_installer:
             answer = QMessageBox.question(
                 self,
@@ -4217,8 +4545,8 @@ class MainWindow(QMainWindow):
     def on_update_download_failed(self, detail: str) -> None:
         log.error("Update download failed detail: %s", detail)
         self.status_label.setText("Не удалось скачать обновление.")
-        if hasattr(self, "check_updates_btn"):
-            self._flash_button_state(self.check_updates_btn, "Ошибка скачивания", kind="error", seconds=5)
+        if hasattr(self, "header_update_btn"):
+            self._flash_header_link("Ошибка скачивания", "#f87171", seconds=5)
         QMessageBox.warning(self, "Обновления", detail)
 
 
@@ -4698,6 +5026,12 @@ class MainWindow(QMainWindow):
         # US-073: модель, скрытая фильтром подключения, не получает текст
         # расшифровки. Доставляем сырой текст тем же путём, что и при сбое LLM —
         # пользователь видит «Постобработка недоступна», причина в журнале.
+        # US-088: облако запрещено политикой — текст никуда не уходит.
+        _blocked = self._cloud_blocked_by_policy(getattr(self.cfg, "postprocess_base_url", "") or "")
+        if _blocked:
+            log.warning("US-088: постобработка пропущена — %s", _blocked)
+            self._on_dictation_postprocess_failed(_blocked, text, duration, wav_path)
+            return
         _hidden = self._llm_model_hidden_by_placement("postprocess_connection_id", "postprocess_model_id")
         if _hidden:
             log.warning("US-073: постобработка пропущена — модель %s скрыта фильтром подключения", _hidden)
@@ -5214,6 +5548,13 @@ class MainWindow(QMainWindow):
         mode = getattr(self.cfg, "summary_mode", "local") or "local"
         cloud_key = (getattr(self.cfg, "summary_api_key", "") or "").strip()
         if mode == "cloud" and cloud_key:
+            # US-088: облако запрещено политикой — предлагаем локальную модель
+            # тем же путём, что и при сбое облака (решение принимает человек).
+            _blocked = self._cloud_blocked_by_policy(getattr(self.cfg, "summary_base_url", "") or "")
+            if _blocked:
+                log.warning("US-088: облачная суммаризация запрещена — %s", _blocked)
+                self._on_cloud_summary_failed(_blocked)
+                return
             # US-073: скрытая фильтром модель текст не получает. Обрабатываем как
             # недоступное облако — пользователю предлагается локальная модель.
             _hidden = self._llm_model_hidden_by_placement("summary_connection_id", "summary_model_id")
@@ -5390,6 +5731,10 @@ class MainWindow(QMainWindow):
 
     def _start_api_server(self) -> None:
         """Start the REST API server if enabled (API-01..04)."""
+        # US-086: второй гейт — сюда нельзя попасть мимо рубильника,
+        # даже если кто-то добавит новый вызов метода.
+        if not API_SERVER_ENABLED:
+            return
         missing: list[str] = []
         for pkg in ("fastapi", "uvicorn", "multipart"):
             try:
@@ -5783,23 +6128,102 @@ class MainWindow(QMainWindow):
         del_btn.setFocusPolicy(Qt.NoFocus)
         del_btn.setAutoDefault(False)
         del_btn.clicked.connect(self._on_dictionary_delete_row)
+        # US-076: словарь передаётся отдельным файлом.
+        export_btn = QPushButton("Экспорт…")
+        export_btn.setFocusPolicy(Qt.NoFocus)
+        export_btn.setAutoDefault(False)
+        export_btn.setToolTip("Сохранить словарь в файл, чтобы передать его коллеге.")
+        export_btn.clicked.connect(self._on_dictionary_export)
+        import_btn = QPushButton("Импорт…")
+        import_btn.setFocusPolicy(Qt.NoFocus)
+        import_btn.setAutoDefault(False)
+        import_btn.setToolTip("Загрузить словарь из файла: заменить свой целиком или добавить записи к существующим.")
+        import_btn.clicked.connect(self._on_dictionary_import)
         btn_row.addWidget(add_btn)
         btn_row.addWidget(edit_btn)
         btn_row.addWidget(del_btn)
         btn_row.addStretch(1)
+        btn_row.addWidget(export_btn)
+        btn_row.addWidget(import_btn)
         layout.addLayout(btn_row)
 
         self._populate_dictionary_table()
         self._refresh_dictionary_tab_state()
         return tab
 
+    def _on_dictionary_export(self) -> None:
+        """US-076 (AC 4): сохранить словарь в файл для передачи коллеге."""
+        entries = self._collect_dictionary_from_table()
+        if not entries:
+            self.status_label.setText("Словарь пуст — экспортировать нечего.")
+            return
+        default = str(Path.home() / "dictionary.json")
+        target, _ = QFileDialog.getSaveFileName(self, "Экспорт словаря", default, "Файлы словаря (*.json)")
+        if not target:
+            return
+        try:
+            count = glossary_store.export_to(Path(target), entries)
+        except OSError as exc:
+            QMessageBox.warning(self, "Экспорт словаря", "Не удалось сохранить файл:\n%s" % exc)
+            return
+        self.status_label.setText("Словарь сохранён: %d записей → %s" % (count, target))
+
+    def _on_dictionary_import(self) -> None:
+        """US-076 (AC 4): загрузить словарь из файла, спросив «заменить или добавить»."""
+        source, _ = QFileDialog.getOpenFileName(self, "Импорт словаря", str(Path.home()), "Файлы словаря (*.json)")
+        if not source:
+            return
+        result = glossary_store.import_from(Path(source))
+        if not result.ok:
+            QMessageBox.warning(
+                self, "Импорт словаря",
+                "Файл не удалось прочитать — словарь не изменён.\n\n%s" % result.detail,
+            )
+            return
+        if not result.entries:
+            QMessageBox.information(self, "Импорт словаря", "В файле нет записей словаря — ничего не изменено.")
+            return
+        current = self._collect_dictionary_from_table()
+        box = QMessageBox(self)
+        box.setWindowTitle("Импорт словаря")
+        box.setIcon(QMessageBox.Question)
+        box.setText("В файле %d записей, сейчас в словаре %d." % (len(result.entries), len(current)))
+        box.setInformativeText(
+            "Заменить словарь целиком или добавить записи к существующим?\n"
+            "При добавлении термины, которые уже есть, останутся вашими."
+        )
+        replace_btn = box.addButton("Заменить целиком", QMessageBox.DestructiveRole)
+        merge_btn = box.addButton("Добавить к существующим", QMessageBox.AcceptRole)
+        box.addButton("Отмена", QMessageBox.RejectRole)
+        box.setDefaultButton(merge_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is replace_btn:
+            entries = list(result.entries)
+            done = "Словарь заменён: %d записей." % len(entries)
+        elif clicked is merge_btn:
+            entries = glossary_store.merge_entries(current, result.entries)
+            done = "Словарь дополнен: было %d, стало %d." % (len(current), len(entries))
+        else:
+            return
+        try:
+            glossary_store.save(entries)
+        except OSError as exc:
+            QMessageBox.warning(self, "Импорт словаря", "Не удалось сохранить словарь:\n%s" % exc)
+            return
+        self._glossary_entries = entries
+        self._glossary_load = glossary_store.load()
+        self._populate_dictionary_table()
+        self._refresh_dictionary_tab_state()
+        self.status_label.setText(done)
+
     def _populate_dictionary_table(self) -> None:
-        """US-044: заполнить таблицу словаря из cfg.postprocess_glossary."""
+        """US-044/US-076: заполнить таблицу словаря из отдельного файла."""
         tbl = self.dictionary_table
         tbl.blockSignals(True)
         try:
             tbl.setRowCount(0)
-            for entry in (getattr(self.cfg, "postprocess_glossary", None) or []):
+            for entry in (getattr(self, "_glossary_entries", None) or []):
                 if not isinstance(entry, dict):
                     continue
                 r = tbl.rowCount()
@@ -5951,6 +6375,19 @@ class MainWindow(QMainWindow):
         gloss_on = pp_on and bool(master is not None and master.isChecked())
         # Чекбоксы «Вкл» терминов — только при включённом словаре (US-046).
         self._set_dictionary_checkboxes_enabled(gloss_on)
+        # US-076 (AC 5): повреждённый файл словаря не мешает работе, но человек
+        # должен узнать, почему его термины пропали, — иначе он решит, что
+        # программа их потеряла, и начнёт заводить заново поверх целого файла.
+        _load = getattr(self, "_glossary_load", None)
+        if _load is not None and not _load.ok:
+            self.dictionary_status_label.setText(
+                "Файл словаря повреждён и не прочитан — программа работает без словаря. "
+                "Файл: %s. Он не перезаписан: почините его или загрузите словарь "
+                "заново кнопкой «Импорт…»." % glossary_store.path()
+            )
+            self.dictionary_status_label.setStyleSheet("color: #fbbf24;")
+            self.dictionary_table.setStyleSheet("color: #71717a;")
+            return
         if not pp_on:
             self.dictionary_status_label.setText(
                 "Постобработка выключена — словарь недоступен. Термины можно добавлять впрок; "
@@ -6182,7 +6619,7 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             recording = False
         try:
-            api_on = bool(getattr(self.cfg, "api_enabled", False))
+            api_on = bool(API_SERVER_ENABLED and getattr(self.cfg, "api_enabled", False))
         except Exception:  # noqa: BLE001
             api_on = False
         log.info(
@@ -6239,7 +6676,8 @@ class MainWindow(QMainWindow):
         # остаётся «полуживым» (оверлей интерактивен, но hotkey уже снят →
         # диктовка не работает). Подтверждено логами: пикер моделей срабатывал
         # через 33с после quit(). Плюс при api_enabled uvicorn-потоки мешают
-        # чистой финализации. Поэтому: аккуратно гасим фон, затем ПРИНУДИТЕЛЬНО
+        # чистой финализации (US-086: при выключенном рубильнике
+        # таких потоков нет вовсе). Поэтому: аккуратно гасим фон, затем ПРИНУДИТЕЛЬНО
         # завершаем процесс через os._exit(0).
         if getattr(self, "_quitting", False):
             return
@@ -6341,6 +6779,10 @@ def _activate_running_instance(server_name: str, timeout_ms: int = 400) -> bool:
 def run() -> int:
     """Entry point: создаёт QApplication, главное окно и запускает event loop."""
     setup_logging()
+    # US-088 (AC 7): администратору нужно уметь проверить, что политика
+    # применилась. Строка в app.log — самый дешёвый способ: она пишется до
+    # создания окна и видна даже когда приложение сразу свернулось в трей.
+    log.info("Машинные политики администратора: %s", policy.describe())
     app = QApplication.instance() or QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 

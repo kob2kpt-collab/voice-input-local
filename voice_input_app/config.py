@@ -166,6 +166,19 @@ class CloudConnection:
         self.only_internal_models = bool(self.only_internal_models)
         self.reports_model_placement = bool(self.reports_model_placement)
 
+    @property
+    def effective_only_internal_models(self) -> bool:
+        """US-088: действующее значение фильтра «только модели Cloud.ru».
+
+        Машинная политика ForceInternalModelsOnly ВАЖНЕЕ настройки пользователя
+        (AC 5): правка config.json вручную её не обходит. Свойство, а не поле —
+        поэтому в config.json не сохраняется и не может разойтись с реестром.
+        Читают его чокпоинт регистрации моделей и cloud_placement.
+        """
+        from . import policy
+
+        return policy.effective_only_internal_models(self.only_internal_models)
+
 
 @dataclass
 class AppConfig:
@@ -207,7 +220,10 @@ class AppConfig:
     autostart_enabled: bool = False
     hf_token: str = ""  # optional Hugging Face token for authenticated model downloads
     updates_enabled: bool = True
-    update_repo: str = ""  # owner/repo for GitHub Releases, e.g. my-org/voice-input-local
+    # US-078: ссылка на репозиторий выпусков — GitHub или GitLab (в т.ч. внутренний).
+    # Хранится либо короткой формой "owner/repo" (GitHub, как раньше), либо полной
+    # ссылкой "https://gitlab.example.ru/group/project". Разбор — updater.parse_repo.
+    update_repo: str = ""
     last_update_check_ts: float = 0.0
     microphone_autodetect_done: bool = False
     file_stable_timestamps_enabled: bool = False
@@ -280,7 +296,10 @@ class AppConfig:
     # True; старые записи без ключа считаются включёнными). Термины вшиваются в
     # системный промпт постобработки (без второго облачного вызова). Пустой
     # список — поведение не меняется.
-    postprocess_glossary: list[dict] = field(default_factory=list)
+    # US-076: САМ словарь здесь больше не хранится — он лежит в отдельном
+    # файле dictionary.json (voice_input_app/glossary.py). Здесь остался
+    # только выключатель: он относится к настройкам постобработки, а не к
+    # пользовательским данным, и должен приезжать вместе с готовым config.json.
     # US-046: мастер-тумблер словаря. Словарь применяется только если ВКЛЮЧЕНА
     # постобработка (postprocess_enabled) И этот флаг. Дефолт True — сохраняет
     # прежнее поведение US-044 (словарь работал при включённой постобработке).

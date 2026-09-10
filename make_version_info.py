@@ -52,10 +52,11 @@ VSVersionInfo(
       StringTable(
         '040904B0',
         [
-          StringStruct('CompanyName', 'Voice Input Local'),
+          StringStruct('CompanyName', 'АО «Телеофис»'),
           StringStruct('FileDescription', 'Voice Input Local'),
           StringStruct('FileVersion', '{version}'),
           StringStruct('InternalName', 'VoiceInputLocal'),
+          StringStruct('LegalCopyright', 'Copyright (C) 2026 АО «Телеофис»'),
           StringStruct('OriginalFilename', 'VoiceInputLocal.exe'),
           StringStruct('ProductName', 'Voice Input Local'),
           StringStruct('ProductVersion', '{version}')
