@@ -45,6 +45,25 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = REPO_ROOT / "requirements.txt"
 LOCKFILE = REPO_ROOT / "requirements.lock.txt"
 PYPI_JSON = "https://pypi.org/pypi/{name}/{version}/json"
+def _force_utf8_output() -> None:
+    """Печатать по-русски можно на любой консоли.
+
+    Windows отдаёт скрипту кодировку консоли (cp1252/cp866), и обычный print с
+    кириллицей роняет процесс UnicodeEncodeError. Из-за этого сборка 4.22.0
+    упала на шаге тестов: все проверки прошли, а запускальщик умер на итоговой
+    строке — и выпуск не опубликовался. Понижаем непечатаемые символы вместо
+    падения; на UTF-8-консоли ничего не меняется.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
+_force_utf8_output()
 
 
 def resolve_tree(python: str, requirements: Path, constraints: dict[str, str] | None = None) -> list[dict]:

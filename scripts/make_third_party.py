@@ -30,6 +30,25 @@ from make_sbom import LOCKFILE, app_version, pypi_meta, read_lock  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LICENSES_DIR = REPO_ROOT / "licenses"
 OUTPUT = REPO_ROOT / "THIRD-PARTY-LICENSES.md"
+def _force_utf8_output() -> None:
+    """Печатать по-русски можно на любой консоли.
+
+    Windows отдаёт скрипту кодировку консоли (cp1252/cp866), и обычный print с
+    кириллицей роняет процесс UnicodeEncodeError. Из-за этого сборка 4.22.0
+    упала на шаге тестов: все проверки прошли, а запускальщик умер на итоговой
+    строке — и выпуск не опубликовался. Понижаем непечатаемые символы вместо
+    падения; на UTF-8-консоли ничего не меняется.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
+_force_utf8_output()
 
 # Лицензии, требующие приложить полный текст, и файл с этим текстом.
 TEXT_REQUIRED = {
