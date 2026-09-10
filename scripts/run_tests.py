@@ -71,7 +71,46 @@ def main() -> int:
         print("ПАДЕНИЕ: %s" % name)
         print("=" * 70)
         print(output.strip()[-4000:])
+    _report_to_ci(failed, len(files))
     return 1 if failed else 0
+
+
+def _report_to_ci(failed: list[tuple[str, str]], total: int) -> None:
+    """Продублировать причину падения туда, где её видно без доступа к журналу.
+
+    Журнал сборки в GitHub Actions открывается только после входа в аккаунт, и
+    у выпуска 4.22.1 гейт заблокировал публикацию с единственным словом
+    «Process completed with exit code 1» — понять, какой тест упал, было
+    невозможно ни по странице сборки, ни по API. Гейт, который останавливает
+    выпуск, обязан называть причину.
+
+    Пишем в два места, доступных без авторизации: аннотации задания
+    (workflow-команда ::error, её отдаёт API проверок) и сводку задания
+    ($GITHUB_STEP_SUMMARY, она видна на странице запуска).
+    """
+    import os
+
+    if not os.environ.get("GITHUB_ACTIONS"):
+        return
+
+    for name, output in failed:
+        tail = (output or "").strip()[-800:]
+        # В аннотации переводы строк экранируются, иначе сообщение обрежется.
+        escaped = tail.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+        print("::error title=Упал тест %s::%s" % (name, escaped), flush=True)
+
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    lines = ["## Тесты: файлов %d, упало %d\n" % (total, len(failed))]
+    for name, output in failed:
+        lines.append("### %s\n" % name)
+        lines.append("```\n%s\n```\n" % (output or "").strip()[-3000:])
+    try:
+        with open(summary_path, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines))
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":
