@@ -47,6 +47,15 @@ def config_path() -> Path:
     return app_data_dir() / "config.json"
 
 
+def dictionary_path() -> Path:
+    """US-076: словарь терминов лежит рядом с настройками, но ОТДЕЛЬНО от них.
+
+    Готовые настройки раздаются коллегам подменой config.json, и словарь,
+    собранный человеком под себя, не должен при этом теряться.
+    """
+    return app_data_dir() / "dictionary.json"
+
+
 def history_db_path() -> Path:
     return app_data_dir() / "history.sqlite3"
 

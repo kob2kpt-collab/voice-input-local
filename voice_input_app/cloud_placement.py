@@ -271,6 +271,24 @@ def hidden_reason(
     return "unknown" if knows else ""
 
 
+def connection_only_internal(conn) -> bool:
+    """Действующее значение флажка «только модели Cloud.ru» у подключения.
+
+    US-088: у CloudConnection есть свойство effective_only_internal_models,
+    которое накладывает машинную политику ForceInternalModelsOnly поверх выбора
+    пользователя. Читаем его, а не поле, — иначе политика обходилась бы правкой
+    config.json. Модуль остаётся чистым: реестр читает config/policy, здесь
+    только утиная типизация, поэтому фикстуры тестов без свойства продолжают
+    работать по прежнему полю.
+    """
+    if conn is None:
+        return False
+    effective = getattr(conn, "effective_only_internal_models", None)
+    if isinstance(effective, bool):
+        return effective
+    return bool(getattr(conn, "only_internal_models", False))
+
+
 def connection_hidden_reason(conn, model_id: str) -> str:
     """То же решение, но для объекта подключения (CloudConnection).
 
@@ -283,7 +301,7 @@ def connection_hidden_reason(conn, model_id: str) -> str:
         base_url = elevenlabs_endpoint_key()
     return hidden_reason(
         model_id,
-        only_internal=bool(getattr(conn, "only_internal_models", False)),
+        only_internal=connection_only_internal(conn),
         reports_placement=bool(getattr(conn, "reports_model_placement", False)),
         stored_placement=getattr(conn, "model_placement", None),
         base_url=base_url,

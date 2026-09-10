@@ -9,6 +9,7 @@ from PySide6.QtCore import QThread, Signal
 from .audio_files import cleanup_prepared_file, convert_media_to_wav_16k_mono, format_duration, get_media_duration_seconds
 from .audio_recorder import auto_detect_input_device
 from .config import AppConfig
+from . import glossary as glossary_store
 from .logger import get_logger
 from .models import ModelManager, is_cloud_model_key, model_display_name
 
@@ -628,9 +629,12 @@ class PostProcessWorker(QThread):
                 system_prompt=getattr(self.cfg, "postprocess_system_prompt", "") or "",
                 reasoning=bool(getattr(self.cfg, "postprocess_reasoning", False)),
                 reasoning_effort=getattr(self.cfg, "postprocess_reasoning_effort", "low") or "low",
-                # US-044/US-046: словарь терминов — только если включён мастер-тумблер
+                # US-044/US-046: словарь терминов — только если включён мастер-тумблер.
+                # US-076: записи читаются из отдельного файла dictionary.json, а
+                # не из настроек. Мастер-гейт намеренно остался здесь: это
+                # единственное место, откуда словарь попадает в облачный запрос.
                 glossary=(
-                    getattr(self.cfg, "postprocess_glossary", None)
+                    glossary_store.load_entries()
                     if getattr(self.cfg, "postprocess_glossary_enabled", True)
                     else None
                 ),
