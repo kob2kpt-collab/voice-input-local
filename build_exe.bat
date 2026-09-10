@@ -19,6 +19,10 @@ if not exist "%VENV_PY%" (
   exit /b 1
 )
 
+rem US-086: fastapi/uvicorn/starlette/multipart исключены из сборки — REST API выключен
+rem рубильником voice_input_app\features.py (API_SERVER_ENABLED). llama_cpp.server тянет
+rem fastapi через --collect-all llama_cpp, приложению нужен только llama_cpp.Llama.
+rem НЕ исключать anyio/h11/httpx/httpcore/pydantic/click — их тянет huggingface_hub.
 rem US-056: сгенерировать ресурс версии из __version__ (иначе версия .exe = 0.0.0.0).
 "%VENV_PY%" make_version_info.py
 if errorlevel 1 (
@@ -28,7 +32,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-"%VENV_PY%" -m PyInstaller --noconfirm --clean --windowed --name VoiceInputLocal --version-file version_info.txt --icon "voice_input_app\assets\icon.ico" --add-data "voice_input_app\assets;voice_input_app\assets" --collect-all PySide6 --collect-all faster_whisper --collect-all onnx_asr --hidden-import pyperclip --hidden-import uiautomation --hidden-import sounddevice --hidden-import soundfile --hidden-import requests --collect-submodules fpdf --collect-all llama_cpp main.py
+"%VENV_PY%" -m PyInstaller --noconfirm --clean --windowed --name VoiceInputLocal --version-file version_info.txt --icon "voice_input_app\assets\icon.ico" --add-data "voice_input_app\assets;voice_input_app\assets" --collect-all PySide6 --collect-all faster_whisper --collect-all onnx_asr --hidden-import pyperclip --hidden-import uiautomation --hidden-import sounddevice --hidden-import soundfile --hidden-import requests --collect-submodules fpdf --collect-all llama_cpp --exclude-module fastapi --exclude-module uvicorn --exclude-module starlette --exclude-module multipart --exclude-module python_multipart --exclude-module llama_cpp.server main.py
 if errorlevel 1 (
   echo ERROR: EXE build failed.
   pause

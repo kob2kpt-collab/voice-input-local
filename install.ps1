@@ -26,7 +26,23 @@ if (-not (Test-Path -LiteralPath "requirements.txt")) {
 
 & $Python @PyArgs -m venv .venv
 & .\.venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
-& .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# US-089: ставим ЗАКРЕПЛЁННЫЕ версии с хэшами — те же, из которых собирается
+# релиз. Иначе установка «из исходников» и установка из инсталлятора дают разный
+# состав, и согласованный службой ИБ перечень перестаёт что-либо значить.
+# Диапазоны из requirements.txt остаются запасным путём: замка может не быть в
+# старом архиве, и установка не должна из-за этого падать.
+if (Test-Path -LiteralPath "requirements.lock.txt") {
+  Write-Host "Installing pinned dependencies from requirements.lock.txt"
+  & .\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements.lock.txt
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: pinned install failed. Do not fall back silently - the release composition must match."
+    exit 1
+  }
+} else {
+  Write-Host "WARNING: requirements.lock.txt not found, installing from version ranges (requirements.txt)."
+  & .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+}
 
 # Summarization support: install llama-cpp-python from pre-built CPU wheels
 # (avoids the need for C++ compiler on Windows)
