@@ -1,7 +1,7 @@
 #define MyAppName "Voice Input Local"
 #define MyAppExeName "VoiceInputLocal.exe"
 #ifndef MyAppVersion
-#define MyAppVersion "4.22.1"
+#define MyAppVersion "4.23.0"
 #endif
 
 [Setup]

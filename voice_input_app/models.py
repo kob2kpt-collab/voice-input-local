@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import gc
 import os
 import shutil
@@ -109,11 +110,15 @@ def _normalize_language(value: str | None) -> str | None:
     return lowered or None
 
 
-def _repo_size_bytes(repo_id: str, token: str | None = None) -> int | None:
+def _repo_size_bytes(repo_id: str, token: str | None = None, allow_patterns: tuple[str, ...] = ()) -> int | None:
+    """Суммарный размер файлов репозитория; allow_patterns — считать только подходящие (US-085)."""
     try:
         info = HfApi(token=token).model_info(repo_id, files_metadata=True)
         total = 0
         for sibling in getattr(info, "siblings", []) or []:
+            name = getattr(sibling, "rfilename", "") or ""
+            if allow_patterns and not any(fnmatch.fnmatch(name, pattern) for pattern in allow_patterns):
+                continue
             size = getattr(sibling, "size", None)
             if isinstance(size, int) and size > 0:
                 total += size
@@ -256,6 +261,11 @@ class ModelSpec:
     language_hint: str
     size_hint: str
     note: str
+    # US-085: необязательные поля для onnx-asr-моделей. allow_patterns — какие файлы
+    # репозитория качать (пусто = весь snapshot, как раньше); quantization — какой
+    # вариант весов грузить через onnx_asr.load_model(..., quantization=...), None = fp32.
+    allow_patterns: tuple[str, ...] = ()
+    quantization: str | None = None
 
 
 WHISPER_MODELS: dict[str, ModelSpec] = {
@@ -270,6 +280,38 @@ WHISPER_MODELS: dict[str, ModelSpec] = {
 PARAKEET_MODELS: dict[str, ModelSpec] = {
     "parakeet:v2": ModelSpec("parakeet:v2", "Parakeet", "TDT 0.6B v2 ONNX", "istupakov/parakeet-tdt-0.6b-v2-onnx", "nemo-parakeet-tdt-0.6b-v2", "английская", "~1.5-2.5 ГБ", "Английская, ONNX Runtime"),
     "parakeet:v3": ModelSpec("parakeet:v3", "Parakeet", "TDT 0.6B v3 ONNX", "istupakov/parakeet-tdt-0.6b-v3-onnx", "nemo-parakeet-tdt-0.6b-v3", "25 языков", "~1.5-2.5 ГБ", "Мультиязычная, ONNX Runtime"),
+}
+
+# US-085: локальная модель Сбера GigaAM v3 E2E RNNT (ai-sage/GigaAM-v3) через тот
+# же onnx-asr, что и Parakeet: ONNX-экспорт того же мейнтейнера (istupakov),
+# лицензия MIT, имя модели поддерживается onnx-asr с 0.8.0. E2E-вариант отдаёт
+# текст сразу с пунктуацией, заглавными буквами и нормализацией чисел — та же
+# модель, что в «Тайпе» Сбера. Язык — русский (английские слова внутри русской
+# речи распознаёт, чисто английскую речь — нет). Движок "GigaAM" ходит по тем же
+# путям, что "Parakeet" (_load_parakeet, _transcribe_parakeet*, проверка *.onnx).
+# Репозиторий istupakov/gigaam-v3-onnx содержит четыре варианта в fp32 и int8
+# (~4,5 ГБ), поэтому качаем ТОЛЬКО int8-файлы e2e_rnnt (allow_patterns, ~0,23 ГБ)
+# и грузим их с quantization="int8"; config.json для onnx-asr обязателен.
+# GigaAM Multilingual (5 языков, CTC без пунктуации) рассматривалась и заменена
+# этой моделью решением владельца 11.09.2026 — см. CLAUDE.md, US-085.
+GIGAAM_MODELS: dict[str, ModelSpec] = {
+    "gigaam:v3-e2e-rnnt": ModelSpec(
+        "gigaam:v3-e2e-rnnt", "GigaAM", "v3 E2E RNNT",
+        "istupakov/gigaam-v3-onnx",
+        "gigaam-v3-e2e-rnnt",
+        "русский (английские слова в русской речи)",
+        "~230 МБ (int8)",
+        "Sber GigaAM v3, ONNX Runtime; с пунктуацией, заглавными буквами и нормализацией чисел; чисто английскую речь не распознаёт",
+        allow_patterns=(
+            "v3_e2e_rnnt_encoder.int8.onnx",
+            "v3_e2e_rnnt_decoder.int8.onnx",
+            "v3_e2e_rnnt_joint.int8.onnx",
+            "v3_e2e_rnnt_vocab.txt",
+            "v3_e2e_rnnt.yaml",
+            "config.json",
+        ),
+        quantization="int8",
+    ),
 }
 
 ADDITIONAL_MODELS: dict[str, ModelSpec] = {
@@ -289,7 +331,7 @@ SUMMARY_MODELS: dict[str, ModelSpec] = {
 }
 DEFAULT_SUMMARY_MODEL_KEY = "summary:qwen3-1.7b"
 
-TRANSCRIPTION_MODELS: dict[str, ModelSpec] = {**WHISPER_MODELS, **PARAKEET_MODELS}
+TRANSCRIPTION_MODELS: dict[str, ModelSpec] = {**WHISPER_MODELS, **PARAKEET_MODELS, **GIGAAM_MODELS}
 ALL_MODELS: dict[str, ModelSpec] = {**TRANSCRIPTION_MODELS, **ADDITIONAL_MODELS, **SUMMARY_MODELS}
 
 # US-015, US-016: Cloud STT models registry.
@@ -431,7 +473,8 @@ def _missing_required_files(spec: ModelSpec, path: Path) -> list[str]:
         has_vocab = any((path / name).is_file() and (path / name).stat().st_size > 0 for name in WHISPER_VOCAB_ALTERNATIVES)
         if not has_vocab:
             missing.append("vocabulary.json or vocabulary.txt")
-    elif spec.engine == "Parakeet":
+    elif spec.engine in ("Parakeet", "GigaAM"):
+        # US-085: GigaAM — тоже onnx-asr, та же проверка по *.onnx.
         has_model_file = any(p.is_file() and p.suffix.lower() in PARAKEET_MODEL_SUFFIXES and p.stat().st_size > 0 for p in path.rglob("*"))
         if not has_model_file:
             missing.append("*.onnx or model metadata")
@@ -940,7 +983,7 @@ class ModelManager:
             if _is_summary_model(spec):
                 total_bytes = _single_file_size_bytes(spec.repo_id, spec.loader_name, token=token) or 0
             else:
-                total_bytes = _repo_size_bytes(spec.repo_id, token=token) or 0
+                total_bytes = _repo_size_bytes(spec.repo_id, token=token, allow_patterns=spec.allow_patterns) or 0
             stop_monitor = threading.Event()
 
             def monitor_download() -> None:
@@ -981,12 +1024,15 @@ class ModelManager:
                         token=token,
                     )
                 else:
+                    # US-085: allow_patterns ограничивает snapshot нужными файлами
+                    # (у gigaam-v3-onnx четыре варианта на ~4,5 ГБ, нужен один int8).
                     snapshot_download(
                         repo_id=spec.repo_id,
                         local_dir=str(staging_path),
                         local_dir_use_symlinks=False,
                         resume_download=False,
                         token=token,
+                        allow_patterns=list(spec.allow_patterns) or None,
                     )
             finally:
                 stop_monitor.set()
@@ -1040,7 +1086,7 @@ class ModelManager:
         with self._lock_for(key):
             if spec.engine == "Whisper":
                 self._load_whisper(spec, cfg)
-            elif spec.engine == "Parakeet":
+            elif spec.engine in ("Parakeet", "GigaAM"):
                 self._load_parakeet(spec)
 
     def transcribe(self, key: str, wav_path: Path, cfg: AppConfig, *, is_live: bool = False, progress_callback=None, duration_seconds: float = 0.0) -> str:
@@ -1050,14 +1096,14 @@ class ModelManager:
         # Cloud-модели (US-015, US-016, US-032) — отдельная ветка, без блокировки
         # (несколько cloud-запросов могут идти параллельно — это нормально).
         # US-022: прогресс процента применяется ТОЛЬКО к локальным движкам
-        # (Whisper/Parakeet); cloud-путь его игнорирует.
+        # (Whisper/Parakeet/GigaAM); cloud-путь его игнорирует.
         if is_cloud_model_key(key):
             return self._transcribe_cloud(key, wav_path, cfg)
         with self._lock_for(key):
             transcription_log.info("Transcription start: key=%s engine=%s live=%s language=%s path=%s", key, spec.engine, is_live, _normalize_language(cfg.language), wav_path)
             if spec.engine == "Whisper":
                 text = self._transcribe_whisper(spec, wav_path, cfg, is_live=is_live, progress_callback=progress_callback, duration_seconds=duration_seconds)
-            elif spec.engine == "Parakeet":
+            elif spec.engine in ("Parakeet", "GigaAM"):
                 text = self._transcribe_parakeet(spec, wav_path, is_live=is_live, progress_callback=progress_callback)
             else:
                 raise RuntimeError(f"Неподдерживаемый движок: {spec.engine}")
@@ -1354,7 +1400,7 @@ class ModelManager:
                 text = self._transcribe_whisper_progressive(
                     spec, wav_path, cfg, duration_seconds=duration_seconds, progress_callback=emit_progress, block_callback=block_callback, cancel_check=is_cancelled
                 )
-            elif spec.engine == "Parakeet":
+            elif spec.engine in ("Parakeet", "GigaAM"):
                 text = self._transcribe_parakeet_progressive(
                     spec, wav_path, cfg, duration_seconds=duration_seconds, progress_callback=emit_progress, block_callback=block_callback, cancel_check=is_cancelled
                 )
@@ -1706,6 +1752,10 @@ class ModelManager:
                     except Exception:
                         pass
 
+    # US-085: методы _load_parakeet / _recognize_parakeet_chunk / _transcribe_parakeet*
+    # обслуживают ОБА onnx-asr-движка — Parakeet и GigaAM. Они не знают ничего
+    # про Parakeet: модель выбирается по spec.loader_name, результат разбирает
+    # _extract_text. Имена оставлены прежними, чтобы не трогать рабочий код.
     def _load_parakeet(self, spec: ModelSpec):  # noqa: ANN001
         import onnx_asr
 
@@ -1719,7 +1769,11 @@ class ModelManager:
         # onnx-asr expects the supported model name as the first argument and
         # the local directory as the second argument. Passing the directory as
         # the model name raises ModelNotSupportedError.
-        model_obj = onnx_asr.load_model(spec.loader_name, local_dir)
+        # US-085: quantization выбирает вариант весов (int8 у GigaAM v3); None = как раньше.
+        if spec.quantization:
+            model_obj = onnx_asr.load_model(spec.loader_name, local_dir, quantization=spec.quantization)
+        else:
+            model_obj = onnx_asr.load_model(spec.loader_name, local_dir)
         self._loaded[spec.key] = model_obj
         return model_obj
 

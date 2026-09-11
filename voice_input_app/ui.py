@@ -5167,10 +5167,12 @@ class MainWindow(QMainWindow):
         if not self.cfg.live_transcription or not self.recorder.is_recording or self.cancel_requested:
             return
         selected = self.cfg.selected_model
-        if ALL_MODELS[selected].engine == "Parakeet":
+        engine = ALL_MODELS[selected].engine
+        if engine in ("Parakeet", "GigaAM"):
+            # US-085: GigaAM, как и Parakeet, работает через onnx-asr без live-режима.
             if not self.live_unavailable_notice_shown:
                 self.live_unavailable_notice_shown = True
-                self.status_label.setText("Для Parakeet live-режим временно отключён; после остановки будет финальная расшифровка.")
+                self.status_label.setText(f"Для {engine} live-режим временно отключён; после остановки будет финальная расшифровка.")
             return
         if self.live_worker and self.live_worker.isRunning():
             return

@@ -14,7 +14,7 @@ Voice Input Local использует библиотеки с открытым 
 Полные тексты лицензий, требующих приложения (LGPL, GPL), лежат в папке
 `licenses/` и входят в поставку.
 
-Собрано: 2026-09-10 · версия программы: 4.22.0 · компонентов: 56
+Собрано: 2026-09-10 · версия программы: 4.23.0 · компонентов: 56
 
 
 ## Перечень
@@ -48,7 +48,7 @@ Voice Input Local использует библиотеки с открытым 
 | markdown-it-py | 4.2.0 | MIT License | https://pypi.org/project/markdown-it-py/ |
 | mdurl | 0.1.2 | MIT License | https://pypi.org/project/mdurl/ |
 | numpy | 2.4.6 | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 | https://pypi.org/project/numpy/ |
-| onnx-asr | 0.11.0 | MIT | https://pypi.org/project/onnx-asr/ |
+| onnx-asr | 0.12.0 | MIT | https://pypi.org/project/onnx-asr/ |
 | onnxruntime | 1.27.0 | MIT License | https://onnxruntime.ai |
 | packaging | 26.2 | Apache-2.0 OR BSD-2-Clause | https://pypi.org/project/packaging/ |
 | pefile | 2024.8.26 | MIT | https://github.com/erocarrera/pefile |
